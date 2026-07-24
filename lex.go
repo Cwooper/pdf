@@ -189,11 +189,20 @@ func (b *buffer) readHexString() token {
 		if c == '>' {
 			break
 		}
+		// readByte reports end of input as '\n' once allowEOF is set, so
+		// without this check an unterminated hex string skips whitespace
+		// forever.
+		if b.eof {
+			break
+		}
 		if isSpace(c) {
 			goto Loop
 		}
 	Loop2:
 		c2 := b.readByte()
+		if b.eof {
+			break
+		}
 		if isSpace(c2) {
 			goto Loop2
 		}
