@@ -67,6 +67,7 @@ import (
 	"crypto/md5"
 	"crypto/rc4"
 	"encoding/ascii85"
+	"errors"
 	"fmt"
 	"io"
 	"math"
@@ -1018,13 +1019,17 @@ func (e *errorReadCloser) Close() error {
 	return e.err
 }
 
+// errStreamNotPresent is the error a Reader for a non-stream Value responds
+// with; the lexer treats it as end of input rather than malformed data.
+var errStreamNotPresent = errors.New("stream not present")
+
 // Reader returns the data contained in the stream v.
 // If v.Kind() != Stream, Reader returns a ReadCloser that
 // responds to all reads with a “stream not present” error.
 func (v Value) Reader() io.ReadCloser {
 	x, ok := v.data.(stream)
 	if !ok {
-		return &errorReadCloser{fmt.Errorf("stream not present")}
+		return &errorReadCloser{errStreamNotPresent}
 	}
 	streamLen := v.Key("Length").Int64()
 	// Handle empty streams - return empty reader without applying filters.
