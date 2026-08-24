@@ -3,6 +3,7 @@ package pdf
 import (
 	"bytes"
 	"fmt"
+	"strings"
 	"testing"
 	"time"
 )
@@ -65,5 +66,28 @@ func TestUnterminatedArrayTerminates(t *testing.T) {
 		// ok: extraction terminated
 	case <-time.After(5 * time.Second):
 		t.Fatal("GetPlainText did not return within 5s: readArray is looping on io.EOF at end of a truncated content stream")
+	}
+}
+
+// TestReadObjectStopsAtStrayCloseBracket verifies that readObject treats a
+// stray "]" like ">>": as the end of the enclosing structure rather than a
+// malformed-PDF panic. Real-world PDFs produce this shape via dictionaries
+// with a missing value, e.g. << /A ] >>.
+func TestReadObjectStopsAtStrayCloseBracket(t *testing.T) {
+	defer func() {
+		if r := recover(); r != nil {
+			t.Fatalf("readObject panicked on stray ]: %v", r)
+		}
+	}()
+
+	b := newBuffer(strings.NewReader("<< /A ] >>"), 0)
+	b.allowEOF = true
+	obj := b.readObject()
+	d, ok := obj.(dict)
+	if !ok {
+		t.Fatalf("expected dict, got %T (%v)", obj, obj)
+	}
+	if _, present := d[name("A")]; !present {
+		t.Fatalf("expected key A in dict, got %v", d)
 	}
 }
