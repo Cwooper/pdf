@@ -7,6 +7,7 @@ package pdf
 import (
 	"io"
 	"runtime"
+	"strings"
 )
 
 // A Stack represents a stack of values.
@@ -58,8 +59,11 @@ func Interpret(strm Value, do func(stk *Stack, op string)) {
 	var dicts []dict
 	var rd io.Reader
 	if strm.Kind() == Array {
-		readers := make([]io.Reader, 0, strm.Len())
+		readers := make([]io.Reader, 0, 2*strm.Len())
 		for i := 0; i < strm.Len(); i++ {
+			if i > 0 {
+				readers = append(readers, strings.NewReader("\n"))
+			}
 			readers = append(readers, strm.Index(i).Reader())
 		}
 		rd = io.MultiReader(readers...)
