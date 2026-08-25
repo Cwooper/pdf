@@ -30,6 +30,12 @@ const (
 	// items, deep or wide.
 	maxOutlineDepth = 128
 	maxOutlineNodes = 1 << 16
+
+	// maxMissingPages bounds how many page numbers in a row may resolve to
+	// no page before extraction stops. /Count is the file's own claim of how
+	// many pages there are, and a hostile one would otherwise have the tree
+	// walked billions of times.
+	maxMissingPages = 64
 )
 
 // A Page represent a single page in a PDF file.
@@ -98,8 +104,16 @@ func (r *Reader) GetPlainText() (reader io.Reader, err error) {
 	pages := r.NumPage()
 	var buf bytes.Buffer
 	fonts := make(map[string]*Font)
+	missing := 0
 	for i := 1; i <= pages; i++ {
 		p := r.Page(i)
+		if p.V.IsNull() {
+			if missing++; missing > maxMissingPages {
+				break
+			}
+			continue
+		}
+		missing = 0
 		for name, f := range p.fontCache() { // cache fonts so we don't continually parse charmap
 			if _, ok := fonts[name]; !ok {
 				fonts[name] = f
@@ -125,10 +139,17 @@ func (r *Reader) GetStyledTexts() (sentences []Text, err error) {
 	}()
 
 	totalPage := r.NumPage()
+	missing := 0
 	for pageIndex := 1; pageIndex <= totalPage; pageIndex++ {
 		p := r.Page(pageIndex)
-
-		if p.V.IsNull() || p.V.Key("Contents").Kind() == Null {
+		if p.V.IsNull() {
+			if missing++; missing > maxMissingPages {
+				break
+			}
+			continue
+		}
+		missing = 0
+		if p.V.Key("Contents").Kind() == Null {
 			continue
 		}
 		var lastTextStyle Text
