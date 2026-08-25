@@ -355,11 +355,19 @@ func readXref(r *Reader, b *buffer) (*xrefTable, objptr, dict, error) {
 // positioned at the start of each previous section and must return that
 // section's own /Prev entry (or nil) to continue the chain.
 func readPrevXrefs(r *Reader, first object, parse func(b *buffer) (object, error)) error {
+	// /Prev offsets come from the file and can form a cycle. Everything a
+	// repeated section describes is already in the table, so the chain just
+	// ends there.
+	seen := make(map[int64]bool)
 	for prev := first; prev != nil; {
 		off, ok := prev.(int64)
 		if !ok {
 			return fmt.Errorf("malformed PDF: xref Prev is not integer: %v", prev)
 		}
+		if seen[off] {
+			return nil
+		}
+		seen[off] = true
 		b := newBuffer(io.NewSectionReader(r.f, off, r.end-off), off)
 		next, err := parse(b)
 		if err != nil {
