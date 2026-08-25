@@ -195,7 +195,7 @@ func TestOutlineMalformedReturns(t *testing.T) {
 // Before the fix the depth counter restarted at zero on each hop and the
 // goroutine stack overflowed, which is fatal rather than recoverable.
 func TestObjectStreamHeaderCycle(t *testing.T) {
-	data := buildObjStmPDF("/N 7 0 R /First FIRST", 1)
+	data := buildObjStmPDF("/N 7 0 R /First FIRST", "", 1)
 	mustNotCrash(t, func() {
 		r, err := NewReader(bytes.NewReader(data), int64(len(data)))
 		if err != nil {
@@ -355,5 +355,50 @@ func TestNegativeStreamLength(t *testing.T) {
 	}
 	if len(got) != 0 {
 		t.Errorf("read %d bytes from a stream with /Length -1, want 0", len(got))
+	}
+}
+
+// TestObjectStreamJunkPairSkipped verifies that a malformed entry in an object
+// stream's index table is skipped rather than ending the scan, so the objects
+// listed after it still resolve.
+func TestObjectStreamJunkPairSkipped(t *testing.T) {
+	data := buildObjStmPDF("/N 4 /First FIRST", "9 12.0 ", 0)
+	r, err := NewReader(bytes.NewReader(data), int64(len(data)))
+	if err != nil {
+		t.Fatalf("NewReader: %v", err)
+	}
+	text, err := r.GetPlainText()
+	if err != nil {
+		t.Fatalf("GetPlainText: %v", err)
+	}
+	var buf bytes.Buffer
+	buf.ReadFrom(text)
+	if !strings.Contains(buf.String(), "Hello Stream") {
+		t.Errorf("GetPlainText = %q, want it to contain %q", buf.String(), "Hello Stream")
+	}
+}
+
+// TestObjectStreamIndexJunkValues verifies two more kinds of junk in an
+// object stream index that must not stop objects listed after them from
+// resolving: a negative offset in a pair that is not being looked up, and an
+// object number outside the 32-bit range, which used to alias a real one.
+func TestObjectStreamIndexJunkValues(t *testing.T) {
+	for _, prefix := range []string{"9 -1 ", "4294967297 5 ", "-4294967295 5 "} {
+		t.Run(strings.TrimSpace(prefix), func(t *testing.T) {
+			data := buildObjStmPDF("/N 4 /First FIRST", prefix, 0)
+			r, err := NewReader(bytes.NewReader(data), int64(len(data)))
+			if err != nil {
+				t.Fatalf("NewReader: %v", err)
+			}
+			text, err := r.GetPlainText()
+			if err != nil {
+				t.Fatalf("GetPlainText: %v", err)
+			}
+			var buf bytes.Buffer
+			buf.ReadFrom(text)
+			if !strings.Contains(buf.String(), "Hello Stream") {
+				t.Errorf("GetPlainText = %q, want it to contain %q", buf.String(), "Hello Stream")
+			}
+		})
 	}
 }

@@ -533,13 +533,13 @@ func objStmPDF() []byte { return objStmPDFWith("") }
 // objStmPDFWith is objStmPDF with the object stream's /N and /First replaced by
 // hdr, to exercise the checks on those values. An empty hdr keeps the correct
 // ones.
-func objStmPDFWith(hdr string) []byte { return buildObjStmPDF(hdr, 0) }
+func objStmPDFWith(hdr string) []byte { return buildObjStmPDF(hdr, "", 0) }
 
 // buildObjStmPDF is the generator behind objStmPDFWith. FIRST in hdr is
-// replaced by the computed /First, and extra names how many further object
-// numbers (7, 8, ...) the cross-reference stream should also place inside
-// object stream 5.
-func buildObjStmPDF(hdr string, extra int) []byte {
+// replaced by the computed /First, pairPrefix is inserted in front of the
+// index table, and extra names how many further object numbers (7, 8, ...)
+// the cross-reference stream should also place inside object stream 5.
+func buildObjStmPDF(hdr, pairPrefix string, extra int) []byte {
 	const content = "BT /F1 24 Tf 100 700 Td (Hello Stream) Tj ET\n"
 
 	inner := []struct {
@@ -554,6 +554,7 @@ func buildObjStmPDF(hdr string, extra int) []byte {
 	// An object stream holds a table of "number offset" pairs, then the
 	// objects themselves starting at /First.
 	var pairs, bodies strings.Builder
+	pairs.WriteString(pairPrefix)
 	for _, o := range inner {
 		fmt.Fprintf(&pairs, "%d %d ", o.num, bodies.Len())
 		bodies.WriteString(o.body + "\n")

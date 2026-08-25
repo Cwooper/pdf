@@ -938,6 +938,10 @@ func (r *Reader) resolve(parent objptr, x interface{}) Value {
 // an object stream's own header (/N, /First, /Length, /Extends) is read
 // through Key, and a reference there back into the stream would otherwise
 // restart the count at zero and recurse until the stack is gone.
+//
+// The index table of an object stream declares /N pairs, but /N is a claim
+// rather than a measurement: the end of the stream ends the scan, and a pair
+// the file got wrong is skipped so that the ones after it still resolve.
 func (r *Reader) resolveAt(parent objptr, x interface{}, depth int) Value {
 	if ptr, ok := x.(objptr); ok {
 		xref := r.xref.get(ptr.id)
@@ -977,15 +981,16 @@ func (r *Reader) resolveAt(parent objptr, x interface{}, depth int) Value {
 				b := newBuffer(strm.Reader(), 0)
 				b.allowEOF = true
 				for i := 0; i < n; i++ {
-					id, ok1 := b.readToken().(int64)
-					off, ok2 := b.readToken().(int64)
-					// /N is a declared count, not a measured one. Stop at the
-					// first non-integer or end of stream instead of spinning
-					// through however many pairs the file claims.
-					if !ok1 || !ok2 {
+					tok1, tok2 := b.readToken(), b.readToken()
+					if tok1 == io.EOF || tok2 == io.EOF {
 						break
 					}
-					if uint32(id) == ptr.id {
+					id, ok1 := tok1.(int64)
+					off, ok2 := tok2.(int64)
+					if !ok1 || !ok2 || off < 0 {
+						continue
+					}
+					if id == int64(ptr.id) {
 						b.seekForward(first + off)
 						x = b.readObject()
 						break Search
