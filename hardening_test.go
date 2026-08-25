@@ -3,6 +3,7 @@ package pdf
 import (
 	"bytes"
 	"fmt"
+	"io"
 	"strings"
 	"testing"
 )
@@ -302,5 +303,20 @@ func TestDeepPageTreeInheritsResources(t *testing.T) {
 	p := Page{V: Value{r: r, data: page}}
 	if got := p.Fonts(); len(got) != 1 || got[0] != "F1" {
 		t.Errorf("Fonts = %v, want [F1]", got)
+	}
+}
+
+// TestNegativeStreamLength verifies that a negative /Length yields an empty
+// stream rather than one running to the end of the file.
+func TestNegativeStreamLength(t *testing.T) {
+	const file = "stream body and everything after it"
+	r := &Reader{f: bytes.NewReader([]byte(file)), end: int64(len(file))}
+	v := Value{r: r, data: stream{dict{name("Length"): int64(-1)}, objptr{}, 0}}
+	got, err := io.ReadAll(v.Reader())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 0 {
+		t.Errorf("read %d bytes from a stream with /Length -1, want 0", len(got))
 	}
 }

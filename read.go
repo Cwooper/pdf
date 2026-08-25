@@ -1015,6 +1015,8 @@ var errStreamNotPresent = errors.New("stream not present")
 // Reader returns the data contained in the stream v.
 // If v.Kind() != Stream, Reader returns a ReadCloser that
 // responds to all reads with a “stream not present” error.
+// A negative /Length reads as no data; io.NewSectionReader would otherwise
+// take it as unbounded and read to the end of the file.
 func (v Value) Reader() io.ReadCloser {
 	x, ok := v.data.(stream)
 	if !ok {
@@ -1023,7 +1025,7 @@ func (v Value) Reader() io.ReadCloser {
 	streamLen := v.Key("Length").Int64()
 	// Handle empty streams - return empty reader without applying filters.
 	// This avoids zlib "unexpected EOF" errors on 0-length FlateDecode streams.
-	if streamLen == 0 {
+	if streamLen <= 0 {
 		return io.NopCloser(bytes.NewReader(nil))
 	}
 	var rd io.Reader
