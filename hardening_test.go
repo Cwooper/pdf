@@ -106,3 +106,43 @@ func TestCyclicPrevChain(t *testing.T) {
 		mustNotCrash(t, func() { openBytes(data) })
 	})
 }
+
+// TestCyclicOutlineCombined verifies that an outline entry whose /First and
+// /Next both hold the entry itself, a direct cycle seen cannot catch,
+// terminates.
+func TestCyclicOutlineCombined(t *testing.T) {
+	d := dict{name("Title"): "t"}
+	d[name("First")] = d
+	d[name("Next")] = d
+	r := &Reader{f: bytes.NewReader(nil), end: 0}
+	r.trailer = dict{name("Root"): dict{name("Outlines"): d}}
+	mustNotCrash(t, func() { r.Outline() })
+}
+
+// TestCyclicOutlineByReference verifies that an outline entry reached through
+// an object reference is visited once. The node budget stops a cycle
+// eventually, but a cycle of a single entry with a long title would otherwise
+// be copied out tens of thousands of times.
+func TestCyclicOutlineByReference(t *testing.T) {
+	var b strings.Builder
+	b.WriteString("%PDF-1.4\n")
+	b.WriteString(pad())
+	objOff := b.Len()
+	b.WriteString("1 0 obj\n<< /Title (loop) /First 1 0 R /Next 1 0 R >>\nendobj\n")
+	xrefOff := b.Len()
+	fmt.Fprintf(&b, "xref\n0 2\n0000000000 65535 f \n%010d 00000 n \n", objOff)
+	b.WriteString("trailer\n<< /Size 2 /Root << /Outlines << /First 1 0 R >> >> >>\n")
+	fmt.Fprintf(&b, "startxref\n%d\n%%%%EOF\n", xrefOff)
+	r := openPDF(t, []byte(b.String()))
+	if n := countOutline(r.Outline()); n > 3 {
+		t.Errorf("outline has %d nodes, want the single entry visited once", n)
+	}
+}
+
+func countOutline(o Outline) int {
+	n := 1
+	for _, c := range o.Child {
+		n += countOutline(c)
+	}
+	return n
+}

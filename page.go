@@ -26,10 +26,10 @@ const (
 	// broad and shallow.
 	maxPageTreeDepth = 1024
 
-	// maxOutlineDepth and maxOutlineSiblings bound the outline tree, whose
-	// /First and /Next links can both be made cyclic.
-	maxOutlineDepth    = 128
-	maxOutlineSiblings = 1 << 16
+	// maxOutlineDepth and maxOutlineNodes bound an outline of distinct
+	// items, deep or wide.
+	maxOutlineDepth = 128
+	maxOutlineNodes = 1 << 16
 )
 
 // A Page represent a single page in a PDF file.
@@ -1165,24 +1165,52 @@ type Outline struct {
 // The Outline returned is the root of the outline tree and typically has no Title itself.
 // That is, the children of the returned root are the top-level entries in the outline.
 func (r *Reader) Outline() Outline {
-	return buildOutline(r.Trailer().Key("Root").Key("Outlines"), 0)
+	w := outlineWalk{budget: maxOutlineNodes, seen: make(map[objptr]bool)}
+	return w.build(r.Trailer().Key("Root").Key("Outlines"), 0)
 }
 
-func buildOutline(entry Value, depth int) Outline {
+// An outlineWalk builds an Outline from a tree whose /First and /Next links
+// can both be made cyclic.
+type outlineWalk struct {
+	// budget is the number of nodes still allowed for the whole tree.
+	budget int
+	// seen holds the references followed so far. Outline items are indirect
+	// objects, so a reference met again is a cycle, and the item it names is
+	// already built.
+	seen map[objptr]bool
+}
+
+func (w *outlineWalk) build(entry Value, depth int) Outline {
 	var x Outline
-	// A /First pointing at its own entry recurses until the stack is gone,
-	// which is fatal rather than recoverable.
+	if w.budget <= 0 {
+		return x
+	}
+	w.budget--
 	if depth > maxOutlineDepth {
 		return x
 	}
 	x.Title = entry.Key("Title").Text()
-	n := 0
-	for child := entry.Key("First"); child.Kind() == Dict; child = child.Key("Next") {
-		// Likewise a cyclic /Next never reaches a null sibling.
-		if n++; n > maxOutlineSiblings {
+	child, ok := w.follow(entry, "First")
+	for ok && child.Kind() == Dict {
+		if w.budget <= 0 {
 			break
 		}
-		x.Child = append(x.Child, buildOutline(child, depth+1))
+		x.Child = append(x.Child, w.build(child, depth+1))
+		child, ok = w.follow(child, "Next")
 	}
 	return x
+}
+
+// follow resolves entry's key, reporting false for a reference already
+// followed.
+func (w *outlineWalk) follow(entry Value, key string) (Value, bool) {
+	if d, ok := entry.data.(dict); ok {
+		if ref, ok := d[name(key)].(objptr); ok {
+			if w.seen[ref] {
+				return Value{}, false
+			}
+			w.seen[ref] = true
+		}
+	}
+	return entry.Key(key), true
 }

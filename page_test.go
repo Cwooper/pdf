@@ -190,7 +190,8 @@ func TestBuildOutline(t *testing.T) {
 		},
 	})
 
-	got := buildOutline(entry, 0)
+	w := outlineWalk{budget: maxOutlineNodes, seen: make(map[objptr]bool)}
+	got := w.build(entry, 0)
 	want := Outline{
 		Title: "Root",
 		Child: []Outline{
