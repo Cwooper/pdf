@@ -227,3 +227,22 @@ func TestOddLengthHexString(t *testing.T) {
 		}
 	}
 }
+
+// TestXrefStreamZeroWidths verifies that an xref stream whose /W widths sum
+// to zero is rejected. With no bytes per entry the entry loop consumed no
+// input, so a 207-byte file ran 8 million iterations and grew the table to
+// over a gigabyte.
+func TestXrefStreamZeroWidths(t *testing.T) {
+	data := xrefStreamPDF("/Size 8388608 /W [0 0 0]", "")
+	var before, after runtime.MemStats
+	runtime.GC()
+	runtime.ReadMemStats(&before)
+	err := openBytes(data)
+	runtime.ReadMemStats(&after)
+	if err == nil {
+		t.Error("NewReader: got nil error, want the zero-width /W rejected")
+	}
+	if got := after.TotalAlloc - before.TotalAlloc; got > 8<<20 {
+		t.Errorf("opening a %d-byte file allocated %d MB", len(data), got>>20)
+	}
+}

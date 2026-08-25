@@ -480,6 +480,9 @@ func readXrefStreamData(r *Reader, strm stream, table *xrefTable, size int64) (*
 	for _, wid := range w {
 		wtotal += wid
 	}
+	if wtotal == 0 {
+		return nil, fmt.Errorf("invalid W array %v: no bytes per entry", objfmt(ww))
+	}
 	buf := make([]byte, wtotal)
 	data := v.Reader()
 	for len(index) > 0 {
