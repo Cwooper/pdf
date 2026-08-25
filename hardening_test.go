@@ -259,3 +259,48 @@ func TestHugePageCount(t *testing.T) {
 		r.GetStyledTexts()
 	})
 }
+
+// TestCmapCountMismatchSalvaged verifies that a block whose declared count
+// exceeds the pairs present keeps the pairs that are there. Generators
+// miscount these blocks often enough that discarding the whole cmap turns
+// readable text into raw codes.
+func TestCmapCountMismatchSalvaged(t *testing.T) {
+	const space = "1 begincodespacerange <00> <ff> endcodespacerange "
+
+	tests := []struct {
+		name    string
+		content string
+		in, out string
+	}{
+		{"bfchar over", space + "3 beginbfchar <41> <0061> <42> <0062> endbfchar", "A", "a"},
+		{"bfrange over", space + "2 beginbfrange <43> <45> <0063> endbfrange", "D", "d"},
+		{"codespace over", "2 begincodespacerange <00> <ff> endcodespacerange 1 beginbfchar <41> <0061> endbfchar", "A", "a"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			m := readCmap(rawStream(tt.content))
+			if m == nil {
+				t.Fatal("readCmap returned nil, want the salvaged mappings")
+			}
+			if got := m.Decode(tt.in); got != tt.out {
+				t.Errorf("Decode(%q) = %q, want %q", tt.in, got, tt.out)
+			}
+		})
+	}
+}
+
+// TestCmapMissingBeginDiscarded verifies that a block closed without ever
+// being opened still discards the cmap, as it always did: with no codespace
+// ranges at all a cmap maps every byte to the replacement character, so
+// falling back to raw bytes reads better.
+func TestCmapMissingBeginDiscarded(t *testing.T) {
+	for _, content := range []string{
+		"endcodespacerange 1 beginbfchar <41> <0061> endbfchar",
+		"1 begincodespacerange <00> <ff> endcodespacerange endbfchar",
+		"1 begincodespacerange <00> <ff> endcodespacerange endbfrange",
+	} {
+		if m := readCmap(rawStream(content)); m != nil {
+			t.Errorf("readCmap(%q) = %v, want nil", content, m)
+		}
+	}
+}
