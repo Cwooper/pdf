@@ -83,3 +83,26 @@ func TestXrefEntryBound(t *testing.T) {
 		t.Error("xref stream: got nil error, want the entry bound reported")
 	}
 }
+
+// TestCyclicPrevChain verifies that a cross-reference /Prev pointing back at
+// an already-visited offset terminates instead of re-reading the same section
+// forever.
+func TestCyclicPrevChain(t *testing.T) {
+	headerLen := len("%PDF-1.4\n" + pad())
+
+	t.Run("classic table", func(t *testing.T) {
+		data := xrefTablePDF(
+			"0 1\n0000000000 65535 f \n",
+			fmt.Sprintf("<< /Size 1 /Prev %d >>", headerLen),
+		)
+		mustNotCrash(t, func() { openBytes(data) })
+	})
+
+	t.Run("xref stream", func(t *testing.T) {
+		data := xrefStreamPDF(
+			fmt.Sprintf("/Size 1 /W [1 1 1] /Prev %d", headerLen),
+			"\x01\x09\x00",
+		)
+		mustNotCrash(t, func() { openBytes(data) })
+	})
+}
