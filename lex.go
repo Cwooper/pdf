@@ -266,8 +266,9 @@ Loop:
 		case '\\':
 			switch c = b.readByte(); c {
 			default:
-				b.errorf("invalid escape sequence \\%c", c)
-				tmp = append(tmp, '\\', c)
+				// PDF 32000-1, 7.3.4.2: a backslash before any other
+				// character is ignored.
+				tmp = append(tmp, c)
 			case 'n':
 				tmp = append(tmp, '\n')
 			case 'r':
