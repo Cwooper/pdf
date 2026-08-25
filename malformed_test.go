@@ -244,11 +244,7 @@ func TestCompressedXrefStreamManyObjects(t *testing.T) {
 	}
 }
 
-// rawStream returns a Value of Kind Stream holding content, with no filter.
-func rawStream(content string) Value {
-	r := &Reader{f: bytes.NewReader([]byte(content)), end: int64(len(content))}
-	return Value{r: r, data: stream{dict{name("Length"): int64(len(content))}, objptr{}, 0}}
-}
+func rawStream(content string) Value { return memoryStream([]byte(content)) }
 
 // TestMalformedLexer covers tokenizer termination.
 func TestMalformedLexer(t *testing.T) {
@@ -288,9 +284,8 @@ func TestMalformedContentStream(t *testing.T) {
 
 // pageWithContent builds a Page whose /Contents is an unfiltered stream.
 func pageWithContent(content string) Page {
-	r := &Reader{f: bytes.NewReader([]byte(content)), end: int64(len(content))}
-	strm := stream{dict{name("Length"): int64(len(content))}, objptr{}, 0}
-	return Page{V: Value{r: r, data: dict{name("Contents"): strm}}}
+	s := rawStream(content)
+	return Page{V: Value{r: s.r, data: dict{name("Contents"): s.data}}}
 }
 
 // TestMalformedCmap covers the ToUnicode CMap parser.

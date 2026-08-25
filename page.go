@@ -36,6 +36,10 @@ const (
 	// many pages there are, and a hostile one would otherwise have the tree
 	// walked billions of times.
 	maxMissingPages = 64
+
+	// maxCmapBytes bounds a ToUnicode cmap read into memory. Real cmaps run
+	// to a few hundred kilobytes at most.
+	maxCmapBytes = 32 << 20
 )
 
 // A Page represent a single page in a PDF file.
@@ -482,7 +486,29 @@ func operandCount(stk *Stack, n, per int) int {
 	return n
 }
 
-func readCmap(toUnicode Value) (result *cmap) {
+// readCmap reads and parses a font's ToUnicode stream. The stream is read
+// here, outside the recovery in parseCmap: one that cannot be read at all, for
+// an unsupported filter or corrupt data, is reported the way any other
+// unreadable stream is, so an error-returning caller sees it rather than
+// silently decoding text with no cmap.
+func readCmap(toUnicode Value) *cmap {
+	data, err := io.ReadAll(io.LimitReader(toUnicode.Reader(), maxCmapBytes+1))
+	if err != nil {
+		panic(fmt.Errorf("reading ToUnicode cmap: %v", err))
+	}
+	if len(data) > maxCmapBytes {
+		panic("ToUnicode cmap too large")
+	}
+	return parseCmap(memoryStream(data))
+}
+
+// memoryStream returns an unfiltered stream Value holding data.
+func memoryStream(data []byte) Value {
+	r := &Reader{f: bytes.NewReader(data), end: int64(len(data))}
+	return Value{r: r, data: stream{dict{name("Length"): int64(len(data))}, objptr{}, 0}}
+}
+
+func parseCmap(toUnicode Value) (result *cmap) {
 	// A ToUnicode CMap is arbitrary data from the file, and Interpret reports
 	// malformed input by panicking. Treat that as "no usable cmap" so it does
 	// not escape into callers that cannot report it.
