@@ -1164,7 +1164,11 @@ type Outline struct {
 // Outline returns the document outline.
 // The Outline returned is the root of the outline tree and typically has no Title itself.
 // That is, the children of the returned root are the top-level entries in the outline.
-func (r *Reader) Outline() Outline {
+// A malformed reference somewhere in the tree yields the empty outline, as a
+// missing /Outlines does.
+func (r *Reader) Outline() (x Outline) {
+	var err error
+	defer recoverTo(&err, func() { x = Outline{} })
 	w := outlineWalk{budget: maxOutlineNodes, seen: make(map[objptr]bool)}
 	return w.build(r.Trailer().Key("Root").Key("Outlines"), 0)
 }
