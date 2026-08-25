@@ -197,6 +197,9 @@ func (b *buffer) readToken() token {
 	}
 }
 
+// readHexString reads the body of a hex string after its '<'. An odd number of
+// digits is valid: the final digit behaves as if followed by 0 (PDF 32000-1,
+// 7.3.4.3).
 func (b *buffer) readHexString() token {
 	tmp := b.tmp[:0]
 	for {
@@ -221,6 +224,15 @@ func (b *buffer) readHexString() token {
 		}
 		if isSpace(c2) {
 			goto Loop2
+		}
+		if c2 == '>' {
+			x := unhex(c) << 4
+			if x < 0 {
+				b.errorf("malformed hex string %c", c)
+				break
+			}
+			tmp = append(tmp, byte(x))
+			break
 		}
 		x := unhex(c)<<4 | unhex(c2)
 		if x < 0 {

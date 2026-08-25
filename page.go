@@ -6,7 +6,6 @@ package pdf
 
 import (
 	"bytes"
-	"errors"
 	"fmt"
 	"io"
 	"sort"
@@ -19,17 +18,29 @@ import (
 // from recursing until the goroutine stack is exhausted, which is a fatal
 // error that a caller cannot recover from.
 const (
-	// maxInheritDepth bounds a walk up a chain of /Parent links.
-	maxInheritDepth = 64
-
 	// maxPageTreeDepth bounds a descent through /Kids. Real page trees are
 	// broad and shallow.
 	maxPageTreeDepth = 1024
 
-	// maxOutlineDepth and maxOutlineSiblings bound the outline tree, whose
+	// maxInheritDepth bounds a walk up a chain of /Parent links, counting the
+	// page itself. A page at the bottom of the deepest tree Page accepts has
+	// maxPageTreeDepth ancestors, all of which may carry inherited entries.
+	maxInheritDepth = maxPageTreeDepth + 1
+
+	// maxOutlineDepth and maxOutlineNodes bound the outline tree, whose
 	// /First and /Next links can both be made cyclic.
-	maxOutlineDepth    = 128
-	maxOutlineSiblings = 1 << 16
+	maxOutlineDepth = 128
+	maxOutlineNodes = 1 << 16
+
+	// maxCmapBytes bounds a ToUnicode cmap read into memory. Real cmaps run
+	// to a few hundred kilobytes at most.
+	maxCmapBytes = 32 << 20
+
+	// maxMissingPages bounds how many page numbers in a row may resolve to
+	// no page before extraction stops. /Count is the file's own claim of how
+	// many pages there are, and a hostile one would otherwise have the tree
+	// walked billions of times.
+	maxMissingPages = 64
 )
 
 // A Page represent a single page in a PDF file.
@@ -89,17 +100,22 @@ func (r *Reader) NumPage() int {
 func (r *Reader) GetPlainText() (reader io.Reader, err error) {
 	// Resolving objects panics on malformed input, and that happens here in
 	// NumPage, Page and Fonts as well as inside Page.GetPlainText.
-	defer func() {
-		if e := recover(); e != nil {
-			reader, err = &bytes.Buffer{}, fmt.Errorf("malformed PDF: %v", e)
-		}
-	}()
+	reader = &bytes.Buffer{}
+	defer recoverTo(&err, nil)
 
 	pages := r.NumPage()
 	var buf bytes.Buffer
 	fonts := make(map[string]*Font)
+	missing := 0
 	for i := 1; i <= pages; i++ {
 		p := r.Page(i)
+		if p.V.IsNull() {
+			if missing++; missing > maxMissingPages {
+				break
+			}
+			continue
+		}
+		missing = 0
 		for name, f := range p.fontCache() { // cache fonts so we don't continually parse charmap
 			if _, ok := fonts[name]; !ok {
 				fonts[name] = f
@@ -118,17 +134,21 @@ func (r *Reader) GetPlainText() (reader io.Reader, err error) {
 func (r *Reader) GetStyledTexts() (sentences []Text, err error) {
 	// Page.Content has no way to report a malformed content stream, so catch
 	// its panics here rather than letting them reach the caller.
-	defer func() {
-		if e := recover(); e != nil {
-			sentences, err = nil, fmt.Errorf("malformed PDF: %v", e)
-		}
-	}()
+	defer recoverTo(&err, nil)
 
+	var out []Text
 	totalPage := r.NumPage()
+	missing := 0
 	for pageIndex := 1; pageIndex <= totalPage; pageIndex++ {
 		p := r.Page(pageIndex)
-
-		if p.V.IsNull() || p.V.Key("Contents").Kind() == Null {
+		if p.V.IsNull() {
+			if missing++; missing > maxMissingPages {
+				break
+			}
+			continue
+		}
+		missing = 0
+		if p.V.Key("Contents").Kind() == Null {
 			continue
 		}
 		var lastTextStyle Text
@@ -142,16 +162,16 @@ func (r *Reader) GetStyledTexts() (sentences []Text, err error) {
 			if IsSameSentence(lastTextStyle, text) {
 				lastTextStyle.S = lastTextStyle.S + text.S
 			} else {
-				sentences = append(sentences, lastTextStyle)
+				out = append(out, lastTextStyle)
 				lastTextStyle = text
 			}
 		}
 		if len(lastTextStyle.S) > 0 {
-			sentences = append(sentences, lastTextStyle)
+			out = append(out, lastTextStyle)
 		}
 	}
 
-	return sentences, err
+	return out, nil
 }
 
 func (p Page) findInherited(key string) Value {
@@ -450,24 +470,45 @@ Parse:
 	return string(r)
 }
 
-// hasOperands reports whether stk holds enough values for n entries of per
-// entry operands each. The counts in a CMap are declared by the file rather
-// than measured, so an entry count is only credible if the operands to fill it
-// were actually supplied. Without this check a count of a few digits makes the
-// loops below append hundreds of millions of empty entries.
-func hasOperands(stk *Stack, n, per int) bool {
-	return n <= stk.Len()/per
+// operandCount returns how many entries of per operands a block can supply:
+// its declared count, or fewer when the stack holds fewer. Generators
+// miscount these blocks often enough that discarding the block, let alone the
+// whole cmap, would turn readable text into raw codes.
+func operandCount(stk *Stack, n, per int) int {
+	if have := stk.Len() / per; n > have {
+		n = have
+	}
+	return n
 }
 
-func readCmap(toUnicode Value) (result *cmap) {
+// readCmap reads and parses a font's ToUnicode stream. The stream is read
+// here, outside the recovery in parseCmap: one that cannot be read at all, for
+// an unsupported filter or corrupt data, is reported the way any other
+// unreadable stream is, so an error-returning caller sees it rather than
+// silently decoding text with no cmap.
+func readCmap(toUnicode Value) *cmap {
+	data, err := io.ReadAll(io.LimitReader(toUnicode.Reader(), maxCmapBytes+1))
+	if err != nil {
+		panic(fmt.Errorf("reading ToUnicode cmap: %v", err))
+	}
+	if len(data) > maxCmapBytes {
+		panic("ToUnicode cmap too large")
+	}
+	return parseCmap(memoryStream(data))
+}
+
+// memoryStream returns an unfiltered stream Value holding data.
+func memoryStream(data []byte) Value {
+	r := &Reader{f: bytes.NewReader(data), end: int64(len(data))}
+	return Value{r: r, data: stream{dict{name("Length"): int64(len(data))}, objptr{}, 0}}
+}
+
+func parseCmap(toUnicode Value) (result *cmap) {
 	// A ToUnicode CMap is arbitrary data from the file, and Interpret reports
 	// malformed input by panicking. Treat that as "no usable cmap" so it does
 	// not escape into callers such as Page.Content, which cannot report it.
-	defer func() {
-		if r := recover(); r != nil {
-			result = nil
-		}
-	}()
+	var err error
+	defer recoverTo(&err, nil)
 
 	n := -1
 	var m cmap
@@ -488,13 +529,14 @@ func readCmap(toUnicode Value) (result *cmap) {
 		case "begincodespacerange":
 			n = int(stk.Pop().Int64())
 		case "endcodespacerange":
-			if n < 0 || !hasOperands(stk, n, 2) {
+			if n < 0 {
 				if DebugOn {
-					println("missing or malformed begincodespacerange")
+					println("missing begincodespacerange")
 				}
 				ok = false
 				return
 			}
+			n = operandCount(stk, n, 2)
 			for i := 0; i < n; i++ {
 				hi, lo := stk.Pop().RawString(), stk.Pop().RawString()
 				if len(lo) == 0 || len(lo) != len(hi) {
@@ -519,13 +561,14 @@ func readCmap(toUnicode Value) (result *cmap) {
 		case "beginbfchar":
 			n = int(stk.Pop().Int64())
 		case "endbfchar":
-			if n < 0 || !hasOperands(stk, n, 2) {
+			if n < 0 {
 				if DebugOn {
-					println("missing or malformed beginbfchar")
+					println("missing beginbfchar")
 				}
 				ok = false
 				return
 			}
+			n = operandCount(stk, n, 2)
 			for i := 0; i < n; i++ {
 				repl, orig := stk.Pop().RawString(), stk.Pop().RawString()
 				m.bfchar = append(m.bfchar, bfchar{orig, repl})
@@ -534,13 +577,14 @@ func readCmap(toUnicode Value) (result *cmap) {
 		case "beginbfrange":
 			n = int(stk.Pop().Int64())
 		case "endbfrange":
-			if n < 0 || !hasOperands(stk, n, 3) {
+			if n < 0 {
 				if DebugOn {
-					println("missing or malformed beginbfrange")
+					println("missing beginbfrange")
 				}
 				ok = false
 				return
 			}
+			n = operandCount(stk, n, 3)
 			for i := 0; i < n; i++ {
 				dst, srcHi, srcLo := stk.Pop(), stk.Pop().RawString(), stk.Pop().RawString()
 				m.bfrange = append(m.bfrange, bfrange{srcLo, srcHi, dst})
@@ -634,13 +678,25 @@ func popArgs(stk *Stack) []Value {
 }
 
 // recoverTo recovers from a panic raised while parsing PDF content and stores
-// it in err, after calling reset to discard any partially built result. It is
-// meant to be deferred by methods that use panic-based parse error handling.
+// it in err, after calling reset (if non-nil) to discard any partially built
+// result. It is meant to be deferred by methods that use panic-based parse
+// error handling. A PDF is untrusted by definition, and opening a corrupt or
+// hostile file must not take down the caller. Every error reads "malformed
+// PDF: ..." exactly once: errors that already carry the prefix, the lexer's
+// own, are passed through as they are.
 func recoverTo(err *error, reset func()) {
-	if r := recover(); r != nil {
-		reset()
-		*err = errors.New(fmt.Sprint(r))
+	r := recover()
+	if r == nil {
+		return
 	}
+	if reset != nil {
+		reset()
+	}
+	if e, ok := r.(error); ok && strings.HasPrefix(e.Error(), "malformed PDF") {
+		*err = e
+		return
+	}
+	*err = fmt.Errorf("malformed PDF: %v", r)
 }
 
 // decodeText decodes raw font code points with enc and returns UTF-8 text.
@@ -737,6 +793,7 @@ type Columns []*Column
 // GetTextByColumn returns the page's all text grouped by column
 func (p Page) GetTextByColumn() (result Columns, err error) {
 	defer recoverTo(&err, func() { result = Columns{} })
+	columns := Columns{}
 
 	showText := func(enc TextEncoding, currentX, currentY float64, s string) {
 		text := Text{
@@ -747,7 +804,7 @@ func (p Page) GetTextByColumn() (result Columns, err error) {
 
 		var currentColumn *Column
 		columnFound := false
-		for _, column := range result {
+		for _, column := range columns {
 			if int64(currentX) == column.Position {
 				currentColumn = column
 				columnFound = true
@@ -760,7 +817,7 @@ func (p Page) GetTextByColumn() (result Columns, err error) {
 				Position: int64(currentX),
 				Content:  TextVertical{},
 			}
-			result = append(result, currentColumn)
+			columns = append(columns, currentColumn)
 		}
 
 		currentColumn.Content = append(currentColumn.Content, text)
@@ -768,15 +825,15 @@ func (p Page) GetTextByColumn() (result Columns, err error) {
 
 	p.walkTextBlocks(showText)
 
-	for _, column := range result {
+	for _, column := range columns {
 		sort.Sort(column.Content)
 	}
 
-	sort.Slice(result, func(i, j int) bool {
-		return result[i].Position < result[j].Position
+	sort.Slice(columns, func(i, j int) bool {
+		return columns[i].Position < columns[j].Position
 	})
 
-	return result, err
+	return columns, nil
 }
 
 // Row represents the contents of a row
@@ -791,6 +848,7 @@ type Rows []*Row
 // GetTextByRow returns the page's all text grouped by rows
 func (p Page) GetTextByRow() (result Rows, err error) {
 	defer recoverTo(&err, func() { result = Rows{} })
+	rows := Rows{}
 
 	showText := func(enc TextEncoding, currentX, currentY float64, s string) {
 		text := Text{
@@ -801,7 +859,7 @@ func (p Page) GetTextByRow() (result Rows, err error) {
 
 		var currentRow *Row
 		rowFound := false
-		for _, row := range result {
+		for _, row := range rows {
 			if int64(currentY) == row.Position {
 				currentRow = row
 				rowFound = true
@@ -814,7 +872,7 @@ func (p Page) GetTextByRow() (result Rows, err error) {
 				Position: int64(currentY),
 				Content:  TextHorizontal{},
 			}
-			result = append(result, currentRow)
+			rows = append(rows, currentRow)
 		}
 
 		currentRow.Content = append(currentRow.Content, text)
@@ -822,15 +880,15 @@ func (p Page) GetTextByRow() (result Rows, err error) {
 
 	p.walkTextBlocks(showText)
 
-	for _, row := range result {
+	for _, row := range rows {
 		sort.Sort(row.Content)
 	}
 
-	sort.Slice(result, func(i, j int) bool {
-		return result[i].Position > result[j].Position
+	sort.Slice(rows, func(i, j int) bool {
+		return rows[i].Position > rows[j].Position
 	})
 
-	return result, err
+	return rows, nil
 }
 
 func (p Page) walkTextBlocks(walker func(enc TextEncoding, x, y float64, s string)) {
@@ -1174,25 +1232,63 @@ type Outline struct {
 // Outline returns the document outline.
 // The Outline returned is the root of the outline tree and typically has no Title itself.
 // That is, the children of the returned root are the top-level entries in the outline.
-func (r *Reader) Outline() Outline {
-	return buildOutline(r.Trailer().Key("Root").Key("Outlines"), 0)
+// A malformed reference somewhere in the tree yields the empty outline, as a
+// missing /Outlines does.
+func (r *Reader) Outline() (x Outline) {
+	var err error
+	defer recoverTo(&err, nil)
+	w := outlineWalk{budget: maxOutlineNodes, seen: make(map[objptr]bool)}
+	return w.build(r.Trailer().Key("Root").Key("Outlines"), 0)
 }
 
-func buildOutline(entry Value, depth int) Outline {
+// An outlineWalk builds an Outline from a tree whose /First and /Next links
+// can both be made cyclic.
+type outlineWalk struct {
+	// budget is the number of nodes still allowed for the whole tree, and is
+	// charged before any other check on a node. Bounding depth and siblings
+	// separately is not enough: an entry whose /First and /Next both point
+	// back at itself multiplies the two limits combinatorially, and a depth
+	// cut that cost nothing would let the sibling loop above it spin forever.
+	budget int
+	// seen holds the references followed so far. Outline items are indirect
+	// objects, so a reference met again is a cycle, and the item it names is
+	// already built.
+	seen map[objptr]bool
+}
+
+func (w *outlineWalk) build(entry Value, depth int) Outline {
 	var x Outline
+	if w.budget <= 0 {
+		return x
+	}
+	w.budget--
 	// A /First pointing at its own entry recurses until the stack is gone,
 	// which is fatal rather than recoverable.
 	if depth > maxOutlineDepth {
 		return x
 	}
 	x.Title = entry.Key("Title").Text()
-	n := 0
-	for child := entry.Key("First"); child.Kind() == Dict; child = child.Key("Next") {
-		// Likewise a cyclic /Next never reaches a null sibling.
-		if n++; n > maxOutlineSiblings {
+	child, ok := w.follow(entry, "First")
+	for ok && child.Kind() == Dict {
+		if w.budget <= 0 {
 			break
 		}
-		x.Child = append(x.Child, buildOutline(child, depth+1))
+		x.Child = append(x.Child, w.build(child, depth+1))
+		child, ok = w.follow(child, "Next")
 	}
 	return x
+}
+
+// follow resolves entry's key, reporting false for a reference already
+// followed.
+func (w *outlineWalk) follow(entry Value, key string) (Value, bool) {
+	if d, ok := entry.data.(dict); ok {
+		if ref, ok := d[name(key)].(objptr); ok {
+			if w.seen[ref] {
+				return Value{}, false
+			}
+			w.seen[ref] = true
+		}
+	}
+	return entry.Key(key), true
 }

@@ -237,7 +237,7 @@ func TestCompressedXrefStreamManyObjects(t *testing.T) {
 // stream returns a Value of Kind Stream holding content, with no filter.
 func rawStream(content string) Value {
 	r := &Reader{f: bytes.NewReader([]byte(content)), end: int64(len(content))}
-	return Value{r, objptr{}, stream{dict{name("Length"): int64(len(content))}, objptr{}, 0}}
+	return Value{r: r, data: stream{dict{name("Length"): int64(len(content))}, objptr{}, 0}}
 }
 
 // TestMalformedLexer covers tokenizer termination.
@@ -302,7 +302,7 @@ func TestMalformedContentStream(t *testing.T) {
 func pageWithContent(content string) Page {
 	r := &Reader{f: bytes.NewReader([]byte(content)), end: int64(len(content))}
 	strm := stream{dict{name("Length"): int64(len(content))}, objptr{}, 0}
-	return Page{V: Value{r, objptr{}, dict{name("Contents"): strm}}}
+	return Page{V: Value{r: r, data: dict{name("Contents"): strm}}}
 }
 
 // TestGetTextByRowColumnReportErrors pins the named-return fix: a panic has to
@@ -427,7 +427,7 @@ func TestCyclicReferences(t *testing.T) {
 		d := dict{}
 		d[name("Parent")] = d
 		mustNotCrash(t, func() {
-			Page{V: Value{newReader(), objptr{}, d}}.Resources()
+			Page{V: Value{r: newReader(), data: d}}.Resources()
 		})
 	})
 
@@ -439,7 +439,7 @@ func TestCyclicReferences(t *testing.T) {
 			cur = dict{name("Parent"): cur}
 		}
 		mustNotCrash(t, func() {
-			Page{V: Value{newReader(), objptr{}, cur}}.Resources()
+			Page{V: Value{r: newReader(), data: cur}}.Resources()
 		})
 	})
 
@@ -585,12 +585,17 @@ func TestValidPDFStillParses(t *testing.T) {
 // objStmPDF builds a well-formed PDF that keeps its catalog, page tree and page
 // inside an object stream, indexed by a cross-reference stream. This is the
 // layout every /Size, /W, /Index and /N check has to keep working.
-func objStmPDF() []byte { return objStmPDFWith("") }
+func objStmPDF() []byte { return objStmPDFWith("/N 3 /First FIRST") }
 
-// objStmPDFWith is objStmPDF with the object stream's /N and /First replaced by
-// hdr, to exercise the checks on those values. An empty hdr keeps the correct
-// ones.
-func objStmPDFWith(hdr string) []byte {
+// objStmPDFWith is objStmPDF with the object stream's /N and /First entries
+// replaced by hdr, to exercise the checks on those values.
+func objStmPDFWith(hdr string) []byte { return buildObjStmPDF(hdr, "", 0) }
+
+// buildObjStmPDF is the generator behind objStmPDF. FIRST in hdr is replaced
+// by the computed /First. pairPrefix is inserted in front of the index table,
+// and extra names how many further object numbers (7, 8, ...) the
+// cross-reference stream should also place inside object stream 5.
+func buildObjStmPDF(hdr, pairPrefix string, extra int) []byte {
 	const content = "BT /F1 24 Tf 100 700 Td (Hello Stream) Tj ET\n"
 
 	inner := []struct {
@@ -605,6 +610,7 @@ func objStmPDFWith(hdr string) []byte {
 	// An object stream holds a table of "number offset" pairs, then the
 	// objects themselves starting at /First.
 	var pairs, bodies strings.Builder
+	pairs.WriteString(pairPrefix)
 	for _, o := range inner {
 		fmt.Fprintf(&pairs, "%d %d ", o.num, bodies.Len())
 		bodies.WriteString(o.body + "\n")
@@ -619,9 +625,7 @@ func objStmPDFWith(hdr string) []byte {
 	off[4] = b.Len()
 	fmt.Fprintf(&b, "4 0 obj\n<< /Length %d >>\nstream\n%sendstream\nendobj\n", len(content), content)
 
-	if hdr == "" {
-		hdr = fmt.Sprintf("/N %d /First %d", len(inner), first)
-	}
+	hdr = strings.ReplaceAll(hdr, "FIRST", fmt.Sprint(first))
 	off[5] = b.Len()
 	fmt.Fprintf(&b, "5 0 obj\n<< /Type /ObjStm %s /Length %d >>\nstream\n%s\nendstream\nendobj\n",
 		hdr, len(objstm), objstm)
@@ -640,8 +644,11 @@ func objStmPDFWith(hdr string) []byte {
 	put(1, uint32(off[4]), 0) // object 4, at a file offset
 	put(1, uint32(off[5]), 0) // object 5
 	put(1, uint32(off[6]), 0) // object 6
-	fmt.Fprintf(&b, "6 0 obj\n<< /Type /XRef /Size 7 /W [1 4 2] /Root 1 0 R /Length %d >>\nstream\n%s\nendstream\nendobj\n",
-		entries.Len(), entries.String())
+	for i := 0; i < extra; i++ {
+		put(2, 5, uint16(3+i)) // objects 7, 8, ... claimed to be in stream 5
+	}
+	fmt.Fprintf(&b, "6 0 obj\n<< /Type /XRef /Size %d /W [1 4 2] /Root 1 0 R /Length %d >>\nstream\n%s\nendstream\nendobj\n",
+		7+extra, entries.Len(), entries.String())
 
 	fmt.Fprintf(&b, "startxref\n%d\n%%%%EOF\n", off[6])
 	return []byte(b.String())
@@ -700,11 +707,7 @@ func TestMalformedObjectStream(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			hdr := tt.hdr
-			if hdr == "" {
-				hdr = " " // keep objStmPDFWith from filling in the valid header
-			}
-			data := objStmPDFWith(hdr)
+			data := objStmPDFWith(tt.hdr)
 			// Opening may succeed, since the object stream is only read when an
 			// object inside it is resolved. Either way nothing may crash or
 			// hang, and any failure has to arrive as an error.
