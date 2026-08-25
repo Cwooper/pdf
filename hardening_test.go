@@ -304,3 +304,22 @@ func TestCmapMissingBeginDiscarded(t *testing.T) {
 		}
 	}
 }
+
+// TestToUnicodeStreamErrorReported verifies that a ToUnicode stream that
+// cannot be read at all -- an unsupported filter here -- is reported like any
+// other unreadable stream, rather than silently decoding text with no cmap.
+func TestToUnicodeStreamErrorReported(t *testing.T) {
+	const content = "BT /F1 12 Tf (AB) Tj ET"
+	file := content + "junk"
+	r := &Reader{f: bytes.NewReader([]byte(file)), end: int64(len(file))}
+	toUnicode := stream{dict{name("Length"): int64(4), name("Filter"): name("LZWDecode")}, objptr{}, int64(len(content))}
+	font := dict{name("Type"): name("Font"), name("Subtype"): name("Type1"), name("ToUnicode"): toUnicode}
+	page := dict{
+		name("Resources"): dict{name("Font"): dict{name("F1"): font}},
+		name("Contents"):  stream{dict{name("Length"): int64(len(content))}, objptr{}, 0},
+	}
+	p := Page{V: Value{r: r, data: page}}
+	if _, err := p.GetPlainText(nil); err == nil {
+		t.Error("GetPlainText: got nil error, want the unsupported ToUnicode filter reported")
+	}
+}
