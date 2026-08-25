@@ -187,3 +187,21 @@ func TestOutlineMalformedReturns(t *testing.T) {
 	}
 	mustNotCrash(t, func() { r.Outline() })
 }
+
+// TestObjectStreamHeaderCycle verifies the resolve depth cap holds when the
+// cycle runs through an object stream's own header: /N is a reference to an
+// object the stream claims to contain, so resolving it re-enters the stream.
+// Before the fix the depth counter restarted at zero on each hop and the
+// goroutine stack overflowed, which is fatal rather than recoverable.
+func TestObjectStreamHeaderCycle(t *testing.T) {
+	data := buildObjStmPDF("/N 7 0 R /First FIRST", 1)
+	mustNotCrash(t, func() {
+		r, err := NewReader(bytes.NewReader(data), int64(len(data)))
+		if err != nil {
+			return
+		}
+		if _, err := r.GetPlainText(); err == nil {
+			t.Error("GetPlainText: got nil error, want the cycle reported")
+		}
+	})
+}

@@ -234,7 +234,7 @@ func TestCompressedXrefStreamManyObjects(t *testing.T) {
 // stream returns a Value of Kind Stream holding content, with no filter.
 func rawStream(content string) Value {
 	r := &Reader{f: bytes.NewReader([]byte(content)), end: int64(len(content))}
-	return Value{r, objptr{}, stream{dict{name("Length"): int64(len(content))}, objptr{}, 0}}
+	return Value{r: r, data: stream{dict{name("Length"): int64(len(content))}, objptr{}, 0}}
 }
 
 // TestMalformedLexer covers tokenizer termination.
@@ -278,7 +278,7 @@ func TestMalformedContentStream(t *testing.T) {
 func pageWithContent(content string) Page {
 	r := &Reader{f: bytes.NewReader([]byte(content)), end: int64(len(content))}
 	strm := stream{dict{name("Length"): int64(len(content))}, objptr{}, 0}
-	return Page{V: Value{r, objptr{}, dict{name("Contents"): strm}}}
+	return Page{V: Value{r: r, data: dict{name("Contents"): strm}}}
 }
 
 // TestMalformedCmap covers the ToUnicode CMap parser.
@@ -389,7 +389,7 @@ func TestCyclicReferences(t *testing.T) {
 		d := dict{}
 		d[name("Parent")] = d
 		mustNotCrash(t, func() {
-			Page{V: Value{newReader(), objptr{}, d}}.Resources()
+			Page{V: Value{r: newReader(), data: d}}.Resources()
 		})
 	})
 
@@ -401,7 +401,7 @@ func TestCyclicReferences(t *testing.T) {
 			cur = dict{name("Parent"): cur}
 		}
 		mustNotCrash(t, func() {
-			Page{V: Value{newReader(), objptr{}, cur}}.Resources()
+			Page{V: Value{r: newReader(), data: cur}}.Resources()
 		})
 	})
 
@@ -533,7 +533,13 @@ func objStmPDF() []byte { return objStmPDFWith("") }
 // objStmPDFWith is objStmPDF with the object stream's /N and /First replaced by
 // hdr, to exercise the checks on those values. An empty hdr keeps the correct
 // ones.
-func objStmPDFWith(hdr string) []byte {
+func objStmPDFWith(hdr string) []byte { return buildObjStmPDF(hdr, 0) }
+
+// buildObjStmPDF is the generator behind objStmPDFWith. FIRST in hdr is
+// replaced by the computed /First, and extra names how many further object
+// numbers (7, 8, ...) the cross-reference stream should also place inside
+// object stream 5.
+func buildObjStmPDF(hdr string, extra int) []byte {
 	const content = "BT /F1 24 Tf 100 700 Td (Hello Stream) Tj ET\n"
 
 	inner := []struct {
@@ -565,6 +571,7 @@ func objStmPDFWith(hdr string) []byte {
 	if hdr == "" {
 		hdr = fmt.Sprintf("/N %d /First %d", len(inner), first)
 	}
+	hdr = strings.ReplaceAll(hdr, "FIRST", fmt.Sprint(first))
 	off[5] = b.Len()
 	fmt.Fprintf(&b, "5 0 obj\n<< /Type /ObjStm %s /Length %d >>\nstream\n%s\nendstream\nendobj\n",
 		hdr, len(objstm), objstm)
@@ -583,8 +590,11 @@ func objStmPDFWith(hdr string) []byte {
 	put(1, uint32(off[4]), 0) // object 4, at a file offset
 	put(1, uint32(off[5]), 0) // object 5
 	put(1, uint32(off[6]), 0) // object 6
-	fmt.Fprintf(&b, "6 0 obj\n<< /Type /XRef /Size 7 /W [1 4 2] /Root 1 0 R /Length %d >>\nstream\n%s\nendstream\nendobj\n",
-		entries.Len(), entries.String())
+	for i := 0; i < extra; i++ {
+		put(2, 5, uint16(3+i)) // objects 7, 8, ... claimed to be in stream 5
+	}
+	fmt.Fprintf(&b, "6 0 obj\n<< /Type /XRef /Size %d /W [1 4 2] /Root 1 0 R /Length %d >>\nstream\n%s\nendstream\nendobj\n",
+		7+extra, entries.Len(), entries.String())
 
 	fmt.Fprintf(&b, "startxref\n%d\n%%%%EOF\n", off[6])
 	return []byte(b.String())

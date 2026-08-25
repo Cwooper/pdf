@@ -335,7 +335,7 @@ func NewReaderEncrypted(f io.ReaderAt, size int64, pw func() string) (r *Reader,
 
 // Trailer returns the file's Trailer value.
 func (r *Reader) Trailer() Value {
-	return Value{r, r.trailerptr, r.trailer}
+	return Value{r: r, ptr: r.trailerptr, data: r.trailer}
 }
 
 func readXref(r *Reader, b *buffer) (*xrefTable, objptr, dict, error) {
@@ -419,7 +419,7 @@ func readXrefStream(r *Reader, b *buffer) (*xrefTable, objptr, dict, error) {
 		if !ok {
 			return nil, fmt.Errorf("malformed PDF: xref prev stream not found: %v", objfmt(obj))
 		}
-		prev := Value{r, objptr{}, prevstrm}
+		prev := Value{r: r, data: prevstrm}
 		if prev.Kind() != Stream {
 			return nil, fmt.Errorf("malformed PDF: xref prev stream is not stream: %v", prev)
 		}
@@ -475,7 +475,7 @@ func readXrefStreamData(r *Reader, strm stream, table *xrefTable, size int64) (*
 		return nil, fmt.Errorf("invalid W array %v", objfmt(ww))
 	}
 
-	v := Value{r, objptr{}, strm}
+	v := Value{r: r, data: strm}
 	wtotal := 0
 	for _, wid := range w {
 		wtotal += wid
@@ -660,6 +660,9 @@ type Value struct {
 	r    *Reader
 	ptr  objptr
 	data interface{}
+	// depth is the object stream nesting at which the value was resolved,
+	// carried so that references followed from it keep counting.
+	depth int
 }
 
 // IsNull reports whether the value is a null. It is equivalent to Kind() == Null.
@@ -877,7 +880,7 @@ func (v Value) Key(key string) Value {
 		}
 		x = strm.hdr
 	}
-	return v.r.resolve(v.ptr, x[name(key)])
+	return v.r.resolveAt(v.ptr, x[name(key)], v.depth)
 }
 
 // Keys returns a sorted list of the keys in the dictionary v.
@@ -908,7 +911,7 @@ func (v Value) Index(i int) Value {
 	if !ok || i < 0 || i >= len(x) {
 		return Value{}
 	}
-	return v.r.resolve(v.ptr, x[i])
+	return v.r.resolveAt(v.ptr, x[i], v.depth)
 }
 
 // Len returns the length of the array v.
@@ -926,8 +929,12 @@ func (r *Reader) resolve(parent objptr, x interface{}) Value {
 }
 
 // resolveAt resolves x, tracking how deeply it has recursed through object
-// streams. The depth is a parameter rather than Reader state so that a Reader
-// stays immutable once opened and remains safe to read from concurrently.
+// streams. The depth is a parameter, and travels on the Values resolved here,
+// rather than being Reader state so that a Reader stays immutable once opened
+// and remains safe to read from concurrently. Carrying it on the Value matters:
+// an object stream's own header (/N, /First, /Length, /Extends) is read
+// through Key, and a reference there back into the stream would otherwise
+// restart the count at zero and recurse until the stack is gone.
 func (r *Reader) resolveAt(parent objptr, x interface{}, depth int) Value {
 	if ptr, ok := x.(objptr); ok {
 		xref := r.xref.get(ptr.id)
@@ -1007,9 +1014,9 @@ func (r *Reader) resolveAt(parent objptr, x interface{}, depth int) Value {
 
 	switch x := x.(type) {
 	case nil, bool, int64, float64, name, dict, array, stream:
-		return Value{r, parent, x}
+		return Value{r, parent, x, depth}
 	case string:
-		return Value{r, parent, x}
+		return Value{r, parent, x, depth}
 	default:
 		panic(fmt.Errorf("unexpected value type %T in resolve", x))
 	}
