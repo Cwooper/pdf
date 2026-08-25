@@ -196,3 +196,17 @@ func TestOddLengthHexString(t *testing.T) {
 		}
 	}
 }
+
+// TestXrefStreamZeroWidths verifies that an xref stream whose /W widths sum
+// to zero, so that its entries consume no input, is rejected.
+func TestXrefStreamZeroWidths(t *testing.T) {
+	data := xrefStreamPDF("/Size 8388608 /W [0 0 0]", "")
+	var err error
+	got := allocated(func() { err = openBytes(data) })
+	if err == nil {
+		t.Error("NewReader: got nil error, want the zero-width /W rejected")
+	}
+	if got > 8<<20 {
+		t.Errorf("opening a %d-byte file allocated %d MB", len(data), got>>20)
+	}
+}
