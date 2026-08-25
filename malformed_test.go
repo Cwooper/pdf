@@ -194,7 +194,7 @@ func TestLargeXrefTableGrows(t *testing.T) {
 	if err != nil {
 		t.Fatalf("NewReader: %v", err)
 	}
-	if got := len(r.xref); got != n {
+	if got := r.xref.size(); got != n {
 		t.Errorf("xref table has %d entries, want %d", got, n)
 	}
 }
@@ -229,7 +229,7 @@ func TestCompressedXrefStreamManyObjects(t *testing.T) {
 	if err != nil {
 		t.Fatalf("NewReader on a %d-byte file describing %d objects: %v", len(data), n, err)
 	}
-	if got := len(r.xref); got != n {
+	if got := r.xref.size(); got != n {
 		t.Errorf("xref table has %d entries, want %d", got, n)
 	}
 }
