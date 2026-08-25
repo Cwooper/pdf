@@ -19,12 +19,14 @@ import (
 // from recursing until the goroutine stack is exhausted, which is a fatal
 // error that a caller cannot recover from.
 const (
-	// maxInheritDepth bounds a walk up a chain of /Parent links.
-	maxInheritDepth = 64
-
 	// maxPageTreeDepth bounds a descent through /Kids. Real page trees are
 	// broad and shallow.
 	maxPageTreeDepth = 1024
+
+	// maxInheritDepth bounds a walk up a chain of /Parent links, counting the
+	// page itself. A page at the bottom of the deepest tree Page accepts has
+	// maxPageTreeDepth ancestors, all of which may carry inherited entries.
+	maxInheritDepth = maxPageTreeDepth + 1
 
 	// maxOutlineDepth and maxOutlineNodes bound the outline tree, whose
 	// /First and /Next links can both be made cyclic.
