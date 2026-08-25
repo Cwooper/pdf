@@ -172,3 +172,18 @@ func countOutline(o Outline) int {
 	}
 	return n
 }
+
+// TestOutlineMalformedReturns verifies that Outline, which has no error
+// return, absorbs the panic resolve raises on a broken reference rather than
+// letting it reach the caller.
+func TestOutlineMalformedReturns(t *testing.T) {
+	data := xrefTablePDF(
+		"0 2\n0000000000 65535 f \n0009999999 00000 n \n",
+		"<< /Size 2 /Root << /Outlines << /First 1 0 R >> >> >>",
+	)
+	r, err := NewReader(bytes.NewReader(data), int64(len(data)))
+	if err != nil {
+		t.Fatalf("NewReader: %v", err)
+	}
+	mustNotCrash(t, func() { r.Outline() })
+}
