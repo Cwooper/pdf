@@ -246,3 +246,16 @@ func TestXrefStreamZeroWidths(t *testing.T) {
 		t.Errorf("opening a %d-byte file allocated %d MB", len(data), got>>20)
 	}
 }
+
+// TestHugePageCount verifies that a /Count far beyond the pages the tree
+// holds does not turn text extraction into a loop over every claimed number.
+func TestHugePageCount(t *testing.T) {
+	r := &Reader{f: bytes.NewReader(nil), end: 0}
+	r.trailer = dict{name("Root"): dict{name("Pages"): dict{
+		name("Type"): name("Pages"), name("Kids"): array{}, name("Count"): int64(1 << 40),
+	}}}
+	mustNotCrash(t, func() {
+		r.GetPlainText()
+		r.GetStyledTexts()
+	})
+}
