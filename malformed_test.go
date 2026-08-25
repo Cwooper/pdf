@@ -9,6 +9,7 @@ import (
 	"encoding/binary"
 	"fmt"
 	"io"
+	"runtime"
 	"strings"
 	"testing"
 	"time"
@@ -48,6 +49,25 @@ func mustNotCrash(t *testing.T, fn func()) {
 func openBytes(data []byte) error {
 	_, err := NewReader(bytes.NewReader(data), int64(len(data)))
 	return err
+}
+
+func openPDF(t *testing.T, data []byte) *Reader {
+	t.Helper()
+	r, err := NewReader(bytes.NewReader(data), int64(len(data)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	return r
+}
+
+// allocated returns the bytes fn allocates.
+func allocated(fn func()) uint64 {
+	var before, after runtime.MemStats
+	runtime.GC()
+	runtime.ReadMemStats(&before)
+	fn()
+	runtime.ReadMemStats(&after)
+	return after.TotalAlloc - before.TotalAlloc
 }
 
 // pad returns a comment line long enough to push a file past the 100-byte
@@ -184,7 +204,7 @@ func TestLargeXrefTableGrows(t *testing.T) {
 	if err != nil {
 		t.Fatalf("NewReader: %v", err)
 	}
-	if got := len(r.xref); got != n {
+	if got := r.xref.n; got != n {
 		t.Errorf("xref table has %d entries, want %d", got, n)
 	}
 }
@@ -219,7 +239,7 @@ func TestCompressedXrefStreamManyObjects(t *testing.T) {
 	if err != nil {
 		t.Fatalf("NewReader on a %d-byte file describing %d objects: %v", len(data), n, err)
 	}
-	if got := len(r.xref); got != n {
+	if got := r.xref.n; got != n {
 		t.Errorf("xref table has %d entries, want %d", got, n)
 	}
 }
