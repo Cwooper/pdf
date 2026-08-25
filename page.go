@@ -471,13 +471,15 @@ Parse:
 	return string(r)
 }
 
-// hasOperands reports whether stk holds enough values for n entries of per
-// entry operands each. The counts in a CMap are declared by the file rather
-// than measured, so an entry count is only credible if the operands to fill it
-// were actually supplied. Without this check a count of a few digits makes the
-// loops below append hundreds of millions of empty entries.
-func hasOperands(stk *Stack, n, per int) bool {
-	return n <= stk.Len()/per
+// operandCount returns how many entries of per operands a block can supply:
+// its declared count, or fewer when the stack holds fewer. Generators
+// miscount these blocks often enough that discarding the block, let alone the
+// whole cmap, would turn readable text into raw codes.
+func operandCount(stk *Stack, n, per int) int {
+	if have := stk.Len() / per; n > have {
+		n = have
+	}
+	return n
 }
 
 func readCmap(toUnicode Value) (result *cmap) {
@@ -509,13 +511,14 @@ func readCmap(toUnicode Value) (result *cmap) {
 		case "begincodespacerange":
 			n = int(stk.Pop().Int64())
 		case "endcodespacerange":
-			if n < 0 || !hasOperands(stk, n, 2) {
+			if n < 0 {
 				if DebugOn {
-					println("missing or malformed begincodespacerange")
+					println("missing begincodespacerange")
 				}
 				ok = false
 				return
 			}
+			n = operandCount(stk, n, 2)
 			for i := 0; i < n; i++ {
 				hi, lo := stk.Pop().RawString(), stk.Pop().RawString()
 				if len(lo) == 0 || len(lo) != len(hi) {
@@ -540,13 +543,14 @@ func readCmap(toUnicode Value) (result *cmap) {
 		case "beginbfchar":
 			n = int(stk.Pop().Int64())
 		case "endbfchar":
-			if n < 0 || !hasOperands(stk, n, 2) {
+			if n < 0 {
 				if DebugOn {
-					println("missing or malformed beginbfchar")
+					println("missing beginbfchar")
 				}
 				ok = false
 				return
 			}
+			n = operandCount(stk, n, 2)
 			for i := 0; i < n; i++ {
 				repl, orig := stk.Pop().RawString(), stk.Pop().RawString()
 				m.bfchar = append(m.bfchar, bfchar{orig, repl})
@@ -555,13 +559,14 @@ func readCmap(toUnicode Value) (result *cmap) {
 		case "beginbfrange":
 			n = int(stk.Pop().Int64())
 		case "endbfrange":
-			if n < 0 || !hasOperands(stk, n, 3) {
+			if n < 0 {
 				if DebugOn {
-					println("missing or malformed beginbfrange")
+					println("missing beginbfrange")
 				}
 				ok = false
 				return
 			}
+			n = operandCount(stk, n, 3)
 			for i := 0; i < n; i++ {
 				dst, srcHi, srcLo := stk.Pop(), stk.Pop().RawString(), stk.Pop().RawString()
 				m.bfrange = append(m.bfrange, bfrange{srcLo, srcHi, dst})
