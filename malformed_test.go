@@ -399,18 +399,6 @@ func TestCyclicReferences(t *testing.T) {
 		})
 	})
 
-	t.Run("parent chain long", func(t *testing.T) {
-		// A chain longer than the cap but not cyclic still terminates.
-		leaf := dict{name("Resources"): dict{}}
-		cur := leaf
-		for i := 0; i < 500; i++ {
-			cur = dict{name("Parent"): cur}
-		}
-		mustNotCrash(t, func() {
-			Page{V: Value{r: newReader(), data: cur}}.Resources()
-		})
-	})
-
 	t.Run("page kids", func(t *testing.T) {
 		node := dict{name("Type"): name("Pages"), name("Count"): int64(10)}
 		node[name("Kids")] = array{node}

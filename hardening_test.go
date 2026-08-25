@@ -287,3 +287,20 @@ func TestToUnicodeStreamErrorReported(t *testing.T) {
 		t.Error("GetPlainText: got nil error, want the unsupported ToUnicode filter reported")
 	}
 }
+
+// TestDeepPageTreeInheritsResources verifies that a page as deep as the page
+// tree walk allows still inherits attributes from the top of the tree: Page
+// descends maxPageTreeDepth levels, so the page has that many ancestors.
+func TestDeepPageTreeInheritsResources(t *testing.T) {
+	root := dict{name("Resources"): dict{name("Font"): dict{name("F1"): dict{}}}}
+	cur := root
+	for i := 0; i < maxPageTreeDepth-1; i++ {
+		cur = dict{name("Parent"): cur}
+	}
+	page := dict{name("Type"): name("Page"), name("Parent"): cur}
+	r := &Reader{f: bytes.NewReader(nil), end: 0}
+	p := Page{V: Value{r: r, data: page}}
+	if got := p.Fonts(); len(got) != 1 || got[0] != "F1" {
+		t.Errorf("Fonts = %v, want [F1]", got)
+	}
+}
