@@ -175,3 +175,24 @@ func TestObjectStreamHeaderCycle(t *testing.T) {
 		}
 	})
 }
+
+// TestOddLengthHexString verifies the PDF 7.3.4.3 rule: a hex string with an
+// odd digit count behaves as if a final 0 were appended.
+func TestOddLengthHexString(t *testing.T) {
+	for _, tc := range []struct{ in, want string }{
+		{"<F>", "\xf0"},
+		{"<ABC>", "\xab\xc0"},
+		{"<901FA>", "\x90\x1f\xa0"},
+		{"<90 1F A>", "\x90\x1f\xa0"},
+	} {
+		var tok token
+		mustNotCrash(t, func() {
+			b := newBuffer(strings.NewReader(tc.in), 0)
+			b.allowEOF = true
+			tok = b.readToken()
+		})
+		if got, ok := tok.(string); !ok || got != tc.want {
+			t.Errorf("%q: token = %#v, want %q", tc.in, tok, tc.want)
+		}
+	}
+}
