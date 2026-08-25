@@ -165,7 +165,7 @@ func TestOutlineMalformedReturns(t *testing.T) {
 // Before the fix the depth counter restarted at zero on each hop and the
 // goroutine stack overflowed, which is fatal rather than recoverable.
 func TestObjectStreamHeaderCycle(t *testing.T) {
-	data := buildObjStmPDF("/N 7 0 R /First FIRST", 1)
+	data := buildObjStmPDF("/N 7 0 R /First FIRST", "", 1)
 	mustNotCrash(t, func() {
 		r, err := NewReader(bytes.NewReader(data), int64(len(data)))
 		if err != nil {
@@ -318,5 +318,23 @@ func TestNegativeStreamLength(t *testing.T) {
 	}
 	if len(got) != 0 {
 		t.Errorf("read %d bytes from a stream with /Length -1, want 0", len(got))
+	}
+}
+
+// TestObjectStreamIndexJunk verifies that junk in an object stream's index
+// table is skipped rather than ending the scan, so the objects listed after it
+// still resolve: a non-integer offset, a negative one in a pair not looked up,
+// and object numbers outside the 32-bit range, which must not alias real ones.
+func TestObjectStreamIndexJunk(t *testing.T) {
+	for _, prefix := range []string{"9 12.0 ", "9 -1 ", "4294967297 5 ", "-4294967295 5 "} {
+		t.Run(strings.TrimSpace(prefix), func(t *testing.T) {
+			text, err := openPDF(t, buildObjStmPDF("/N 4 /First FIRST", prefix, 0)).GetPlainText()
+			if err != nil {
+				t.Fatalf("GetPlainText: %v", err)
+			}
+			if got, _ := io.ReadAll(text); !strings.Contains(string(got), "Hello Stream") {
+				t.Errorf("GetPlainText = %q, want it to contain %q", got, "Hello Stream")
+			}
+		})
 	}
 }
