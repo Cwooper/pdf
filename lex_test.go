@@ -82,3 +82,13 @@ func TestLiteralStringUnknownEscape(t *testing.T) {
 		}
 	}
 }
+
+// TestLiteralStringCutOffByEOF verifies that a literal string cut off by the
+// end of input ends there, without the '\n' readByte reports at the end.
+func TestLiteralStringCutOffByEOF(t *testing.T) {
+	b := newBuffer(strings.NewReader("(unterminated"), 0)
+	b.allowEOF = true
+	if got := b.readToken(); got != "unterminated" {
+		t.Errorf("readToken = %#v, want %q", got, "unterminated")
+	}
+}

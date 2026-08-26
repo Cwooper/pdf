@@ -250,8 +250,12 @@ func (b *buffer) readLiteralString() token {
 	tmp := b.tmp[:0]
 	depth := 1
 Loop:
-	for !b.eof {
+	for {
 		c := b.readByte()
+		// The end of input reads as '\n'; it ends the string, not part of it.
+		if b.eof {
+			break
+		}
 		switch c {
 		default:
 			tmp = append(tmp, c)
