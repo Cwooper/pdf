@@ -3,6 +3,7 @@ package pdf
 import (
 	"bytes"
 	"fmt"
+	"reflect"
 	"strings"
 	"testing"
 	"time"
@@ -90,5 +91,17 @@ func TestLiteralStringCutOffByEOF(t *testing.T) {
 	b.allowEOF = true
 	if got := b.readToken(); got != "unterminated" {
 		t.Errorf("readToken = %#v, want %q", got, "unterminated")
+	}
+}
+
+// TestDictValueCutOffByEOF verifies that a dictionary value cut off by the
+// end of input reads as null rather than as the io.EOF marker, which resolve
+// rejects as an unexpected type.
+func TestDictValueCutOffByEOF(t *testing.T) {
+	b := newBuffer(strings.NewReader("<< /A 1 /B"), 0)
+	b.allowEOF = true
+	got := b.readObject()
+	if !reflect.DeepEqual(got, dict{name("A"): int64(1), name("B"): nil}) {
+		t.Errorf("readObject = %#v, want B read as null", got)
 	}
 }

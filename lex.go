@@ -536,7 +536,13 @@ func (b *buffer) readDict() object {
 			b.errorf("unexpected non-name key %T(%v) parsing dictionary", tok, tok)
 			continue
 		}
-		x[n] = b.readObject()
+		v := b.readObject()
+		if v == io.EOF {
+			// The value is cut off by the end of input; io.EOF is a marker,
+			// not a value resolve can return.
+			v = nil
+		}
+		x[n] = v
 	}
 
 	if !b.allowStream {
