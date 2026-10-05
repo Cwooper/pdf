@@ -989,3 +989,19 @@ func TestFontMetricsResolvedOnce(t *testing.T) {
 		t.Errorf("got %d glyphs, first %+v; want %d of width 6 in Helvetica", len(text), text[0], glyphs)
 	}
 }
+
+// TestInterpretByteCap verifies that content inflating past maxInterpretBytes
+// is reported rather than read to the end: a few kilobytes of Flate can
+// expand to gigabytes.
+func TestInterpretByteCap(t *testing.T) {
+	r := openPDF(t, pagePDF("", flateObj(strings.Repeat(" ", maxInterpretBytes+1))))
+	if _, err := r.Page(1).GetPlainText(nil); err == nil || !strings.Contains(err.Error(), "exceeds") {
+		t.Errorf("GetPlainText: got %v, want the size cap reported", err)
+	}
+	// A cmap past the cap is reported as unreadable, not read in full and
+	// then interpreted as no cmap at all.
+	p, _ := run(t, func() { readCmap(rawStream(strings.Repeat(" ", maxInterpretBytes+1))) })
+	if p == nil || !strings.Contains(fmt.Sprint(p), "exceeds") {
+		t.Errorf("readCmap: got panic %v, want the size cap reported", p)
+	}
+}
