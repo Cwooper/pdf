@@ -144,13 +144,20 @@ func (w *pageWalk) walk(node Value, resources *Value, depth int) {
 			}
 			w.seen[ref] = true
 		}
-		kid := kids.Index(i)
-		switch kid.Key("Type").Name() {
-		case "Pages":
-			w.walk(kid, resources, depth+1)
-		case "Page":
-			w.pages = append(w.pages, pageEntry{kids.ptr, x, resources})
-		}
+		w.kid(kids, i, x, resources, depth)
+	}
+}
+
+// kid walks kids' entry i, skipping it if it fails to parse, so that one
+// malformed node or page loses only the pages under it.
+func (w *pageWalk) kid(kids Value, i int, x object, resources *Value, depth int) {
+	defer func() { recover() }()
+	kid := kids.Index(i)
+	switch kid.Key("Type").Name() {
+	case "Pages":
+		w.walk(kid, resources, depth+1)
+	case "Page":
+		w.pages = append(w.pages, pageEntry{kids.ptr, x, resources})
 	}
 }
 
