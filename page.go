@@ -120,9 +120,11 @@ func (r *Reader) GetPlainText() (reader io.Reader, err error) {
 			continue
 		}
 		missing = 0
-		for name, f := range p.fontCache() { // cache fonts so we don't continually parse charmap
+		// Fonts are shared by name so that each charmap is parsed once.
+		dict := p.Resources().Key("Font")
+		for _, name := range dict.Keys() {
 			if _, ok := fonts[name]; !ok {
-				fonts[name] = f
+				fonts[name] = &Font{V: dict.Key(name)}
 			}
 		}
 		text, err := p.GetPlainText(fonts)
@@ -214,20 +216,48 @@ func (p Page) Fonts() []string {
 
 // Font returns the font with the given name associated with the page.
 func (p Page) Font(name string) Font {
-	return Font{p.Resources().Key("Font").Key(name), nil}
+	return Font{V: p.Resources().Key("Font").Key(name)}
 }
 
-// fontCache returns the page's fonts keyed by name, parsing each font only
-// once so that repeated text operations don't re-parse its charmap.
-func (p Page) fontCache() map[string]*Font {
-	fonts := make(map[string]*Font)
-	for _, name := range p.Fonts() {
-		if _, ok := fonts[name]; !ok {
-			f := p.Font(name)
-			fonts[name] = &f
-		}
+// pageFonts resolves a page's fonts by name as its text operators select
+// them, each once, so that its charmap is parsed once. The /Font dictionary
+// is looked up on the first selection, since each lookup walks the /Parent
+// chain, and a font on its own first selection, since a page may name
+// thousands it never shows.
+type pageFonts struct {
+	page   Page
+	dict   Value
+	looked bool
+	fonts  map[string]*Font
+}
+
+// noFont is the font of a name the page does not define. Its encoding is set
+// so that Encoder never writes to the shared value.
+var noFont = Font{enc: &byteEncoder{&pdfDocEncoding}}
+
+// lookup returns the font named name, or noFont for a name whose entry is
+// null, with false if the page has no entry for it at all. Neither is
+// remembered: a content stream can select millions of such names.
+func (pf *pageFonts) lookup(fontName string) (*Font, bool) {
+	if f, ok := pf.fonts[fontName]; ok {
+		return f, true
 	}
-	return fonts
+	if !pf.looked {
+		pf.dict = pf.page.Resources().Key("Font")
+		pf.looked = true
+	}
+	v := pf.dict.Key(fontName)
+	if v.IsNull() {
+		d, _ := pf.dict.data.(dict)
+		_, defined := d[name(fontName)]
+		return &noFont, defined
+	}
+	if pf.fonts == nil {
+		pf.fonts = make(map[string]*Font)
+	}
+	f := &Font{V: v}
+	pf.fonts[fontName] = f
+	return f, true
 }
 
 // A Font represent a font in a PDF file.
@@ -718,8 +748,12 @@ func (p Page) GetPlainText(fonts map[string]*Font) (result string, err error) {
 	strm := p.V.Key("Contents")
 	var enc TextEncoding = &nopEncoder{}
 
-	if fonts == nil {
-		fonts = p.fontCache()
+	lookup := (&pageFonts{page: p}).lookup
+	if fonts != nil {
+		lookup = func(name string) (*Font, bool) {
+			f, ok := fonts[name]
+			return f, ok
+		}
 	}
 
 	var textBuilder bytes.Buffer
@@ -746,7 +780,7 @@ func (p Page) GetPlainText(fonts map[string]*Font) (result string, err error) {
 			if len(args) != 2 {
 				panic("bad TL")
 			}
-			if font, ok := fonts[args[0].Name()]; ok {
+			if font, ok := lookup(args[0].Name()); ok {
 				enc = font.Encoder()
 			} else {
 				enc = &nopEncoder{}
@@ -895,7 +929,7 @@ func (p Page) walkTextBlocks(walker func(enc TextEncoding, x, y float64, s strin
 
 	strm := p.V.Key("Contents")
 
-	fonts := p.fontCache()
+	fonts := &pageFonts{page: p}
 
 	var enc TextEncoding = &nopEncoder{}
 	var currentX, currentY float64
@@ -915,7 +949,7 @@ func (p Page) walkTextBlocks(walker func(enc TextEncoding, x, y float64, s strin
 				panic("bad TL")
 			}
 
-			if font, ok := fonts[args[0].Name()]; ok {
+			if font, ok := fonts.lookup(args[0].Name()); ok {
 				enc = font.Encoder()
 			} else {
 				enc = &nopEncoder{}
@@ -961,6 +995,7 @@ func (p Page) Content() Content {
 	}
 	strm := p.V.Key("Contents")
 	var enc TextEncoding = &nopEncoder{}
+	fonts := &pageFonts{page: p}
 
 	var g = gstate{
 		Th:  1,
@@ -1089,8 +1124,9 @@ func (p Page) Content() Content {
 				panic("bad TL")
 			}
 			f := args[0].Name()
-			g.Tf = p.Font(f)
-			enc = g.Tf.Encoder()
+			font, _ := fonts.lookup(f)
+			enc = font.Encoder()
+			g.Tf = *font
 			if enc == nil {
 				if DebugOn {
 					println("no cmap for", f)
