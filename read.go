@@ -1454,6 +1454,11 @@ func (r *Reader) initEncrypt(password string) error {
 	if n == 0 {
 		n = minKeyBits
 	}
+	if V == 4 {
+		// AESV2, the one crypt filter okayV4 allows, takes a 128-bit key
+		// whatever /Length says, and a shorter one fails aes.NewCipher.
+		n = maxKeyBits
+	}
 	if n%8 != 0 || n > maxKeyBits || n < minKeyBits {
 		return fmt.Errorf("malformed PDF: %d-bit encryption key", n)
 	}
@@ -1594,7 +1599,7 @@ func cryptKey(key []byte, useAES bool, ptr objptr) []byte {
 	if useAES {
 		h.Write([]byte("sAlT"))
 	}
-	return h.Sum(nil)
+	return h.Sum(nil)[:min(len(key)+5, md5.Size)]
 }
 
 func decryptString(key []byte, useAES bool, ptr objptr, x string) string {
