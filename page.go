@@ -23,6 +23,10 @@ const (
 	// broad and shallow.
 	maxPageTreeDepth = 1024
 
+	// maxPageTreeNodes bounds the /Kids entries, and so the pages, the page
+	// tree walk visits.
+	maxPageTreeNodes = 1 << 20
+
 	// maxInheritDepth bounds a walk up a chain of /Parent links, counting the
 	// page itself. A page at the bottom of the deepest tree Page accepts has
 	// maxPageTreeDepth ancestors, all of which may carry inherited entries.
@@ -32,12 +36,6 @@ const (
 	// /First and /Next links can both be made cyclic.
 	maxOutlineDepth = 128
 	maxOutlineNodes = 1 << 16
-
-	// maxMissingPages bounds how many page numbers in a row may resolve to
-	// no page before extraction stops. /Count is the file's own claim of how
-	// many pages there are, and a hostile one would otherwise have the tree
-	// walked billions of times.
-	maxMissingPages = 64
 
 	// maxCmapBytes bounds a ToUnicode cmap read into memory. Real cmaps run
 	// to a few hundred kilobytes at most.
@@ -58,53 +56,91 @@ const (
 // The methods interpret a Page dictionary stored in V.
 type Page struct {
 	V Value
+	// inherited, when set, is the /Resources the page inherits from the page
+	// tree, found as the tree was walked, so that Resources need not parse
+	// the page's ancestors again.
+	inherited *Value
 }
 
 // Page returns the page for the given page number.
 // Page numbers are indexed starting at 1, not 0.
 // If the page is not found, Page returns a Page with p.V.IsNull().
 func (r *Reader) Page(num int) Page {
-	num-- // now 0-indexed
-	page := r.Trailer().Key("Root").Key("Pages")
-	depth := 0
-Search:
-	for page.Key("Type").Name() == "Pages" {
-		// Each continue Search below descends one level, so a /Kids link back
-		// up the tree would otherwise loop forever.
-		if depth++; depth > maxPageTreeDepth {
-			return Page{}
-		}
-		count := int(page.Key("Count").Int64())
-		if count < num {
-			return Page{}
-		}
-		kids := page.Key("Kids")
-		for i := 0; i < kids.Len(); i++ {
-			kid := kids.Index(i)
-			if kid.Key("Type").Name() == "Pages" {
-				c := int(kid.Key("Count").Int64())
-				if num < c {
-					page = kid
-					continue Search
-				}
-				num -= c
-				continue
-			}
-			if kid.Key("Type").Name() == "Page" {
-				if num == 0 {
-					return Page{kid}
-				}
-				num--
-			}
-		}
-		break
+	pages := r.pages()
+	if num < 1 || num > len(pages) {
+		return Page{}
 	}
-	return Page{}
+	e := pages[num-1]
+	return Page{V: r.resolve(e.parent, e.kid), inherited: e.resources}
 }
 
-// NumPage returns the number of pages in the PDF file.
+// NumPage returns the number of pages in the PDF file: those its page tree
+// lists, whatever its /Count claims.
 func (r *Reader) NumPage() int {
-	return int(r.Trailer().Key("Root").Key("Pages").Key("Count").Int64())
+	return len(r.pages())
+}
+
+// A pageEntry is a page the page tree lists. It keeps the /Kids entry rather
+// than the parsed page, which Page parses again, so that a tree listing a
+// million small pages does not hold them all.
+type pageEntry struct {
+	parent    objptr
+	kid       object
+	resources *Value
+}
+
+// pages returns the pages the page tree lists, in order, walking the tree
+// once per Reader.
+func (r *Reader) pages() []pageEntry {
+	if r.cache == nil {
+		return r.walkPages()
+	}
+	return r.cache.pages.get(r.walkPages)
+}
+
+// walkPages lists the pages of the page tree. A /Kids entry referring to a
+// node or page already listed is skipped: a node listed twice at each level
+// would make a tree of 33 objects hold 2^31 pages, and one listing an
+// ancestor would make a cycle.
+func (r *Reader) walkPages() []pageEntry {
+	w := pageWalk{seen: make(map[objptr]bool)}
+	w.walk(r.Trailer().Key("Root").Key("Pages"), new(Value), 1)
+	return w.pages
+}
+
+type pageWalk struct {
+	seen  map[objptr]bool
+	nodes int
+	pages []pageEntry
+}
+
+func (w *pageWalk) walk(node Value, resources *Value, depth int) {
+	if depth > maxPageTreeDepth || node.Key("Type").Name() != "Pages" {
+		return
+	}
+	if v := node.Key("Resources"); !v.IsNull() {
+		resources = &v
+	}
+	kids := node.Key("Kids")
+	entries, _ := kids.data.(array)
+	for i, x := range entries {
+		if w.nodes++; w.nodes > maxPageTreeNodes {
+			return
+		}
+		if ref, ok := x.(objptr); ok {
+			if w.seen[ref] {
+				continue
+			}
+			w.seen[ref] = true
+		}
+		kid := kids.Index(i)
+		switch kid.Key("Type").Name() {
+		case "Pages":
+			w.walk(kid, resources, depth+1)
+		case "Page":
+			w.pages = append(w.pages, pageEntry{kids.ptr, x, resources})
+		}
+	}
 }
 
 // GetPlainText returns all the text in the PDF file
@@ -121,16 +157,8 @@ func (r *Reader) GetPlainText() (reader io.Reader, err error) {
 	var buf bytes.Buffer
 	fonts := make(map[string]*Font)
 	shared := make(fontSet)
-	missing := 0
 	for i := 1; i <= pages; i++ {
 		p := r.Page(i)
-		if p.V.IsNull() {
-			if missing++; missing > maxMissingPages {
-				break
-			}
-			continue
-		}
-		missing = 0
 		// Fonts are shared by name so that each charmap is parsed once.
 		dict := p.Resources().Key("Font")
 		for _, name := range dict.Keys() {
@@ -158,16 +186,8 @@ func (r *Reader) GetStyledTexts() (sentences []Text, err error) {
 	}()
 
 	totalPage := r.NumPage()
-	missing := 0
 	for pageIndex := 1; pageIndex <= totalPage; pageIndex++ {
 		p := r.Page(pageIndex)
-		if p.V.IsNull() {
-			if missing++; missing > maxMissingPages {
-				break
-			}
-			continue
-		}
-		missing = 0
 		if p.V.Key("Contents").Kind() == Null {
 			continue
 		}
@@ -217,7 +237,13 @@ func (p Page) CropBox() Value {
 
 // Resources returns the resources dictionary associated with the page.
 func (p Page) Resources() Value {
-	return p.findInherited("Resources")
+	if p.inherited == nil {
+		return p.findInherited("Resources")
+	}
+	if v := p.V.Key("Resources"); !v.IsNull() {
+		return v
+	}
+	return *p.inherited
 }
 
 // Fonts returns a list of the fonts associated with the page.

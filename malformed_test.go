@@ -482,7 +482,7 @@ func TestValidPDFStillParses(t *testing.T) {
 	if got := p.V.Key("Type").Name(); got != "Page" {
 		t.Errorf("page /Type = %q, want %q", got, "Page")
 	}
-	// Resources is inherited through /Parent, exercising findInherited.
+	// Resources is inherited from the page tree.
 	if fonts := p.Fonts(); len(fonts) != 1 || fonts[0] != "F1" {
 		t.Errorf("Fonts = %v, want [F1]", fonts)
 	}

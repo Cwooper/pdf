@@ -53,8 +53,8 @@ func TestSparseObjectNumberResolves(t *testing.T) {
 	if err != nil {
 		t.Fatalf("NewReader: %v", err)
 	}
-	if got := r.NumPage(); got != 3 {
-		t.Errorf("NumPage = %d, want 3 (catalog at object 500000 not resolved)", got)
+	if got := declaredPages(r); got != 3 {
+		t.Errorf("/Count = %d, want 3 (catalog at object 500000 not resolved)", got)
 	}
 }
 
@@ -570,11 +570,11 @@ func TestObjectStreamByteCap(t *testing.T) {
 
 	r := open(maxObjStmBytes)
 	if p, _ := run(t, func() {
-		if got := r.NumPage(); got != 7 {
-			t.Errorf("NumPage = %d, want 7", got)
+		if got := declaredPages(r); got != 7 {
+			t.Errorf("/Count = %d, want 7", got)
 		}
 	}); p != nil {
-		t.Errorf("%d bytes: NumPage panicked: %v", maxObjStmBytes, p)
+		t.Errorf("%d bytes: resolving the catalog panicked: %v", maxObjStmBytes, p)
 	}
 	r = open(maxObjStmBytes + 1)
 	p, _ := run(t, func() { r.NumPage() })
@@ -703,9 +703,9 @@ func TestObjectStreamIndexCap(t *testing.T) {
 		}
 		r.cache.indexed.Store(tt.before)
 		got := 0
-		p, _ := run(t, func() { got = r.NumPage() })
+		p, _ := run(t, func() { got = declaredPages(r) })
 		if tt.ok && (p != nil || got != 7) {
-			t.Errorf("%d indexed before: NumPage = %d, panic %v; want 7", tt.before, got, p)
+			t.Errorf("%d indexed before: /Count = %d, panic %v; want 7", tt.before, got, p)
 		}
 		if !tt.ok && !strings.Contains(fmt.Sprint(p), "index more than") {
 			t.Errorf("%d indexed before: got panic %v, want the index cap reported", tt.before, p)
@@ -733,9 +733,9 @@ func TestObjectStreamExtendsCap(t *testing.T) {
 			t.Fatal(err)
 		}
 		got := 0
-		p, _ := run(t, func() { got = r.NumPage() })
+		p, _ := run(t, func() { got = declaredPages(r) })
 		if n == maxObjStmExtends && (p != nil || got != 7) {
-			t.Errorf("chain of %d: NumPage = %d, panic %v; want 7", n, got, p)
+			t.Errorf("chain of %d: /Count = %d, panic %v; want 7", n, got, p)
 		}
 		if n > maxObjStmExtends && !strings.Contains(fmt.Sprint(p), "too long") {
 			t.Errorf("chain of %d: got panic %v, want the chain cap reported", n, p)
