@@ -560,3 +560,100 @@ func TestObjectStreamByteCap(t *testing.T) {
 		t.Errorf("NumPage: got panic %v, want the object stream size cap reported", p)
 	}
 }
+
+// A testObj is an object for xrefStreamFile: a body, or the members of an
+// object stream whose header is hdr with FIRST and NUM filled in.
+type testObj struct {
+	num     int
+	body    string
+	hdr     string
+	members []testObj
+}
+
+// objStmLayout returns the decoded data of an object stream holding members
+// and its /First.
+func objStmLayout(members []testObj) (string, int) {
+	var index, bodies strings.Builder
+	for _, m := range members {
+		fmt.Fprintf(&index, "%d %d ", m.num, bodies.Len())
+		bodies.WriteString(m.body + "\n")
+	}
+	return index.String() + bodies.String(), index.Len()
+}
+
+// xrefStreamFile returns a file holding objs behind an xref stream, with
+// object 1 as the catalog. An object stream's data is Flate-compressed.
+func xrefStreamFile(objs ...testObj) []byte {
+	var b bytes.Buffer
+	b.WriteString("%PDF-1.5\n")
+	rows := map[int][3]int{0: {0, 0, 65535}}
+	size := 0
+	for _, o := range objs {
+		rows[o.num] = [3]int{1, b.Len(), 0}
+		size = max(size, o.num+1)
+		if o.members == nil {
+			fmt.Fprintf(&b, "%d 0 obj\n%s\nendobj\n", o.num, o.body)
+			continue
+		}
+		data, first := objStmLayout(o.members)
+		for i, m := range o.members {
+			rows[m.num] = [3]int{2, o.num, i}
+			size = max(size, m.num+1)
+		}
+		var z bytes.Buffer
+		zw := zlib.NewWriter(&z)
+		zw.Write([]byte(data))
+		zw.Close()
+		hdr := strings.NewReplacer("FIRST", fmt.Sprint(first), "NUM", fmt.Sprint(len(o.members))).Replace(o.hdr)
+		fmt.Fprintf(&b, "%d 0 obj\n<< /Type /ObjStm %s /Filter /FlateDecode /Length %d >>\nstream\n%s\nendstream\nendobj\n", o.num, hdr, z.Len(), z.String())
+	}
+	rows[size] = [3]int{1, b.Len(), 0}
+	var e bytes.Buffer
+	for i := range size + 1 {
+		r := rows[i]
+		e.Write([]byte{byte(r[0]), byte(r[1] >> 24), byte(r[1] >> 16), byte(r[1] >> 8), byte(r[1]), byte(r[2] >> 8), byte(r[2])})
+	}
+	xref := b.Len()
+	fmt.Fprintf(&b, "%d 0 obj\n<< /Type /XRef /Size %d /W [1 4 2] /Root 1 0 R /Length %d >>\nstream\n%s\nendstream\nendobj\n", size, size+1, e.Len(), e.String())
+	fmt.Fprintf(&b, "startxref\n%d\n%%%%EOF\n", xref)
+	return b.Bytes()
+}
+
+// TestObjectStreamHeaderFanout verifies that an object stream's header is
+// read without following references into other object streams. Each stream
+// here takes /N and /First from the next, so every level doubled the
+// decoding: 9.6 KB allocated 23.5 GB.
+func TestObjectStreamHeaderFanout(t *testing.T) {
+	const depth = 16
+	levels := make([][]testObj, depth+1)
+	levels[0] = []testObj{{num: 1, body: "<< /Type /Catalog /Pages << /Type /Pages /Kids [] /Count 7 >> >>"}}
+	for i := 1; i <= depth; i++ {
+		_, first := objStmLayout(levels[i-1])
+		levels[i] = []testObj{
+			{num: 200 + 2*i, body: fmt.Sprint(len(levels[i-1]))},
+			{num: 201 + 2*i, body: fmt.Sprint(first)},
+		}
+	}
+	var objs []testObj
+	for i, members := range levels {
+		hdr := "/N NUM /First FIRST"
+		if i < depth {
+			hdr = fmt.Sprintf("/N %d 0 R /First %d 0 R", 202+2*i, 203+2*i)
+		}
+		objs = append(objs, testObj{num: 100 + i, hdr: hdr, members: members})
+	}
+	data := xrefStreamFile(objs...)
+
+	r, err := NewReader(bytes.NewReader(data), int64(len(data)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var before, after runtime.MemStats
+	runtime.GC()
+	runtime.ReadMemStats(&before)
+	run(t, func() { r.NumPage() })
+	runtime.ReadMemStats(&after)
+	if got := after.TotalAlloc - before.TotalAlloc; got > 8<<20 {
+		t.Errorf("NumPage on a %d-byte file allocated %d MB", len(data), got>>20)
+	}
+}
