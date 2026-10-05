@@ -235,3 +235,22 @@ func TestEncryptMetadataFalse(t *testing.T) {
 		t.Errorf("metadata = %q, %v; want it in the clear", got, err)
 	}
 }
+
+// TestAESKeyLength verifies that an AESV2 file is read with a 128-bit key
+// whatever the encryption dictionary's /Length says.
+func TestAESKeyLength(t *testing.T) {
+	data := encryptedPDF(cryptSpec{V: 4, R: 4, bits: 128}, "", "Chapter One", "")
+	data = bytes.Replace(data, []byte("/Length 128 /O"), []byte("/Length  40 /O"), 1)
+	r := openPDF(t, data)
+	if o := r.Outline(); len(o.Child) != 1 || o.Child[0].Title != "Chapter One" {
+		t.Errorf("Outline = %q, want one item titled %q", o.Child, "Chapter One")
+	}
+}
+
+// TestRC4ObjectKeyLength verifies that an object's key keeps the file key's
+// length plus five bytes (Algorithm 1): keys under 128 bits read garbage.
+func TestRC4ObjectKeyLength(t *testing.T) {
+	for _, s := range []cryptSpec{{V: 1, R: 2, bits: 40}, {V: 2, R: 3, bits: 56}, {V: 2, R: 3, bits: 128}} {
+		t.Run(fmt.Sprint(s.bits), func(t *testing.T) { checkDecrypts(t, s) })
+	}
+}
