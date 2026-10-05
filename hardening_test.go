@@ -402,3 +402,77 @@ func TestObjectStreamIndexJunkValues(t *testing.T) {
 		})
 	}
 }
+
+// buildPDF returns a file holding objs as objects 1, 2, ..., with object 1
+// as the catalog.
+func buildPDF(objs ...string) []byte {
+	var b bytes.Buffer
+	b.WriteString("%PDF-1.4\n")
+	offs := make([]int, len(objs))
+	for i, o := range objs {
+		offs[i] = b.Len()
+		fmt.Fprintf(&b, "%d 0 obj\n%s\nendobj\n", i+1, o)
+	}
+	xref := b.Len()
+	fmt.Fprintf(&b, "xref\n0 %d\n0000000000 65535 f \n", len(objs)+1)
+	for _, off := range offs {
+		fmt.Fprintf(&b, "%010d 00000 n \n", off)
+	}
+	fmt.Fprintf(&b, "trailer\n<< /Size %d /Root 1 0 R >>\nstartxref\n%d\n%%%%EOF\n", len(objs)+1, xref)
+	return b.Bytes()
+}
+
+// streamObj returns a stream object holding content.
+func streamObj(content string) string {
+	return fmt.Sprintf("<< /Length %d >>\nstream\n%s\nendstream", len(content), content)
+}
+
+// TestFontLookupOncePerPage verifies that text operations do not pay for a
+// /Parent walk each: every inherited lookup resolves each ancestor afresh,
+// so a long or cyclic chain multiplied by the font operators or the font
+// names of a page ran for minutes.
+func TestFontLookupOncePerPage(t *testing.T) {
+	t.Run("Tf operators under a cyclic parent", func(t *testing.T) {
+		data := buildPDF(
+			"<< /Type /Catalog /Pages 2 0 R >>",
+			"<< /Type /Pages /Kids [3 0 R] /Count 1 >>",
+			"<< /Type /Page /Parent 3 0 R /Contents 4 0 R >>",
+			streamObj(strings.Repeat("/F1 1 Tf ", 20000)),
+		)
+		r, err := NewReader(bytes.NewReader(data), int64(len(data)))
+		if err != nil {
+			t.Fatal(err)
+		}
+		mustNotCrash(t, func() { r.Page(1).Content() })
+	})
+
+	t.Run("font names under a deep tree", func(t *testing.T) {
+		const depth, nfonts = 1000, 20000
+		var fonts strings.Builder
+		for i := range nfonts {
+			fmt.Fprintf(&fonts, "/F%d %d 0 R ", i, depth+3)
+		}
+		objs := []string{
+			"<< /Type /Catalog /Pages 2 0 R >>",
+			fmt.Sprintf("<< /Type /Pages /Kids [3 0 R] /Count 1 /Resources << /Font << %s>> >> >>", fonts.String()),
+		}
+		for i := 3; i < depth+2; i++ {
+			objs = append(objs, fmt.Sprintf("<< /Type /Pages /Parent %d 0 R /Kids [%d 0 R] /Count 1 >>", i-1, i+1))
+		}
+		objs = append(objs,
+			fmt.Sprintf("<< /Type /Page /Parent %d 0 R /Contents %d 0 R >>", depth+1, depth+4),
+			"<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>",
+			streamObj("BT /F1 12 Tf (x) Tj ET"),
+		)
+		data := buildPDF(objs...)
+		r, err := NewReader(bytes.NewReader(data), int64(len(data)))
+		if err != nil {
+			t.Fatal(err)
+		}
+		mustNotCrash(t, func() {
+			if _, err := r.Page(1).GetPlainText(nil); err != nil {
+				t.Error(err)
+			}
+		})
+	})
+}

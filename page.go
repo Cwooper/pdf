@@ -218,14 +218,13 @@ func (p Page) Font(name string) Font {
 }
 
 // fontCache returns the page's fonts keyed by name, parsing each font only
-// once so that repeated text operations don't re-parse its charmap.
+// once so that repeated text operations don't re-parse its charmap. The
+// resources are looked up once: each lookup walks the /Parent chain.
 func (p Page) fontCache() map[string]*Font {
 	fonts := make(map[string]*Font)
-	for _, name := range p.Fonts() {
-		if _, ok := fonts[name]; !ok {
-			f := p.Font(name)
-			fonts[name] = &f
-		}
+	res := p.Resources().Key("Font")
+	for _, name := range res.Keys() {
+		fonts[name] = &Font{res.Key(name), nil}
 	}
 	return fonts
 }
@@ -961,6 +960,7 @@ func (p Page) Content() Content {
 	}
 	strm := p.V.Key("Contents")
 	var enc TextEncoding = &nopEncoder{}
+	fonts := p.fontCache()
 
 	var g = gstate{
 		Th:  1,
@@ -1089,8 +1089,13 @@ func (p Page) Content() Content {
 				panic("bad TL")
 			}
 			f := args[0].Name()
-			g.Tf = p.Font(f)
-			enc = g.Tf.Encoder()
+			font, ok := fonts[f]
+			if !ok {
+				font = &Font{}
+				fonts[f] = font
+			}
+			enc = font.Encoder()
+			g.Tf = *font
 			if enc == nil {
 				if DebugOn {
 					println("no cmap for", f)
