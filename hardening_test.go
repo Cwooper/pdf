@@ -657,3 +657,39 @@ func TestObjectStreamHeaderFanout(t *testing.T) {
 		t.Errorf("NumPage on a %d-byte file allocated %d MB", len(data), got>>20)
 	}
 }
+
+// TestObjectStreamDecodedOnce verifies that resolving many objects from one
+// object stream decodes it once, not once per object: a 23-page paper took
+// 3.8 seconds re-inflating its streams.
+func TestObjectStreamDecodedOnce(t *testing.T) {
+	const pages = 1000
+	members := []testObj{
+		{num: 3, body: "(" + strings.Repeat("x", 1<<20) + ")"},
+		{num: 1, body: "<< /Type /Catalog /Pages 2 0 R >>"},
+	}
+	var kids strings.Builder
+	for i := range pages {
+		fmt.Fprintf(&kids, "%d 0 R ", 10+i)
+		members = append(members, testObj{num: 10 + i, body: "<< /Type /Page /Parent 2 0 R >>"})
+	}
+	members = append(members, testObj{num: 2, body: fmt.Sprintf("<< /Type /Pages /Kids [%s] /Count %d >>", kids.String(), pages)})
+	data := xrefStreamFile(testObj{num: 5, hdr: "/N NUM /First FIRST", members: members})
+
+	r, err := NewReader(bytes.NewReader(data), int64(len(data)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var before, after runtime.MemStats
+	runtime.GC()
+	runtime.ReadMemStats(&before)
+	kidsV := r.Trailer().Key("Root").Key("Pages").Key("Kids")
+	for i := range kidsV.Len() {
+		if got := kidsV.Index(i).Key("Type").Name(); got != "Page" {
+			t.Fatalf("kid %d has /Type %q, want Page", i, got)
+		}
+	}
+	runtime.ReadMemStats(&after)
+	if got := after.TotalAlloc - before.TotalAlloc; got > 16<<20 {
+		t.Errorf("resolving %d objects from one stream allocated %d MB", pages, got>>20)
+	}
+}
