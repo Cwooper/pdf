@@ -47,6 +47,11 @@ const (
 	// about 64 bytes each. A dense real page holds under ten thousand; an
 	// inflated content stream can show millions from a few kilobytes.
 	maxPageGlyphs = 1 << 20
+
+	// maxGstackDepth bounds q nesting in Page.Content. Each q saves a
+	// 400-byte graphics state, so a stream of them from a few kilobytes
+	// otherwise held gigabytes.
+	maxGstackDepth = 1 << 10
 )
 
 // A Page represent a single page in a PDF file.
@@ -1047,6 +1052,9 @@ func (p Page) Content() Content {
 			rect = append(rect, Rect{Point{x, y}, Point{x + w, y + h}})
 
 		case "q": // save graphics state
+			if len(gstack) >= maxGstackDepth {
+				panic(fmt.Errorf("graphics state nesting deeper than %d", maxGstackDepth))
+			}
 			gstack = append(gstack, g)
 
 		case "Q": // restore graphics state
