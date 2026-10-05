@@ -1247,3 +1247,15 @@ func TestPageGlyphCap(t *testing.T) {
 	}()
 	p.Content()
 }
+
+// TestGstackDepthCap verifies that Page.Content refuses q nesting past
+// maxGstackDepth instead of saving a graphics state for every q.
+func TestGstackDepthCap(t *testing.T) {
+	p := pageWithContent(strings.Repeat("q ", maxGstackDepth+1))
+	defer func() {
+		if recover() == nil {
+			t.Error("Content returned, want the nesting cap reported")
+		}
+	}()
+	p.Content()
+}
