@@ -372,7 +372,7 @@ func (f Font) getEncoder() TextEncoding {
 func (f *Font) charmapEncoding() TextEncoding {
 	toUnicode := f.V.Key("ToUnicode")
 	if toUnicode.Kind() == Stream {
-		m := readCmap(toUnicode)
+		m := toUnicode.r.toUnicodeCmap(toUnicode)
 		if m == nil {
 			return &nopEncoder{}
 		}
@@ -555,6 +555,17 @@ func readCmap(toUnicode Value) *cmap {
 		panic("ToUnicode cmap too large")
 	}
 	return parseCmap(memoryStream(data))
+}
+
+// toUnicodeCmap returns the cmap in ToUnicode stream v, parsed once per
+// Reader however many fonts and pages share it.
+func (r *Reader) toUnicodeCmap(v Value) *cmap {
+	load := func() *cmap { return readCmap(v) }
+	ptr := v.data.(stream).ptr
+	if ptr == (objptr{}) {
+		return load()
+	}
+	return cacheEntry(r.cache, &r.cache.cmaps, ptr).get(load)
 }
 
 // memoryStream returns an unfiltered stream Value holding data.

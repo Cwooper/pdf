@@ -8,6 +8,7 @@ import (
 	"io"
 	"runtime"
 	"strings"
+	"sync"
 	"testing"
 )
 
@@ -894,4 +895,58 @@ func TestFontsResolvedOnUse(t *testing.T) {
 			t.Errorf("Content allocated %d MB for distinct undefined names, %d MB for one repeated", got>>20, base>>20)
 		}
 	})
+}
+
+// TestCmapParsedOncePerReader verifies that a ToUnicode cmap shared by the
+// pages of a file is parsed once, not once per page.
+func TestCmapParsedOncePerReader(t *testing.T) {
+	const pages = 50
+	var cm strings.Builder
+	cm.WriteString("1 begincodespacerange <0000> <FFFF> endcodespacerange\n")
+	for blk := range 64 {
+		cm.WriteString("100 beginbfchar\n")
+		for i := range 100 {
+			fmt.Fprintf(&cm, "<%04X> <%04X>\n", blk*100+i, 0x4E00+blk*100+i)
+		}
+		cm.WriteString("endbfchar\n")
+	}
+	var kids strings.Builder
+	// Each page has its own font object, so only the cmap cache can share the parse.
+	objs := []string{"<< /Type /Catalog /Pages 2 0 R >>", "", streamObj("BT /F1 12 Tf <00010002> Tj ET"),
+		"null", streamObj(cm.String())}
+	for i := range pages {
+		fmt.Fprintf(&kids, "%d 0 R ", 6+2*i)
+		objs = append(objs, fmt.Sprintf("<< /Type /Page /Parent 2 0 R /Contents 3 0 R /Resources << /Font << /F1 %d 0 R >> >> >>", 7+2*i),
+			"<< /Type /Font /Subtype /Type0 /BaseFont /X /Encoding /Identity-H /ToUnicode 5 0 R >>")
+	}
+	objs[1] = fmt.Sprintf("<< /Type /Pages /Kids [%s] /Count %d >>", kids.String(), pages)
+	r := openPDF(t, buildPDF(objs...))
+	first := allocated(func() { r.Page(1).Content() })
+	rest := allocated(func() {
+		for i := 2; i <= pages; i++ {
+			r.Page(i).Content()
+		}
+	})
+	if rest > 8*first {
+		t.Errorf("pages 2-%d allocated %d KB, page 1 %d KB", pages, rest>>10, first>>10)
+	}
+
+	var wg sync.WaitGroup
+	for range 4 {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for i := 1; i <= pages; i++ {
+				var s string
+				for _, tx := range r.Page(i).Content().Text {
+					s += tx.S
+				}
+				if s != "\u4e01\u4e02" {
+					t.Errorf("page %d text = %q", i, s)
+					return
+				}
+			}
+		}()
+	}
+	wg.Wait()
 }
