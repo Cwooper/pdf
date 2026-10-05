@@ -296,9 +296,7 @@ Loop:
 					}
 					x = x*8 + int(c-'0')
 				}
-				if x > 255 {
-					b.errorf("invalid octal escape \\%03o", x)
-				}
+				// PDF 32000-1, 7.3.4.2: high-order overflow is ignored.
 				tmp = append(tmp, byte(x))
 			}
 		}
@@ -369,7 +367,12 @@ func (b *buffer) readKeyword() token {
 	case isInteger(s):
 		x, err := strconv.ParseInt(s, 10, 64)
 		if err != nil {
-			b.errorf("invalid integer %.64q", s)
+			// Too large for an int64, so read as a real.
+			f, err := strconv.ParseFloat(s, 64)
+			if err != nil {
+				b.errorf("invalid integer %.64q", s)
+			}
+			return f
 		}
 		return x
 	case isReal(s):
