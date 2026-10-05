@@ -887,3 +887,201 @@ func BenchmarkValueIndex(b *testing.B) {
 	}
 	_ = sum
 }
+
+// streamObj returns a stream object holding content.
+func streamObj(content string) string {
+	return fmt.Sprintf("<< /Length %d >>\nstream\n%s\nendstream", len(content), content)
+}
+
+// TestFontLookupOncePerPage verifies that text operations do not pay for a
+// /Parent walk each: every inherited lookup resolves each ancestor afresh,
+// so a long or cyclic chain multiplied by the font operators or the font
+// names of a page ran for minutes.
+func TestFontLookupOncePerPage(t *testing.T) {
+	t.Run("Tf operators under a cyclic parent", func(t *testing.T) {
+		data := buildPDF(
+			"<< /Type /Catalog /Pages 2 0 R >>",
+			"<< /Type /Pages /Kids [3 0 R] /Count 1 >>",
+			"<< /Type /Page /Parent 3 0 R /Contents 4 0 R >>",
+			streamObj(strings.Repeat("/F1 1 Tf ", 20000)),
+		)
+		r, err := NewReader(bytes.NewReader(data), int64(len(data)))
+		if err != nil {
+			t.Fatal(err)
+		}
+		mustNotCrash(t, func() { r.Page(1).Content() })
+	})
+
+	t.Run("font names under a deep tree", func(t *testing.T) {
+		const depth, nfonts = 1000, 20000
+		var fonts strings.Builder
+		for i := range nfonts {
+			fmt.Fprintf(&fonts, "/F%d %d 0 R ", i, depth+3)
+		}
+		objs := []string{
+			"<< /Type /Catalog /Pages 2 0 R >>",
+			fmt.Sprintf("<< /Type /Pages /Kids [3 0 R] /Count 1 /Resources << /Font << %s>> >> >>", fonts.String()),
+		}
+		for i := 3; i < depth+2; i++ {
+			objs = append(objs, fmt.Sprintf("<< /Type /Pages /Parent %d 0 R /Kids [%d 0 R] /Count 1 >>", i-1, i+1))
+		}
+		objs = append(objs,
+			fmt.Sprintf("<< /Type /Page /Parent %d 0 R /Contents %d 0 R >>", depth+1, depth+4),
+			"<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>",
+			streamObj("BT /F1 12 Tf (x) Tj ET"),
+		)
+		data := buildPDF(objs...)
+		r, err := NewReader(bytes.NewReader(data), int64(len(data)))
+		if err != nil {
+			t.Fatal(err)
+		}
+		mustNotCrash(t, func() {
+			if _, err := r.Page(1).GetPlainText(nil); err != nil {
+				t.Error(err)
+			}
+		})
+	})
+}
+
+// TestNullFontEntryDecodes verifies that a font entry naming a missing
+// object still decodes through PDFDocEncoding, as a page's resolved font
+// list always did, rather than passing raw bytes through.
+func TestNullFontEntryDecodes(t *testing.T) {
+	data := buildPDF(
+		"<< /Type /Catalog /Pages 2 0 R >>",
+		"<< /Type /Pages /Kids [3 0 R] /Count 1 >>",
+		"<< /Type /Page /Parent 2 0 R /Contents 4 0 R /Resources << /Font << /F1 99 0 R >> >> >>",
+		streamObj("BT /F1 12 Tf (\x80) Tj ET"),
+	)
+	r, err := NewReader(bytes.NewReader(data), int64(len(data)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got, err := r.Page(1).GetPlainText(nil); err != nil || got != "\n•" {
+		t.Errorf("GetPlainText = %q, %v; want %q", got, err, "\n•")
+	}
+}
+
+// TestNullFontResolvedOnce verifies that a font name the page defines, but
+// as null, is resolved on its first selection only, like any other font.
+func TestNullFontResolvedOnce(t *testing.T) {
+	data := buildPDF(
+		"<< /Type /Catalog /Pages 2 0 R >>",
+		"<< /Type /Pages /Kids [3 0 R] /Count 1 >>",
+		"<< /Type /Page /Parent 2 0 R /Contents 4 0 R /Resources << /Font << /F1 5 0 R >> >> >>",
+		streamObj(strings.Repeat("/F1 1 Tf ", 20000)),
+		"null",
+	)
+	r, err := NewReader(bytes.NewReader(data), int64(len(data)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	p := r.Page(1)
+	if got := allocated(func() { p.Content() }); got > 16<<20 {
+		t.Errorf("Content allocated %d MB", got>>20)
+	}
+}
+
+// TestFontSharedByNames verifies that names referring to one font object
+// share one parse of it, on a page and across a document: each name parsed
+// and kept its own copy, so 150 names for one font holding a megabyte of junk
+// in an object stream ran out of 2 GB from 5.4 KB.
+func TestFontSharedByNames(t *testing.T) {
+	const names = 64
+	var fonts, content strings.Builder
+	content.WriteString("BT ")
+	for i := range names {
+		fmt.Fprintf(&fonts, "/F%d 5 0 R ", i)
+		fmt.Fprintf(&content, "/F%d 12 Tf (x) Tj ", i)
+	}
+	content.WriteString("ET")
+	font := "<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica /Junk [" + strings.Repeat("0 ", 1<<18) + "] >>"
+	data := xrefStreamFile(
+		testObj{num: 1, body: "<< /Type /Catalog /Pages 2 0 R >>"},
+		testObj{num: 2, body: "<< /Type /Pages /Kids [3 0 R] /Count 1 >>"},
+		testObj{num: 3, body: "<< /Type /Page /Parent 2 0 R /Contents 4 0 R /Resources << /Font << " + fonts.String() + ">> >> >>"},
+		testObj{num: 4, body: streamObj(content.String())},
+		testObj{num: 6, hdr: "/N NUM /First FIRST", members: []testObj{{num: 5, body: font}}},
+	)
+	r, err := NewReader(bytes.NewReader(data), int64(len(data)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := allocated(func() { r.Page(1).Content() }); got > 64<<20 {
+		t.Errorf("Content allocated %d MB", got>>20)
+	}
+	if got := allocated(func() { r.GetPlainText() }); got > 64<<20 {
+		t.Errorf("GetPlainText allocated %d MB", got>>20)
+	}
+}
+
+// allocated returns the bytes fn allocates.
+func allocated(fn func()) uint64 {
+	var before, after runtime.MemStats
+	runtime.GC()
+	runtime.ReadMemStats(&before)
+	fn()
+	runtime.ReadMemStats(&after)
+	return after.TotalAlloc - before.TotalAlloc
+}
+
+// TestFontsResolvedOnUse verifies that Page.Content resolves only the fonts
+// its text operators select, and remembers no name the page does not define.
+// Resolving every font up front made a page that inherits fat resources, or
+// names thousands of fonts, pay for all of them, and each undefined name a
+// content stream selected stayed in memory for the rest of the page.
+func TestFontsResolvedOnUse(t *testing.T) {
+	junk := "/Junk [" + strings.Repeat("0 ", 500000) + "]"
+	t.Run("no font selected", func(t *testing.T) {
+		data := buildPDF(
+			"<< /Type /Catalog /Pages 2 0 R >>",
+			"<< /Type /Pages /Kids [3 0 R] /Count 1 /Resources << /Font << /F1 << /Type /Font >> >> >> "+junk+" >>",
+			"<< /Type /Page /Parent 2 0 R /Contents 4 0 R >>",
+			streamObj("BT (x) Tj ET"),
+		)
+		r, err := NewReader(bytes.NewReader(data), int64(len(data)))
+		if err != nil {
+			t.Fatal(err)
+		}
+		p := r.Page(1)
+		if got := allocated(func() { p.Content() }); got > 4<<20 {
+			t.Errorf("Content allocated %d MB", got>>20)
+		}
+	})
+
+	t.Run("one of many fonts selected", func(t *testing.T) {
+		var fonts strings.Builder
+		for i := range 200 {
+			fmt.Fprintf(&fonts, "/F%d 5 0 R ", i)
+		}
+		data := buildPDF(
+			"<< /Type /Catalog /Pages 2 0 R >>",
+			"<< /Type /Pages /Kids [3 0 R] /Count 1 >>",
+			"<< /Type /Page /Parent 2 0 R /Contents 4 0 R /Resources << /Font << "+fonts.String()+">> >> >>",
+			streamObj("BT /F7 12 Tf (x) Tj ET"),
+			"<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica "+junk+" >>",
+		)
+		r, err := NewReader(bytes.NewReader(data), int64(len(data)))
+		if err != nil {
+			t.Fatal(err)
+		}
+		p := r.Page(1)
+		if got := allocated(func() { p.Content() }); got > 64<<20 {
+			t.Errorf("Content allocated %d MB", got>>20)
+		}
+	})
+
+	t.Run("undefined names", func(t *testing.T) {
+		const n = 200000
+		var distinct strings.Builder
+		for i := range n {
+			fmt.Fprintf(&distinct, "/%x 1 Tf ", i)
+		}
+		same := pageWithContent(strings.Repeat("/7 1 Tf ", n))
+		base := allocated(func() { same.Content() })
+		p := pageWithContent(distinct.String())
+		if got := allocated(func() { p.Content() }); got > base+8<<20 {
+			t.Errorf("Content allocated %d MB for distinct undefined names, %d MB for one repeated", got>>20, base>>20)
+		}
+	})
+}
