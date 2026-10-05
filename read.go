@@ -84,10 +84,11 @@ import (
 var DebugOn = false
 
 // A Reader is a single PDF file open for reading.
-// It is safe for concurrent use; goroutines share its caches and one decode
-// budget, which lets its streams decode at most the larger of 128 MB and 32
-// times the file size over the Reader's lifetime. A caller reading the file
-// through many times should open a new Reader for each pass.
+// It is safe for concurrent use; goroutines share its caches and its budgets
+// over its lifetime: its streams decode at most the larger of 128 MB and 32
+// times the file size, its pages' content at most 64 MB of that, and its
+// pages show at most 2^23 glyphs. A caller reading the file through many
+// times should open a new Reader for each pass.
 type Reader struct {
 	f          io.ReaderAt
 	end        int64
@@ -335,6 +336,8 @@ func NewReaderEncrypted(f io.ReaderAt, size int64, pw func() string) (r *Reader,
 	}
 	r.cache.limit = max(minDecodeBudget, decodeBudgetRatio*size)
 	r.cache.budget.Store(r.cache.limit)
+	r.cache.content.Store(maxDocContentBytes)
+	r.cache.glyphs.Store(maxDocGlyphs)
 	pos := end - chunk + int64(i)
 	b := newBuffer(io.NewSectionReader(f, pos, end-pos), pos)
 	if b.readToken() != keyword("startxref") {
@@ -1039,18 +1042,25 @@ type readerCache struct {
 	// streams may yield.
 	budget atomic.Int64
 	limit  int64
+	// content and glyphs are what remain of the limits on the content
+	// Interpret reads and the glyphs text extraction shows, which are
+	// otherwise bounded only per page.
+	content atomic.Int64
+	glyphs  atomic.Int64
 }
 
-// A budgetReader charges what it reads against its Reader's decode budget.
+// A budgetReader charges what it reads against one of its Reader's budgets.
 type budgetReader struct {
-	r io.Reader
-	c *readerCache
+	r     io.Reader
+	left  *atomic.Int64
+	limit int64
+	what  string
 }
 
 func (b *budgetReader) Read(p []byte) (int, error) {
 	n, err := b.r.Read(p)
-	if b.c.budget.Add(-int64(n)) < 0 {
-		return 0, fmt.Errorf("decoding exceeds the %d-byte budget for this file", b.c.limit)
+	if b.left.Add(-int64(n)) < 0 {
+		return 0, fmt.Errorf("%s exceeds the %d-byte budget for this file", b.what, b.limit)
 	}
 	return n, err
 }
@@ -1060,7 +1070,15 @@ func (r *Reader) charge(rd io.Reader) io.Reader {
 	if r.cache == nil {
 		return rd
 	}
-	return &budgetReader{rd, r.cache}
+	return &budgetReader{rd, &r.cache.budget, r.cache.limit, "decoding"}
+}
+
+// chargeContent counts what rd yields against r's content budget.
+func (r *Reader) chargeContent(rd io.Reader) io.Reader {
+	if r == nil || r.cache == nil {
+		return rd
+	}
+	return &budgetReader{rd, &r.cache.content, maxDocContentBytes, "content"}
 }
 
 // A cached value is loaded once, by whichever caller asks first. A panic

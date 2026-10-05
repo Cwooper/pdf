@@ -17,6 +17,12 @@ import (
 // 33 thousand pages of ordinary documents is 8.5 MB.
 const maxInterpretBytes = 16 << 20
 
+// maxDocContentBytes bounds the decoded bytes all Interpret calls on one
+// Reader's pages read, so that pages sharing a stream at the per-page cap
+// cannot multiply it. The most content any of 212 ordinary documents holds
+// is 16.4 MB.
+const maxDocContentBytes = 4 * maxInterpretBytes
+
 // maxOperands bounds the operands on Interpret's stack together with the array
 // and dict entries they hold. Each is a 32-byte Value or larger, so operands
 // never consumed by an operator, from a few kilobytes of Flate, otherwise
@@ -92,7 +98,7 @@ func Interpret(strm Value, do func(stk *Stack, op string)) {
 		rd = strm.Reader()
 	}
 
-	b := newBuffer(newLimitedReader(rd, maxInterpretBytes), 0)
+	b := newBuffer(newLimitedReader(strm.r.chargeContent(rd), maxInterpretBytes), 0)
 	b.allowEOF = true
 	b.allowObjptr = false
 	b.allowStream = false
