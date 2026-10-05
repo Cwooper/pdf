@@ -469,3 +469,19 @@ func TestOutlineTitleBudget(t *testing.T) {
 		t.Errorf("titles hold %d bytes in all, want at most %d", total, maxOutlineTitleBytes)
 	}
 }
+
+// TestQuoteOperator verifies that the " operator shows its string in every
+// text API, not only Content: the others passed it all three operands where
+// one was expected, and failed the page.
+func TestQuoteOperator(t *testing.T) {
+	p := pageWithContent(`BT 1 0 (hello) " ET`)
+	if got := contentText(p); got != "hello" {
+		t.Errorf("Content shows %q, want %q", got, "hello")
+	}
+	if got, err := p.GetPlainText(nil); err != nil || !strings.Contains(got, "hello") {
+		t.Errorf("GetPlainText = %q, %v; want hello", got, err)
+	}
+	if rows, err := p.GetTextByRow(); err != nil || len(rows) != 1 || rows[0].Content[0].S != "hello" {
+		t.Errorf("GetTextByRow = %v, %v; want hello", rows, err)
+	}
+}
