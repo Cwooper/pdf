@@ -42,6 +42,11 @@ const (
 	// maxCmapBytes bounds a ToUnicode cmap read into memory. Real cmaps run
 	// to a few hundred kilobytes at most.
 	maxCmapBytes = 32 << 20
+
+	// maxPageGlyphs bounds the Text values Page.Content builds for one page,
+	// about 64 bytes each. A dense real page holds under ten thousand; an
+	// inflated content stream can show millions from a few kilobytes.
+	maxPageGlyphs = 1 << 20
 )
 
 // A Page represent a single page in a PDF file.
@@ -972,6 +977,9 @@ func (p Page) Content() Content {
 		n := 0
 		decoded := enc.Decode(s)
 		for _, ch := range decoded {
+			if len(text) >= maxPageGlyphs {
+				panic(fmt.Errorf("page shows more than %d glyphs", maxPageGlyphs))
+			}
 			var w0 float64
 			if n < len(s) {
 				w0 = g.Tf.Width(int(s[n]))
