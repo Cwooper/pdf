@@ -330,3 +330,28 @@ func TestAESStreamEnd(t *testing.T) {
 		}
 	}
 }
+
+// TestStringDecryptionCost verifies that an object's strings share one key
+// derivation and cipher: each paid for its own, twenty times the cost of
+// parsing it, on objects holding millions of strings.
+func TestStringDecryptionCost(t *testing.T) {
+	const n = 20000
+	for _, s := range []cryptSpec{{V: 2, R: 3, bits: 128}, {V: 4, R: 4, bits: 128}} {
+		O := strings.Repeat("O", 32)
+		str := fmt.Sprintf("<%x> ", s.encrypt(s.fileKey(O), 3, []byte("abcdefgh")))
+		data := encryptedPDF(s, "", "", "/Junk ["+strings.Repeat(str, n)+"]")
+		r, err := NewReader(bytes.NewReader(data), int64(len(data)))
+		if err != nil {
+			t.Fatal(err)
+		}
+		r.NumPage() // the page-tree walk parses the page too
+		var junk Value
+		perString := allocated(func() { junk = r.Page(1).V.Key("Junk") }) / n
+		if junk.Len() != n || junk.Index(n-1).RawString() != "abcdefgh" {
+			t.Fatalf("V%d: Junk holds %d strings, the last %q; want %d of %q", s.V, junk.Len(), junk.Index(n-1).RawString(), n, "abcdefgh")
+		}
+		if perString > 300 {
+			t.Errorf("V%d: allocated %d bytes per string", s.V, perString)
+		}
+	}
+}
