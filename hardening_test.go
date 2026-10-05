@@ -3,6 +3,7 @@ package pdf
 import (
 	"bytes"
 	"compress/zlib"
+	"encoding/ascii85"
 	"fmt"
 	"io"
 	"runtime"
@@ -420,12 +421,28 @@ func buildPDF(objs ...string) []byte {
 	return b.Bytes()
 }
 
+// pagePDF returns a file of one page, object 3, holding the entries page and
+// /Contents 4 0 R, with objs as objects 4, 5, ....
+func pagePDF(page string, objs ...string) []byte {
+	return buildPDF(append([]string{
+		"<< /Type /Catalog /Pages 2 0 R >>",
+		"<< /Type /Pages /Kids [3 0 R] /Count 1 >>",
+		"<< /Type /Page /Parent 2 0 R /Contents 4 0 R " + page + " >>",
+	}, objs...)...)
+}
+
 func deflate(data []byte) []byte {
 	var b bytes.Buffer
 	w := zlib.NewWriter(&b)
 	w.Write(data)
 	w.Close()
 	return b.Bytes()
+}
+
+// flateObj returns a Flate-compressed stream object holding content.
+func flateObj(content string) string {
+	z := deflate([]byte(content))
+	return fmt.Sprintf("<< /Length %d /Filter /FlateDecode >>\nstream\n%s\nendstream", len(z), z)
 }
 
 // TestXrefTableAtEntryCap verifies that a compressed xref stream describing
@@ -684,5 +701,96 @@ func TestObjectStreamDecodedOnce(t *testing.T) {
 	})
 	if got > 16<<20 {
 		t.Errorf("resolving %d objects from one stream allocated %d MB", pages, got>>20)
+	}
+}
+
+// TestFilterChainCap verifies that a /Filter array of up to maxFilters
+// decodes and a longer one is refused before its decoders are built.
+func TestFilterChainCap(t *testing.T) {
+	page := func(layers int) Page {
+		content := "BT (x) Tj ET"
+		for range layers {
+			var b bytes.Buffer
+			w := ascii85.NewEncoder(&b)
+			w.Write([]byte(content))
+			w.Close()
+			content = b.String() + "~>"
+		}
+		return openPDF(t, pagePDF("",
+			fmt.Sprintf("<< /Length %d /Filter 5 0 R >>\nstream\n%s\nendstream", len(content), content),
+			"["+strings.Repeat("/ASCII85Decode ", layers)+"]",
+		)).Page(1)
+	}
+	if got, err := page(maxFilters).GetPlainText(nil); err != nil || got != "\nx" {
+		t.Errorf("%d filters: GetPlainText = %q, %v; want %q", maxFilters, got, err, "\nx")
+	}
+	if _, err := page(maxFilters + 1).GetPlainText(nil); err == nil || !strings.Contains(err.Error(), "filters") {
+		t.Errorf("%d filters: got %v, want the filter cap reported", maxFilters+1, err)
+	}
+}
+
+// TestDecodeBudgetBeneathPredictor verifies that the inflate beneath a
+// predictor counts against the budget although the predictor yields
+// nothing: with no /Columns every row is the filter byte alone.
+func TestDecodeBudgetBeneathPredictor(t *testing.T) {
+	var z bytes.Buffer
+	zw := zlib.NewWriter(&z)
+	row := bytes.Repeat([]byte{2}, 1<<20)
+	for range minDecodeBudget>>20 + 1 {
+		zw.Write(row)
+	}
+	zw.Close()
+	r := openPDF(t, pagePDF("",
+		fmt.Sprintf("<< /Length %d /Filter /FlateDecode /DecodeParms << /Predictor 12 >> >>\nstream\n%s\nendstream", z.Len(), z.String()),
+	))
+	if _, err := r.Page(1).GetPlainText(nil); err == nil || !strings.Contains(err.Error(), "budget") {
+		t.Errorf("GetPlainText: got %v, want the decode budget reported", err)
+	}
+}
+
+// TestDecodeBudget verifies that the bytes all of a Reader's streams decode
+// to count against one budget, however many pages share one stream.
+func TestDecodeBudget(t *testing.T) {
+	const chunk = 8 << 20
+	pages := minDecodeBudget/chunk + 1
+	objs := []string{"<< /Type /Catalog /Pages 2 0 R >>", "", flateObj(strings.Repeat("\x00", chunk) + "BT (x) Tj ET")}
+	var kids strings.Builder
+	for i := range pages {
+		fmt.Fprintf(&kids, "%d 0 R ", 4+i)
+		objs = append(objs, "<< /Type /Page /Parent 2 0 R /Contents 3 0 R >>")
+	}
+	objs[1] = fmt.Sprintf("<< /Type /Pages /Kids [%s] /Count %d >>", kids.String(), pages)
+	r := openPDF(t, buildPDF(objs...))
+	var err error
+	for i := 1; i <= pages; i++ {
+		if _, err = r.Page(i).GetPlainText(nil); err != nil {
+			break
+		}
+	}
+	if err == nil || !strings.Contains(err.Error(), "budget") {
+		t.Errorf("reading %d pages of %d MB each: got %v, want the decode budget reported", pages, chunk>>20, err)
+	}
+}
+
+// TestDecodeBudgetCountsObjects verifies that the bytes of an object parsed
+// from the file count against the decode budget too, since pages sharing one
+// large /Resources dict parse it for each page.
+func TestDecodeBudgetCountsObjects(t *testing.T) {
+	const size = 1 << 20
+	pages := minDecodeBudget/size + 1
+	content := "BT /F1 12 Tf (a) Tj ET"
+	objs := []string{"<< /Type /Catalog /Pages 2 0 R >>", "",
+		"<< /Font << /F1 4 0 R >> /Junk (" + strings.Repeat("x", size) + ") >>",
+		"<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>",
+		fmt.Sprintf("<< /Length %d >>\nstream\n%s\nendstream", len(content), content)}
+	var kids strings.Builder
+	for i := range pages {
+		fmt.Fprintf(&kids, "%d 0 R ", 6+i)
+		objs = append(objs, "<< /Type /Page /Parent 2 0 R /Contents 5 0 R /Resources 3 0 R >>")
+	}
+	objs[1] = fmt.Sprintf("<< /Type /Pages /Kids [%s] /Count %d >>", kids.String(), pages)
+	r := openPDF(t, buildPDF(objs...))
+	if _, err := r.GetPlainText(); err == nil || !strings.Contains(err.Error(), "budget") {
+		t.Errorf("%d pages sharing a %d MB dict: got %v, want the decode budget reported", pages, size>>20, err)
 	}
 }
