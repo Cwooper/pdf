@@ -972,3 +972,31 @@ func TestCmapParsedOncePerReader(t *testing.T) {
 	}
 	wg.Wait()
 }
+
+// TestFontMetricsResolvedOnce verifies that Page.Content resolves a font's
+// /Widths and the entries around it once, not once per glyph: Word-style
+// files keep /Widths in an indirect object, which each glyph parsed again.
+func TestFontMetricsResolvedOnce(t *testing.T) {
+	const glyphs = 20000
+	data := buildPDF(
+		"<< /Type /Catalog /Pages 2 0 R >>",
+		"<< /Type /Pages /Kids [3 0 R] /Count 1 >>",
+		"<< /Type /Page /Parent 2 0 R /Contents 4 0 R /Resources << /Font << /F1 5 0 R >> >> >>",
+		streamObj("BT /F1 12 Tf ("+strings.Repeat("a", glyphs)+") Tj ET"),
+		"<< /Type /Font /Subtype /Type1 /BaseFont 7 0 R /FirstChar 0 /LastChar 255 /Widths 6 0 R >>",
+		"["+strings.Repeat("500 ", 2000)+"]",
+		"/ABCDEF+Helvetica",
+	)
+	r, err := NewReader(bytes.NewReader(data), int64(len(data)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	p := r.Page(1)
+	var text []Text
+	if got := allocated(func() { text = p.Content().Text }); got > 32<<20 {
+		t.Errorf("Content allocated %d MB", got>>20)
+	}
+	if len(text) != glyphs || text[0].W != 6 || text[0].Font != "Helvetica" {
+		t.Errorf("got %d glyphs, first %+v; want %d of width 6 in Helvetica", len(text), text[0], glyphs)
+	}
+}
