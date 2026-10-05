@@ -606,9 +606,8 @@ func TestObjectStreamStillResolves(t *testing.T) {
 	}
 }
 
-// TestMalformedObjectStream covers the object stream header. /N is a declared
-// count that the pair loop no longer trusts, and /First and the per object
-// offsets are file supplied positions used to seek.
+// TestMalformedObjectStream covers the object stream header: /N is only a
+// claim, and /First and the per-object offsets index the decoded data.
 func TestMalformedObjectStream(t *testing.T) {
 	tests := []struct {
 		name string
@@ -648,9 +647,8 @@ func TestMalformedObjectStream(t *testing.T) {
 	}
 }
 
-// TestConcurrentReads pins the property that made resolve carry its recursion
-// depth as a parameter instead of on the Reader: an opened Reader is immutable,
-// so several goroutines may read from it at once. Run under -race to be
+// TestConcurrentReads pins that several goroutines may read from one Reader
+// at once, sharing the object streams it decodes. Run under -race to be
 // meaningful.
 func TestConcurrentReads(t *testing.T) {
 	data := objStmPDF()
