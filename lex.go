@@ -111,7 +111,11 @@ func (b *buffer) seekForward(offset int64) {
 			return
 		}
 	}
-	b.pos = len(b.buf) - int(b.offset-offset)
+	start := b.offset - int64(len(b.buf))
+	if offset < start {
+		b.errorf("malformed PDF: offset %d is behind the read position", offset)
+	}
+	b.pos = int(offset - start)
 }
 
 func (b *buffer) readOffset() int64 {
