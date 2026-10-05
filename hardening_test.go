@@ -449,6 +449,21 @@ func TestNegativeOffsets(t *testing.T) {
 	}
 }
 
+// TestNegativeXrefStart verifies that a negative startxref or /Prev is
+// reported as malformed input rather than slicing the lexer's buffer out of
+// range.
+func TestNegativeXrefStart(t *testing.T) {
+	for name, data := range map[string][]byte{
+		"startxref":   []byte("%PDF-1.4\n" + pad() + "startxref\n-1\n%%EOF\n"),
+		"table Prev":  xrefTablePDF("0 1\n0000000000 65535 f \n", "<< /Size 1 /Prev -1 >>"),
+		"stream Prev": xrefStreamPDF("/Size 1 /W [1 1 1] /Prev -1", "\x00\x00\x00"),
+	} {
+		if err := openBytes(data); err == nil || strings.Contains(err.Error(), "runtime error") {
+			t.Errorf("%s: got %v, want it reported as malformed", name, err)
+		}
+	}
+}
+
 // buildPDF returns a file holding objs as objects 1, 2, ..., with object 1
 // as the catalog.
 func buildPDF(objs ...string) []byte {
