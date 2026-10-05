@@ -56,6 +56,10 @@ const (
 	// one cmap keeps; a full CID table maps 65,536 glyphs.
 	maxCmapEntries = 1 << 17
 
+	// maxCIDWidths bounds the widths read from a CIDFont's /W; a full one
+	// lists about 100 thousand.
+	maxCIDWidths = 1 << 17
+
 	// maxPageGlyphs bounds the glyphs, Texts, and Rects text extraction
 	// builds for one page, about 64 bytes each. A dense real page holds under
 	// ten thousand; an inflated content stream can show millions from a few
@@ -394,7 +398,71 @@ type fontMetrics struct {
 	loaded      bool
 	base        string
 	first, last int
-	widths      []float64 // for codes first onward
+	widths      []float64   // for codes first onward
+	cid         *cidMetrics // for a Type0 font, whose codes select CIDs
+}
+
+// cidMetrics holds the widths of a Type0 font's descendant CIDFont.
+type cidMetrics struct {
+	identity bool // codes are CIDs
+	dw       float64
+	runs     []widthRun // sorted by first
+}
+
+type widthRun struct {
+	first, last int
+	w           float64   // when ws is nil
+	ws          []float64 // widths of first..last
+}
+
+// loadCIDMetrics reads the /DW and /W of Type0 font f's descendant font.
+func loadCIDMetrics(f Value) *cidMetrics {
+	d := f.Key("DescendantFonts").Index(0)
+	m := &cidMetrics{identity: f.Key("Encoding").Name() == "Identity-H", dw: 1000}
+	if dw := d.Key("DW"); dw.Kind() == Integer || dw.Kind() == Real {
+		m.dw = dw.Float64()
+	}
+	// /W holds runs of "c [w1 w2 ...]" and "cfirst clast w", read up to the
+	// first malformed one.
+	w := d.Key("W")
+	for i, widths := 0, 0; i+1 < w.Len() && widths < maxCIDWidths; {
+		c, next := w.Index(i), w.Index(i+1)
+		if c.Kind() != Integer {
+			break
+		}
+		r := widthRun{first: int(c.Int64())}
+		if next.Kind() == Array {
+			r.ws = make([]float64, min(next.Len(), maxCIDWidths-widths))
+			for j := range r.ws {
+				r.ws[j] = next.Index(j).Float64()
+			}
+			r.last = r.first + len(r.ws) - 1
+			i += 2
+		} else {
+			if next.Kind() != Integer || i+2 >= w.Len() {
+				break
+			}
+			r.last, r.w = int(next.Int64()), w.Index(i+2).Float64()
+			i += 3
+		}
+		widths += max(1, len(r.ws))
+		m.runs = append(m.runs, r)
+	}
+	slices.SortStableFunc(m.runs, func(a, b widthRun) int { return cmp.Compare(a.first, b.first) })
+	return m
+}
+
+// width returns the width of CID cid, or /DW if /W gives none or cid is -1.
+func (m *cidMetrics) width(cid int) float64 {
+	i := sort.Search(len(m.runs), func(i int) bool { return m.runs[i].first > cid }) - 1
+	if cid < 0 || i < 0 || cid > m.runs[i].last {
+		return m.dw
+	}
+	r := m.runs[i]
+	if r.ws != nil {
+		return r.ws[cid-r.first]
+	}
+	return r.w
 }
 
 // metrics returns f.m, loading it on first use, or nil if f does not keep one.
@@ -417,6 +485,9 @@ func (f Font) metrics() *fontMetrics {
 		for i := range m.widths {
 			m.widths[i] = w.Index(i).Float64()
 		}
+	}
+	if f.V.Key("Subtype").Name() == "Type0" {
+		m.cid = loadCIDMetrics(f.V)
 	}
 	m.loaded = true
 	return m
@@ -457,9 +528,17 @@ func (f Font) Widths() []float64 {
 	return out
 }
 
-// Width returns the width of the given code point.
+// Width returns the width of the given code point, or for a Type0 font
+// the width of the given CID.
 func (f Font) Width(code int) float64 {
-	if m := f.metrics(); m != nil {
+	m := f.metrics()
+	if m == nil && f.V.Key("Subtype").Name() == "Type0" {
+		m = Font{V: f.V, m: new(fontMetrics)}.metrics()
+	}
+	if m != nil {
+		if m.cid != nil {
+			return m.cid.width(code)
+		}
 		if i := code - m.first; i >= 0 && i < len(m.widths) && code <= m.last {
 			return m.widths[i]
 		}
@@ -898,6 +977,15 @@ func codeFits(code string) bool {
 	return len(code) >= 1 && len(code) <= 4
 }
 
+// cidCodeLen returns the length of the Type0 font code raw starts with:
+// as the font's cmap reads it, or else the two bytes of Identity-H.
+func cidCodeLen(enc TextEncoding, raw string) int {
+	if m, ok := enc.(*cmap); ok {
+		return max(1, m.codeLen(raw))
+	}
+	return min(2, len(raw))
+}
+
 // dstFits reports whether bfrange destination dst, a string or an array of
 // them, keeps every string within maxCmapDst.
 func dstFits(dst Value) bool {
@@ -1295,28 +1383,58 @@ func (p Page) Content() Content {
 
 	var text []Text
 	glyphs := glyphBudget{r: p.V.r}
+	// glyph shows ch, w0 wide in glyph space, at the text position.
+	glyph := func(ch rune, w0 float64) {
+		glyphs.spend(1)
+		f := g.Tf.BaseFont()
+		if i := strings.Index(f, "+"); i >= 0 {
+			f = f[i+1:]
+		}
+
+		Trm := matrix{{g.Tfs * g.Th, 0, 0}, {0, g.Tfs, 0}, {0, g.Trise, 1}}.mul(g.Tm).mul(g.CTM)
+		text = append(text, Text{f, Trm[0][0], Trm[2][0], Trm[2][1], w0 / 1000 * Trm[0][0], string(ch)})
+	}
+	advance := func(w0, tc float64) {
+		tx := w0/1000*g.Tfs + tc
+		tx *= g.Th
+		g.Tm = matrix{{1, 0, 0}, {0, 1, 0}, {tx, 0, 1}}.mul(g.Tm)
+	}
 	showText := func(s string) {
+		if m := g.Tf.metrics(); m != nil && m.cid != nil {
+			for len(s) > 0 {
+				n := cidCodeLen(enc, s)
+				code := s[:n]
+				s = s[n:]
+				cid := -1
+				if m.cid.identity {
+					cid = 0
+					for i := range n {
+						cid = cid<<8 | int(code[i])
+					}
+				}
+				// A code mapping to several runes splits its width among them.
+				runes := []rune(decodeLimit(enc, code, glyphs.left()+1))
+				w := m.cid.width(cid) / float64(max(1, len(runes)))
+				for i, ch := range runes {
+					glyph(ch, w)
+					if i < len(runes)-1 {
+						advance(w, 0)
+					}
+				}
+				advance(w, g.Tc)
+			}
+			return
+		}
 		n := 0
 		decoded := decodeLimit(enc, s, glyphs.left()+1)
 		for _, ch := range decoded {
-			glyphs.spend(1)
 			var w0 float64
 			if n < len(s) {
 				w0 = g.Tf.Width(int(s[n]))
 			}
 			n++
-
-			f := g.Tf.BaseFont()
-			if i := strings.Index(f, "+"); i >= 0 {
-				f = f[i+1:]
-			}
-
-			Trm := matrix{{g.Tfs * g.Th, 0, 0}, {0, g.Tfs, 0}, {0, g.Trise, 1}}.mul(g.Tm).mul(g.CTM)
-			text = append(text, Text{f, Trm[0][0], Trm[2][0], Trm[2][1], w0 / 1000 * Trm[0][0], string(ch)})
-
-			tx := w0/1000*g.Tfs + g.Tc
-			tx *= g.Th
-			g.Tm = matrix{{1, 0, 0}, {0, 1, 0}, {tx, 0, 1}}.mul(g.Tm)
+			glyph(ch, w0)
+			advance(w0, g.Tc)
 		}
 	}
 

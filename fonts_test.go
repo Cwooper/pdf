@@ -219,3 +219,43 @@ func TestDifferences(t *testing.T) {
 		t.Errorf("Decode = %q, want %q", got, want)
 	}
 }
+
+// TestCIDFontWidths verifies that glyphs of a Type0 font advance by the
+// widths of its descendant font, /W in both its forms and /DW for the rest:
+// every glyph had width 0 and landed at one X.
+func TestCIDFontWidths(t *testing.T) {
+	const cm = "1 begincodespacerange <0000> <ffff> endcodespacerange " +
+		"1 beginbfrange <0001> <0005> <0041> endbfrange " +
+		"2 beginbfchar <0006> <00660069> <0007> <> endbfchar"
+	type glyph struct {
+		S    string
+		X, W float64
+	}
+	tests := []struct {
+		name, descendant string
+		want             []glyph
+	}{
+		{"W and DW", "<< /Type /Font /Subtype /CIDFontType2 /W [1 [500 600] 3 4 700 6 [800]] /DW 300 >>", []glyph{
+			{"A", 0, 5}, {"B", 5, 6}, {"C", 11, 7}, {"D", 18, 7}, {"E", 25, 3},
+			{"f", 28, 4}, {"i", 32, 4}, {"A", 36 + 3, 5},
+		}},
+		{"no DW", "<< /Type /Font /Subtype /CIDFontType2 >>", []glyph{
+			{"A", 0, 10}, {"B", 10, 10}, {"C", 20, 10}, {"D", 30, 10}, {"E", 40, 10},
+			{"f", 50, 5}, {"i", 55, 5}, {"A", 70, 10},
+		}},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			r := fontPage(t, "BT /F1 10 Tf <0001000200030004000500060007 0001> Tj ET",
+				"<< /Type /Font /Subtype /Type0 /BaseFont /X /Encoding /Identity-H /DescendantFonts [7 0 R] /ToUnicode 6 0 R >>",
+				streamObj(cm), tt.descendant)
+			var got []glyph
+			for _, tx := range r.Page(1).Content().Text {
+				got = append(got, glyph{tx.S, tx.X, tx.W})
+			}
+			if fmt.Sprint(got) != fmt.Sprint(tt.want) {
+				t.Errorf("got  %v\nwant %v", got, tt.want)
+			}
+		})
+	}
+}
