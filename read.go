@@ -51,7 +51,7 @@ package pdf
 // BUG(rsc): There is no support for closing open PDF files. If you drop all references to a Reader,
 // the underlying reader will eventually be garbage collected.
 
-// BUG(rsc): Apart from the object streams, cmaps, and page tree a Reader decodes, which it keeps, the library
+// BUG(rsc): Apart from the object streams, fonts, cmaps, and page tree a Reader decodes, which it keeps, the library
 // makes no attempt at efficiency. A value cache maintained in the Reader would probably help.
 
 // BUG(rsc): The support for reading encrypted files is weak.
@@ -1006,6 +1006,7 @@ type readerCache struct {
 	mu      sync.Mutex
 	objStms map[objptr]*cached[*objStm]
 	cmaps   map[objptr]*cached[*cmap]
+	fonts   map[objptr]*cached[*Font]
 	cids    map[objptr]*cached[*cidMetrics]
 	pages   cached[[]pageEntry]
 	// indexed counts the entries every decoded object stream's index has

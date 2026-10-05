@@ -318,3 +318,34 @@ func TestPlainTextFontsPerPage(t *testing.T) {
 		t.Errorf("GetPlainText = %q, want %q", got, "\nX\nY\nZ")
 	}
 }
+
+// TestFontsParsedOncePerReader verifies that pages sharing a font object
+// share its parsed widths.
+func TestFontsParsedOncePerReader(t *testing.T) {
+	const pages = 100
+	w := "[0 [" + strings.Repeat("500 ", maxCIDWidths) + "]]"
+	var kids strings.Builder
+	objs := []string{
+		"<< /Type /Font /Subtype /Type0 /BaseFont /X /Encoding /Identity-H /DescendantFonts [4 0 R] >>",
+		"<< /Type /Font /Subtype /CIDFontType2 /BaseFont /X /W " + w + " >>",
+		flateObj("BT /F1 12 Tf <00010002> Tj ET"),
+	}
+	for i := range pages {
+		fmt.Fprintf(&kids, "%d 0 R ", 6+i)
+		objs = append(objs, "<< /Type /Page /Parent 2 0 R /Contents 5 0 R >>")
+	}
+	root := fmt.Sprintf("<< /Type /Pages /Kids [%s] /Count %d /Resources << /Font << /F1 3 0 R >> >> >>", kids.String(), pages)
+	r := openPDF(t, pageTreePDF(root, objs...))
+	first := allocated(func() { r.Page(1).Content() })
+	rest := allocated(func() {
+		for i := 2; i <= pages; i++ {
+			// Each two-byte code decodes to two runes sharing its width.
+			if got := r.Page(i).Content().Text; len(got) != 4 || got[2].X-got[0].X != 6 {
+				t.Fatalf("page %d texts %v, want two codes 6 apart", i, got)
+			}
+		}
+	})
+	if rest > first {
+		t.Errorf("pages 2 to %d allocated %d KB, page 1 %d KB", pages, rest>>10, first>>10)
+	}
+}
