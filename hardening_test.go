@@ -445,3 +445,34 @@ func TestXrefTableAtEntryCap(t *testing.T) {
 		t.Errorf("opening a %d-byte file allocated %d MB", len(data), got>>20)
 	}
 }
+
+// TestXrefRowsBounded verifies that the rows an xref stream chain is scanned
+// for count against one budget, of exactly maxXrefRows, whether or not they
+// are stored: rows of an unknown type, or for objects a later section already
+// describes, included.
+func TestXrefRowsBounded(t *testing.T) {
+	chain := func(rows int) []byte {
+		comp := deflate(bytes.Repeat([]byte{3, 0}, rows))
+		section := func(num int, extra string) string {
+			return fmt.Sprintf("%d 0 obj\n<< /Type /XRef /Size %d /W [1 1 0] /Filter /FlateDecode /Length %d %s >>\nstream\n%s\nendstream\nendobj\n",
+				num, rows, len(comp), extra, comp)
+		}
+
+		var b strings.Builder
+		b.WriteString("%PDF-1.5\n")
+		b.WriteString(pad())
+		prev := b.Len()
+		b.WriteString(section(1, ""))
+		start := b.Len()
+		b.WriteString(section(2, fmt.Sprintf("/Prev %d", prev)))
+		fmt.Fprintf(&b, "startxref\n%d\n%%%%EOF\n", start)
+		return []byte(b.String())
+	}
+
+	if err := openBytes(chain(maxXrefRows / 2)); err != nil {
+		t.Errorf("%d rows: NewReader: %v", maxXrefRows, err)
+	}
+	if err := openBytes(chain(maxXrefRows/2 + 1)); err == nil || !strings.Contains(err.Error(), "rows") {
+		t.Errorf("%d rows: got %v, want the row budget reported", maxXrefRows+2, err)
+	}
+}
