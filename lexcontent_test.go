@@ -107,3 +107,27 @@ func TestInterpretErrorCap(t *testing.T) {
 		Interpret(rawStream(strings.Repeat("[) ", maxInterpretErrors+1)), nop)
 	})
 }
+
+// contentText returns the text p's Content shows, glyph by glyph.
+func contentText(p Page) string {
+	var b strings.Builder
+	for _, t := range p.Content().Text {
+		b.WriteString(t.S)
+	}
+	return b.String()
+}
+
+// TestMalformedTokenKeepsPage verifies that a malformed token outside any
+// operand is skipped like one inside an array or dict, rather than losing
+// the page's text.
+func TestMalformedTokenKeepsPage(t *testing.T) {
+	for _, junk := range []string{")", "<zz>", "/a#zz"} {
+		t.Run(junk, func(t *testing.T) {
+			var got string
+			mustNotCrash(t, func() { got = contentText(pageWithContent("BT (a) Tj " + junk + " (b) Tj ET")) })
+			if got != "ab" {
+				t.Errorf("got %q, want %q", got, "ab")
+			}
+		})
+	}
+}
