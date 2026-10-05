@@ -16,7 +16,7 @@ import (
 // costs memory in proportion to the entries actually read, not to the number.
 // A file of a couple hundred bytes used to allocate 256 MB here.
 func TestSparseXrefIndexAllocation(t *testing.T) {
-	data := xrefStreamPDF("/Size 1 /W [1 1 1] /Index [8388600 1]", "\x01\x09\x00")
+	data := xrefStreamPDF("/Size 1 /W [1 1 1] /Index [2147483648 1]", "\x01\x09\x00")
 
 	var before, after runtime.MemStats
 	runtime.GC()
@@ -80,4 +80,26 @@ func TestResolveWithoutXref(t *testing.T) {
 			t.Errorf("resolved %v from an empty reader", v)
 		}
 	})
+}
+
+// TestXrefEntryBound verifies that a table already holding maxXrefEntries
+// refuses another entry on both the classic and the xref stream path.
+func TestXrefEntryBound(t *testing.T) {
+	full := func() *xrefTable {
+		table := newXrefTable(0)
+		table.n = maxXrefEntries
+		return table
+	}
+
+	b := newBuffer(strings.NewReader("1 1\n0000000009 00000 n \ntrailer"), 0)
+	if _, err := readXrefTableData(b, full()); err == nil {
+		t.Error("classic table: got nil error, want the entry bound reported")
+	}
+
+	data := "\x01\x09\x00"
+	r := &Reader{f: bytes.NewReader([]byte(data)), end: int64(len(data))}
+	hdr := dict{name("Length"): int64(len(data)), name("W"): array{int64(1), int64(1), int64(1)}, name("Index"): array{int64(1), int64(1)}}
+	if _, err := readXrefStreamData(r, stream{hdr, objptr{}, 0}, full(), 2); err == nil {
+		t.Error("xref stream: got nil error, want the entry bound reported")
+	}
 }

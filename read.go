@@ -69,6 +69,7 @@ import (
 	"encoding/ascii85"
 	"fmt"
 	"io"
+	"math"
 	"os"
 	"sort"
 	"strconv"
@@ -106,12 +107,16 @@ const (
 	// what let a 200-byte file ask for tens of gigabytes.
 	maxXrefPrealloc = 1 << 16
 
-	// maxObjectNumber bounds an object number, and with it the highest index a
-	// cross-reference table can reach. Object streams are compressed, so the
-	// file length is not a usable bound here: a small file can legitimately
-	// describe far more objects than it has bytes. This is instead a limit on
-	// object numbers themselves, well above any real document.
-	maxObjectNumber = 1 << 23
+	// maxObjectNumber is the highest object number an objptr can hold. The
+	// sparse xref table keeps memory proportional to the entries read, so
+	// object numbers need no tighter bound than that: legal files may number
+	// their objects sparsely.
+	maxObjectNumber = int64(math.MaxUint32)
+
+	// maxXrefEntries bounds the entries a cross-reference table may store.
+	// Object streams are compressed, so the file length is not a usable bound
+	// here: a few kilobytes of xref stream can describe millions of entries.
+	maxXrefEntries = 1 << 23
 
 	// maxXrefFieldWidth bounds an entry in an xref stream /W array. The
 	// widths are byte counts that decodeInt accumulates into an int, so a
@@ -505,6 +510,9 @@ func readXrefStreamData(r *Reader, strm stream, table *xrefTable, size int64) (*
 			if table.get(uint32(x)).ptr != (objptr{}) {
 				continue
 			}
+			if table.n >= maxXrefEntries {
+				return nil, fmt.Errorf("xref stream holds more than %d entries", maxXrefEntries)
+			}
 			switch v1 {
 			case 0:
 				table.put(x, xref{ptr: objptr{0, 65535}})
@@ -611,6 +619,9 @@ func readXrefTableData(b *buffer, table *xrefTable) (*xrefTable, error) {
 				return nil, fmt.Errorf("malformed xref table")
 			}
 			x := int(start) + i
+			if table.n >= maxXrefEntries {
+				return nil, fmt.Errorf("malformed xref table: more than %d entries", maxXrefEntries)
+			}
 			if alloc == "n" && table.get(uint32(x)).offset == 0 {
 				table.put(x, xref{ptr: objptr{uint32(x), uint16(gen)}, offset: int64(off)})
 			}
