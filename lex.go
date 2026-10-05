@@ -88,8 +88,17 @@ func (b *buffer) errorf(format string, args ...interface{}) {
 }
 
 func (b *buffer) reload() bool {
-	n := cap(b.buf) - int(b.offset%int64(cap(b.buf)))
-	n, err := b.r.Read(b.buf[:n])
+	size := cap(b.buf) - int(b.offset%int64(cap(b.buf)))
+	n, err := b.r.Read(b.buf[:size])
+	// io.Reader allows a read to return nothing and no error; give up after
+	// as many in a row as bufio does.
+	for empty := 1; n == 0 && err == nil; empty++ {
+		if empty == 100 {
+			err = io.ErrNoProgress
+			break
+		}
+		n, err = b.r.Read(b.buf[:size])
+	}
 	if n == 0 && err != nil {
 		b.buf = b.buf[:0]
 		b.pos = 0

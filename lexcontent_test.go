@@ -180,3 +180,18 @@ func TestLexOutOfRangeNumbers(t *testing.T) {
 		t.Errorf("Content shows %q, want %q", got, "AB")
 	}
 }
+
+// emptyReader returns no bytes and no error, which io.Reader allows.
+type emptyReader struct{}
+
+func (emptyReader) Read([]byte) (int, error) { return 0, nil }
+
+// TestEmptyReadsEnd verifies that the lexer gives up on a reader that keeps
+// returning no bytes and no error, rather than asking it forever.
+func TestEmptyReadsEnd(t *testing.T) {
+	mustPanic(t, "no data", func() {
+		b := newBuffer(emptyReader{}, 0)
+		b.allowEOF = true
+		b.readToken()
+	})
+}
