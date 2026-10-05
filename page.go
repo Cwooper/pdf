@@ -11,6 +11,7 @@ import (
 	"io"
 	"sort"
 	"strings"
+	"unicode/utf8"
 )
 
 // The structures a PDF uses to describe pages and outlines are graphs of
@@ -41,6 +42,11 @@ const (
 	// about 64 bytes each. A dense real page holds under ten thousand; an
 	// inflated content stream can show millions from a few kilobytes.
 	maxPageGlyphs = 1 << 18
+
+	// maxDocGlyphs bounds the glyphs text extraction shows across one
+	// Reader's pages, however many pages share a content stream. A 2,054-page
+	// book shows 3.5 million.
+	maxDocGlyphs = 32 * maxPageGlyphs
 
 	// maxGstackDepth bounds the graphics states q saves in Page.Content; a q
 	// past it saves none. Each is 400 bytes, so a stream of q from a few
@@ -270,6 +276,22 @@ type pageFonts struct {
 	looked bool
 	fonts  map[string]*Font
 	shared fontSet
+}
+
+// A glyphBudget counts the glyphs one page's text extraction shows against
+// maxPageGlyphs and its Reader's document-wide budget.
+type glyphBudget struct {
+	r *Reader
+	n int
+}
+
+func (g *glyphBudget) spend(n int) {
+	if g.n += n; g.n > maxPageGlyphs {
+		panic(fmt.Errorf("page shows more than %d glyphs", maxPageGlyphs))
+	}
+	if g.r != nil && g.r.cache != nil && g.r.cache.glyphs.Add(-int64(n)) < 0 {
+		panic(fmt.Errorf("document shows more than %d glyphs", maxDocGlyphs))
+	}
 }
 
 // noFont is the font of a name the page does not define. Its encoding is set
@@ -880,8 +902,11 @@ func (p Page) GetPlainText(fonts map[string]*Font) (result string, err error) {
 	showText := func(s string) {
 		textBuilder.WriteString(s)
 	}
+	glyphs := glyphBudget{r: p.V.r}
 	showEncodedText := func(s string) {
-		textBuilder.WriteString(decodeText(enc, s))
+		s = decodeText(enc, s)
+		glyphs.spend(utf8.RuneCountInString(s))
+		textBuilder.WriteString(s)
 	}
 
 	Interpret(strm, func(stk *Stack, op string) {
@@ -1123,13 +1148,12 @@ func (p Page) Content() Content {
 	}
 
 	var text []Text
+	glyphs := glyphBudget{r: p.V.r}
 	showText := func(s string) {
 		n := 0
 		decoded := enc.Decode(s)
 		for _, ch := range decoded {
-			if len(text) >= maxPageGlyphs {
-				panic(fmt.Errorf("page shows more than %d glyphs", maxPageGlyphs))
-			}
+			glyphs.spend(1)
 			var w0 float64
 			if n < len(s) {
 				w0 = g.Tf.Width(int(s[n]))

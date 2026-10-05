@@ -84,10 +84,11 @@ import (
 var DebugOn = false
 
 // A Reader is a single PDF file open for reading.
-// It is safe for concurrent use; goroutines share its caches and one decode
-// budget, which lets its streams decode at most the larger of 128 MB and 32
-// times the file size over the Reader's lifetime. A caller reading the file
-// through many times should open a new Reader for each pass.
+// It is safe for concurrent use; goroutines share its caches and its budgets
+// over its lifetime: its streams decode at most the larger of 128 MB and 32
+// times the file size, and its pages show at most 2^23 glyphs. A page whose
+// content decodes past 16 MB fails. A caller reading the file through many
+// times should open a new Reader for each pass.
 type Reader struct {
 	f          io.ReaderAt
 	end        int64
@@ -317,6 +318,7 @@ func NewReaderEncrypted(f io.ReaderAt, size int64, pw func() string) (r *Reader,
 	}
 	r.cache.limit = max(minDecodeBudget, decodeBudgetRatio*size)
 	r.cache.budget.Store(r.cache.limit)
+	r.cache.glyphs.Store(maxDocGlyphs)
 	pos := end - chunk + int64(i)
 	b := newBuffer(io.NewSectionReader(f, pos, end-pos), pos)
 	if b.readToken() != keyword("startxref") {
@@ -1012,6 +1014,9 @@ type readerCache struct {
 	// streams may yield.
 	budget atomic.Int64
 	limit  int64
+	// glyphs is what remains of the limit on the glyphs text extraction
+	// shows, which is otherwise bounded only per page.
+	glyphs atomic.Int64
 }
 
 // A budgetReader charges what it reads against its Reader's decode budget.

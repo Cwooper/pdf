@@ -341,3 +341,27 @@ func TestContentsArray(t *testing.T) {
 		mustPanic(t, "budget", func() { r.Page(1).Content() })
 	})
 }
+
+// TestDocumentGlyphBudget verifies that the glyphs text extraction shows
+// count against a budget shared by every page and call on a Reader, however
+// many pages share one content stream.
+func TestDocumentGlyphBudget(t *testing.T) {
+	data := pageTreePDF("<< /Type /Pages /Kids [3 0 R 4 0 R] /Count 2 >>",
+		"<< /Type /Page /Contents 5 0 R >>", "<< /Type /Page /Contents 5 0 R >>", streamObj("BT (0123456789) Tj ET"))
+	open := func() *Reader {
+		r := openPDF(t, data)
+		r.cache.glyphs.Store(15)
+		return r
+	}
+	r := open()
+	if got := contentText(r.Page(1)); got != "0123456789" {
+		t.Fatalf("page 1 shows %q", got)
+	}
+	mustPanic(t, "glyphs", func() { r.Page(2).Content() })
+	if _, err := open().GetPlainText(); err == nil || !strings.Contains(err.Error(), "glyphs") {
+		t.Errorf("GetPlainText: got %v, want the glyph budget reported", err)
+	}
+	if _, err := open().GetStyledTexts(); err == nil || !strings.Contains(err.Error(), "glyphs") {
+		t.Errorf("GetStyledTexts: got %v, want the glyph budget reported", err)
+	}
+}
