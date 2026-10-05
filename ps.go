@@ -16,9 +16,10 @@ import (
 // file could otherwise feed the lexer gigabytes.
 const maxInterpretBytes = 64 << 20
 
-// maxOperands bounds the operand stack in Interpret. Each operand is a
-// 32-byte Value, so operands never consumed by an operator, from a few
-// kilobytes of Flate, otherwise held gigabytes. A cmap block mapping all
+// maxOperands bounds the operands on Interpret's stack together with the array
+// and dict entries they hold, and the entries of any object read. Each is a
+// 32-byte Value or larger, so operands never consumed by an operator, from a
+// few kilobytes of Flate, would hold gigabytes. A cmap block mapping all
 // 65536 glyphs at once needs 131072.
 const maxOperands = 1 << 18
 
@@ -94,7 +95,12 @@ func Interpret(strm Value, do func(stk *Stack, op string)) {
 
 Reading:
 	for {
-		if stk.Len() > maxOperands {
+		if stk.Len() == 0 && len(dicts) == 0 {
+			// The entries read so far belonged to operands now consumed,
+			// with no dict open that def could have kept them in.
+			b.entries = 0
+		}
+		if stk.Len()+b.entries > maxOperands {
 			panic(fmt.Errorf("more than %d operands", maxOperands))
 		}
 		tok := b.readToken()

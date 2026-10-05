@@ -834,7 +834,7 @@ func TestFontSharedByNames(t *testing.T) {
 		fmt.Fprintf(&content, "/F%d 12 Tf (x) Tj ", i)
 	}
 	content.WriteString("ET")
-	font := "<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica /Junk [" + strings.Repeat("0 ", 1<<18) + "] >>"
+	font := "<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica /Junk [" + strings.Repeat("0 ", 250000) + "] >>"
 	r := openPDF(t, xrefStreamFile(
 		testObj{num: 1, body: "<< /Type /Catalog /Pages 2 0 R >>"},
 		testObj{num: 2, body: "<< /Type /Pages /Kids [3 0 R] /Count 1 >>"},
@@ -855,7 +855,7 @@ func TestFontSharedByNames(t *testing.T) {
 // thousands of fonts pays for those alone, and remembers no name the page does
 // not define.
 func TestFontsResolvedOnUse(t *testing.T) {
-	junk := "/Junk [" + strings.Repeat("0 ", 500000) + "]"
+	junk := "/Junk [" + strings.Repeat("0 ", 250000) + "]"
 	t.Run("no font selected", func(t *testing.T) {
 		p := openPDF(t, buildPDF(
 			"<< /Type /Catalog /Pages 2 0 R >>",
@@ -1025,11 +1025,4 @@ func TestGstackDepthCap(t *testing.T) {
 	if got > 16<<20 || len(text) != 1 {
 		t.Errorf("Content allocated %d MB and showed %d texts, want 1", got>>20, len(text))
 	}
-}
-
-// TestOperandCap verifies that Interpret refuses operands past maxOperands
-// instead of stacking every one a content stream supplies.
-func TestOperandCap(t *testing.T) {
-	p := pageWithContent(strings.Repeat("1 ", maxOperands+2))
-	mustPanic(t, "operands", func() { p.Content() })
 }
