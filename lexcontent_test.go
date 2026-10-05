@@ -147,3 +147,36 @@ func TestInlineImageSkipped(t *testing.T) {
 		})
 	}
 }
+
+// TestLexOutOfRangeNumbers verifies that an octal escape above \377 keeps its
+// low byte, as ISO 32000-1, 7.3.4.2 says, and that an integer too large for
+// int64 reads as a real, rather than either failing its operand.
+func TestLexOutOfRangeNumbers(t *testing.T) {
+	tests := []struct {
+		data string
+		want object
+	}{
+		{`(\777\400a)`, "\xff\x00a"},
+		{"99999999999999999999 ", float64(1e20)},
+		{"-99999999999999999999 ", float64(-1e20)},
+	}
+	for _, tt := range tests {
+		t.Run(tt.data, func(t *testing.T) {
+			var got object
+			mustNotCrash(t, func() {
+				b := newBuffer(strings.NewReader(tt.data), 0)
+				b.allowEOF = true
+				got = b.readObject()
+			})
+			if got != tt.want {
+				t.Errorf("got %#v, want %#v", got, tt.want)
+			}
+		})
+	}
+
+	var got string
+	mustNotCrash(t, func() { got = contentText(pageWithContent(`BT 99999999999999999999 0 Td (\101\502) Tj ET`)) })
+	if got != "AB" {
+		t.Errorf("Content shows %q, want %q", got, "AB")
+	}
+}
