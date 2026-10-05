@@ -1012,3 +1012,17 @@ func TestPageGlyphCap(t *testing.T) {
 	p := pageWithContent("BT (" + strings.Repeat("A", maxPageGlyphs+1) + ") Tj ET")
 	mustPanic(t, "glyphs", func() { p.Content() })
 }
+
+// TestGstackDepthCap verifies that Page.Content saves no graphics state for
+// a q nested past maxGstackDepth, rather than one for every q, and still
+// shows the text inside.
+func TestGstackDepthCap(t *testing.T) {
+	const n = 64 * maxGstackDepth
+	p := pageWithContent(strings.Repeat("q ", n) + "BT (a) Tj ET" + strings.Repeat(" Q", n))
+	var got uint64
+	var text []Text
+	mustNotCrash(t, func() { got = allocated(func() { text = p.Content().Text }) })
+	if got > 16<<20 || len(text) != 1 {
+		t.Errorf("Content allocated %d MB and showed %d texts, want 1", got>>20, len(text))
+	}
+}
