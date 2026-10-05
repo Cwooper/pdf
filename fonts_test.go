@@ -259,3 +259,36 @@ func TestCIDFontWidths(t *testing.T) {
 		})
 	}
 }
+
+// TestPlainTextFontsPerPage verifies that GetPlainText decodes each page
+// with the fonts that page defines: a name took the font the first page
+// gave it, so a second page's /F1 decoded with the first page's /F1.
+func TestPlainTextFontsPerPage(t *testing.T) {
+	cmap := func(dst string) string {
+		return streamObj("1 begincodespacerange <00> <ff> endcodespacerange 1 beginbfchar <01> <" + dst + "> endbfchar")
+	}
+	data := buildPDF(
+		"<< /Type /Catalog /Pages 2 0 R >>",
+		"<< /Type /Pages /Kids [3 0 R 4 0 R 5 0 R] /Count 3 >>",
+		"<< /Type /Page /Parent 2 0 R /Contents 6 0 R /Resources << /Font << /F1 << /Type /Font /Subtype /Type1 /ToUnicode 9 0 R >> >> >> >>",
+		"<< /Type /Page /Parent 2 0 R /Contents 6 0 R /Resources << /Font << /F1 7 0 R >> >> >>",
+		"<< /Type /Page /Parent 2 0 R /Contents 6 0 R /Resources << /Font << /F1 8 0 R >> >> >>",
+		streamObj("BT /F1 12 Tf (\001) Tj ET"),
+		"<< /Type /Font /Subtype /Type1 /ToUnicode 10 0 R >>",
+		"<< /Type /Font /Subtype /Type1 /ToUnicode 11 0 R >>",
+		cmap("0058"), cmap("0059"), cmap("005a"),
+	)
+	r, err := NewReader(bytes.NewReader(data), int64(len(data)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	rd, err := r.GetPlainText()
+	if err != nil {
+		t.Fatal(err)
+	}
+	var b bytes.Buffer
+	b.ReadFrom(rd)
+	if got := b.String(); got != "\nX\nY\nZ" {
+		t.Errorf("GetPlainText = %q, want %q", got, "\nX\nY\nZ")
+	}
+}
