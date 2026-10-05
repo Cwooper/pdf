@@ -6,6 +6,7 @@ package pdf
 
 import (
 	"bytes"
+	"compress/zlib"
 	"fmt"
 	"io"
 	"runtime"
@@ -466,4 +467,29 @@ func buildPDF(objs ...string) []byte {
 	}
 	fmt.Fprintf(&b, "trailer\n<< /Size %d /Root 1 0 R >>\nstartxref\n%d\n%%%%EOF\n", len(objs)+1, xref)
 	return b.Bytes()
+}
+
+// TestXrefTableAtEntryCap verifies that a compressed xref stream describing
+// more entries than the table may hold is refused within a modest
+// allocation. 24 KB describing eight million entries grew the table past a
+// gigabyte.
+func TestXrefTableAtEntryCap(t *testing.T) {
+	const rows = 1 << 23
+	var comp bytes.Buffer
+	zw := zlib.NewWriter(&comp)
+	zw.Write(bytes.Repeat([]byte{1, 9, 0}, rows))
+	zw.Close()
+	data := xrefStreamPDF(fmt.Sprintf("/Size %d /W [1 1 1] /Filter /FlateDecode", rows), comp.String())
+
+	var before, after runtime.MemStats
+	runtime.GC()
+	runtime.ReadMemStats(&before)
+	err := openBytes(data)
+	runtime.ReadMemStats(&after)
+	if err == nil {
+		t.Errorf("NewReader: got nil error, want the entry bound reported")
+	}
+	if got := after.TotalAlloc - before.TotalAlloc; got > 128<<20 {
+		t.Errorf("opening a %d-byte file allocated %d MB", len(data), got>>20)
+	}
 }
