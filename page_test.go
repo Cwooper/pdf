@@ -66,13 +66,13 @@ func TestByteEncoderMacRoman(t *testing.T) {
 
 func TestDictEncoder(t *testing.T) {
 	// Differences array: code 65 -> /Alpha (0x0391).
-	e := &dictEncoder{v: testValue(array{int64(65), name("Alpha")})}
+	e := &byteEncoder{differences(testValue(array{int64(65), name("Alpha")}))}
 	if got := e.Decode("A"); got != "\u0391" {
 		t.Fatalf("Decode(A) = %q, want %q", got, "\u0391")
 	}
 
 	// Unknown glyph name falls back to the raw byte.
-	e2 := &dictEncoder{v: testValue(array{int64(65), name("NotAGlyphName")})}
+	e2 := &byteEncoder{differences(testValue(array{int64(65), name("NotAGlyphName")}))}
 	if got := e2.Decode("A"); got != "A" {
 		t.Fatalf("Decode(A) = %q, want %q (fallback)", got, "A")
 	}
