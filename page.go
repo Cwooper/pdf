@@ -197,22 +197,29 @@ func (r *Reader) GetStyledTexts() (sentences []Text, err error) {
 		if p.V.Key("Contents").Kind() == Null {
 			continue
 		}
+		// lastTextStyle is the sentence's first Text; s holds its text.
 		var lastTextStyle Text
+		var s strings.Builder
 		texts := p.Content().Text
 		for _, text := range texts {
 			if lastTextStyle == (Text{}) {
 				lastTextStyle = text
+				s.WriteString(text.S)
 				continue
 			}
 
 			if IsSameSentence(lastTextStyle, text) {
-				lastTextStyle.S = lastTextStyle.S + text.S
+				s.WriteString(text.S)
 			} else {
+				lastTextStyle.S = s.String()
 				sentences = append(sentences, lastTextStyle)
 				lastTextStyle = text
+				s.Reset()
+				s.WriteString(text.S)
 			}
 		}
-		if len(lastTextStyle.S) > 0 {
+		if s.Len() > 0 {
+			lastTextStyle.S = s.String()
 			sentences = append(sentences, lastTextStyle)
 		}
 	}
