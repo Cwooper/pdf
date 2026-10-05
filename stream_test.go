@@ -64,7 +64,6 @@ func TestCBCReader(t *testing.T) {
 	r := &cbcReader{
 		cbc: cipher.NewCBCDecrypter(block, iv),
 		rd:  bytes.NewReader(ct),
-		buf: make([]byte, 16),
 	}
 	got, err := io.ReadAll(r)
 	if err != nil {
