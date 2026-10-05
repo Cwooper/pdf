@@ -68,6 +68,7 @@ import (
 	"crypto/cipher"
 	"crypto/md5"
 	"crypto/rc4"
+	"crypto/subtle"
 	"encoding/ascii85"
 	"encoding/binary"
 	"errors"
@@ -1608,28 +1609,48 @@ func cryptKey(key []byte, useAES bool, ptr objptr) []byte {
 	return h.Sum(nil)[:min(len(key)+5, md5.Size)]
 }
 
-func decryptString(key []byte, useAES bool, ptr objptr, x string) string {
-	key = cryptKey(key, useAES, ptr)
+// A stringDecrypter decrypts the strings of an object, deriving its key and
+// cipher once rather than per string: an object can hold millions.
+type stringDecrypter struct {
+	ptr   objptr
+	block cipher.Block
+	rc4   *rc4.Cipher
+	ks    []byte // the RC4 keystream, as long as the longest string so far
+}
+
+func (d *stringDecrypter) decrypt(key []byte, useAES bool, ptr objptr, x string) string {
+	if d.ptr != ptr || d.block == nil && d.rc4 == nil {
+		*d = stringDecrypter{ptr: ptr}
+		key = cryptKey(key, useAES, ptr)
+		if useAES {
+			d.block, _ = aes.NewCipher(key)
+		} else {
+			d.rc4, _ = rc4.NewCipher(key)
+		}
+	}
 	if useAES {
 		// Anything shorter than an IV and one block holds no text.
 		if len(x) < 2*aes.BlockSize {
 			return ""
 		}
-		s := []byte(x)
-		block, _ := aes.NewCipher(key)
-		iv := s[:aes.BlockSize]
-		s = s[aes.BlockSize : len(s)-len(s)%aes.BlockSize]
-
-		stream := cipher.NewCBCDecrypter(block, iv)
-		stream.CryptBlocks(s, s)
-		x = string(unpad(s))
-	} else {
-		c, _ := rc4.NewCipher(key)
-		data := []byte(x)
-		c.XORKeyStream(data, data)
-		x = string(data)
+		// CBC by hand, last block first so that each one's predecessor is
+		// still ciphertext: a BlockMode per string copies the expanded key.
+		s := []byte(x[:len(x)-len(x)%aes.BlockSize])
+		for i := len(s) - aes.BlockSize; i >= aes.BlockSize; i -= aes.BlockSize {
+			blk := s[i : i+aes.BlockSize]
+			d.block.Decrypt(blk, blk)
+			subtle.XORBytes(blk, blk, s[i-aes.BlockSize:i])
+		}
+		return string(unpad(s[aes.BlockSize:]))
 	}
-	return x
+	// Each string is encrypted from the start of the keystream.
+	if n := len(x) - len(d.ks); n > 0 {
+		d.ks = append(d.ks, make([]byte, n)...)
+		d.rc4.XORKeyStream(d.ks[len(d.ks)-n:], d.ks[len(d.ks)-n:])
+	}
+	s := []byte(x)
+	subtle.XORBytes(s, s, d.ks)
+	return string(s)
 }
 
 // unpad strips the PKCS#7 padding that AES encryption appends, leaving
