@@ -1443,16 +1443,16 @@ func (r *Reader) initEncrypt(password string) error {
 	if encrypt["Filter"] != name("Standard") {
 		return fmt.Errorf("unsupported PDF: encryption filter %v", objfmt(encrypt["Filter"]))
 	}
+	V, _ := encrypt["V"].(int64)
+	if V != 1 && V != 2 && (V != 4 || !okayV4(encrypt)) {
+		return fmt.Errorf("unsupported PDF: encryption version V=%d; %v", V, objfmt(encrypt))
+	}
 	n, _ := encrypt["Length"].(int64)
 	if n == 0 {
 		n = minKeyBits
 	}
 	if n%8 != 0 || n > maxKeyBits || n < minKeyBits {
 		return fmt.Errorf("malformed PDF: %d-bit encryption key", n)
-	}
-	V, _ := encrypt["V"].(int64)
-	if V != 1 && V != 2 && (V != 4 || !okayV4(encrypt)) {
-		return fmt.Errorf("unsupported PDF: encryption version V=%d; %v", V, objfmt(encrypt))
 	}
 
 	ids, ok := r.trailer["ID"].(array)
