@@ -675,9 +675,8 @@ func TestMalformedObjectStream(t *testing.T) {
 	}
 }
 
-// TestConcurrentReads pins the property that made resolve carry its recursion
-// depth as a parameter instead of on the Reader: an opened Reader is immutable,
-// so several goroutines may read from it at once. Run under -race to be
+// TestConcurrentReads pins that several goroutines may read from one Reader
+// at once, sharing the object streams it decodes. Run under -race to be
 // meaningful.
 func TestConcurrentReads(t *testing.T) {
 	data := objStmPDF()
