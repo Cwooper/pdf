@@ -13,8 +13,9 @@ import (
 
 // maxInterpretBytes bounds the decoded bytes one Interpret call reads: a
 // page's content streams or a cmap. Flate expands about 1000:1, so a small
-// file could otherwise feed the lexer gigabytes.
-const maxInterpretBytes = 64 << 20
+// file could otherwise feed the lexer gigabytes. The largest page content in
+// 33 thousand pages of ordinary documents is 8.5 MB.
+const maxInterpretBytes = 16 << 20
 
 // maxOperands bounds the operands on Interpret's stack together with the array
 // and dict entries they hold. Each is a 32-byte Value or larger, so operands

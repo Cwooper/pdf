@@ -44,7 +44,7 @@ const (
 	// maxPageGlyphs bounds the Text values Page.Content builds for one page,
 	// about 64 bytes each. A dense real page holds under ten thousand; an
 	// inflated content stream can show millions from a few kilobytes.
-	maxPageGlyphs = 1 << 20
+	maxPageGlyphs = 1 << 18
 
 	// maxGstackDepth bounds q nesting in Page.Content. Each q saves a
 	// 400-byte graphics state, so a stream of them from a few kilobytes
