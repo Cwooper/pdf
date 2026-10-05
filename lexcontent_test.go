@@ -58,3 +58,52 @@ func TestOperandCapCountsEntries(t *testing.T) {
 		})
 	})
 }
+
+// lexError returns the message of the panic reading one object from data.
+func lexError(data string) (msg string) {
+	defer func() {
+		if r := recover(); r != nil {
+			msg = fmt.Sprint(r)
+		}
+	}()
+	b := newBuffer(strings.NewReader(data), 0)
+	b.allowEOF = true
+	b.readObject()
+	return ""
+}
+
+// TestLexErrorsShort verifies that a lexer error quotes a bounded amount of
+// its input. Interpret recovers these errors and goes on, so a hex string
+// error that dumped the 4 KB buffer, repeated through 62 KB of Flate, built
+// gigabytes of messages, and an error quoting a whole token could quote 64 MB.
+func TestLexErrorsShort(t *testing.T) {
+	long := strings.Repeat("x", 1<<20)
+	tests := []struct{ name, data string }{
+		{"hex string", "<zz" + strings.Repeat(" ", 8<<10)},
+		{"keyword in array", "[" + long + "]"},
+		{"real", strings.Repeat("9", 400) + ".0 "},
+		{"dict key", "<<(" + long + ") 1>>"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			msg := lexError(tt.data)
+			if msg == "" {
+				t.Fatal("read without error, want one")
+			}
+			if len(msg) > 200 {
+				t.Errorf("error is %d bytes: %.80q...", len(msg), msg)
+			}
+		})
+	}
+}
+
+// TestInterpretErrorCap verifies that Interpret gives up after
+// maxInterpretErrors malformed operands rather than recovering from each:
+// one per two bytes of "[)" took 9 seconds over 62 KB of Flate.
+func TestInterpretErrorCap(t *testing.T) {
+	nop := func(stk *Stack, op string) { popArgs(stk) }
+	Interpret(rawStream(strings.Repeat("[) ", maxInterpretErrors)), nop)
+	mustPanic(t, "malformed", func() {
+		Interpret(rawStream(strings.Repeat("[) ", maxInterpretErrors+1)), nop)
+	})
+}
