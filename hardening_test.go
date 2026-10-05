@@ -1034,3 +1034,16 @@ func TestInterpretByteCap(t *testing.T) {
 		t.Errorf("GetPlainText: got %v, want the size cap reported", err)
 	}
 }
+
+// TestPageGlyphCap verifies that Page.Content stops at maxPageGlyphs instead
+// of building a Text for every glyph a content stream shows: one 16 MB
+// string, 35 KB compressed, held over 3 GB of them.
+func TestPageGlyphCap(t *testing.T) {
+	p := pageWithContent("BT (" + strings.Repeat("A", maxPageGlyphs+1) + ") Tj ET")
+	defer func() {
+		if recover() == nil {
+			t.Error("Content returned, want the glyph cap reported")
+		}
+	}()
+	p.Content()
+}
