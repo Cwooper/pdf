@@ -6,7 +6,9 @@ package pdf
 
 import (
 	"bytes"
+	"compress/zlib"
 	"fmt"
+	"runtime"
 	"strings"
 	"testing"
 )
@@ -290,4 +292,59 @@ func TestPagesParsedOnce(t *testing.T) {
 // the catalog resolved even where the tree lists no pages.
 func declaredPages(r *Reader) int {
 	return int(r.Trailer().Key("Root").Key("Pages").Key("Count").Int64())
+}
+
+// TestContentsArray verifies that a /Contents array is read stream by
+// stream: an entry that is not a stream is skipped rather than ending the
+// page, and each stream is opened only when the one before it ends, where
+// opening every decoder up front held 460 MB for a 180 KB array.
+func TestContentsArray(t *testing.T) {
+	t.Run("gap", func(t *testing.T) {
+		data := pageTreePDF("<< /Type /Pages /Kids [3 0 R] /Count 1 >>",
+			"<< /Type /Page /Contents [4 0 R 5 0 R 99 0 R 6 0 R] >>",
+			streamObj("BT (a) Tj ET"), "<< >>", streamObj("BT (b) Tj ET"))
+		r := openPDF(t, data)
+		var got string
+		mustNotCrash(t, func() { got = contentText(r.Page(1)) })
+		if got != "ab" {
+			t.Errorf("got %q, want %q", got, "ab")
+		}
+	})
+
+	t.Run("unreadable stream", func(t *testing.T) {
+		data := pageTreePDF("<< /Type /Pages /Kids [3 0 R] /Count 1 >>",
+			"<< /Type /Page /Contents [4 0 R 5 0 R] >>",
+			streamObj("BT (a) Tj ET"), "<< /Length 1 /Filter /LZWDecode >>\nstream\nx\nendstream")
+		r := openPDF(t, data)
+		mustPanic(t, "LZWDecode", func() { r.Page(1).Content() })
+	})
+
+	t.Run("opened in turn", func(t *testing.T) {
+		const n = 2000
+		var z bytes.Buffer
+		w := zlib.NewWriter(&z)
+		w.Write([]byte("BT (a) Tj ET"))
+		w.Close()
+		data := pageTreePDF("<< /Type /Pages /Kids [3 0 R] /Count 1 >>",
+			"<< /Type /Page /Contents ["+strings.Repeat("4 0 R ", n)+"] >>",
+			fmt.Sprintf("<< /Length %d /Filter /FlateDecode >>\nstream\n%s\nendstream", z.Len(), z.String()))
+		contents := openPDF(t, data).Page(1).V.Key("Contents")
+
+		var before, first runtime.MemStats
+		runtime.GC()
+		runtime.ReadMemStats(&before)
+		ops := 0
+		Interpret(contents, func(stk *Stack, op string) {
+			if ops++; ops == 1 {
+				runtime.ReadMemStats(&first)
+			}
+			popArgs(stk)
+		})
+		if ops != 3*n {
+			t.Errorf("read %d operators, want %d", ops, 3*n)
+		}
+		if got := first.HeapAlloc - before.HeapAlloc; got > 16<<20 {
+			t.Errorf("%d MB in use by the first operator", got>>20)
+		}
+	})
 }
