@@ -149,10 +149,6 @@ const (
 	// run to a few hundred kilobytes.
 	maxObjStmBytes = 16 << 20
 
-	// maxResolveDepth bounds recursion through objects stored inside object
-	// streams, which can be made to reference each other in a cycle.
-	maxResolveDepth = 32
-
 	// minDecodeBudget and decodeBudgetRatio bound the bytes a Reader's
 	// streams yield in all, counted at every stage from the raw bytes through
 	// each filter: the larger of the floor and the ratio times the file size,
@@ -697,9 +693,6 @@ type Value struct {
 	r    *Reader
 	ptr  objptr
 	data interface{}
-	// depth is the object stream nesting at which the value was resolved,
-	// carried so that references followed from it keep counting.
-	depth int
 }
 
 // IsNull reports whether the value is a null. It is equivalent to Kind() == Null.
@@ -917,7 +910,7 @@ func (v Value) Key(key string) Value {
 		}
 		x = strm.hdr
 	}
-	return v.r.resolveAt(v.ptr, x[name(key)], v.depth)
+	return v.r.resolve(v.ptr, x[name(key)])
 }
 
 // Keys returns a sorted list of the keys in the dictionary v.
@@ -948,7 +941,7 @@ func (v Value) Index(i int) Value {
 	if !ok || i < 0 || i >= len(x) {
 		return Value{}
 	}
-	return v.r.resolveAt(v.ptr, x[i], v.depth)
+	return v.r.resolve(v.ptr, x[i])
 }
 
 // Len returns the length of the array v.
@@ -961,31 +954,15 @@ func (v Value) Len() int {
 	return len(x)
 }
 
+// resolve returns x as a Value, loading it first if it is a reference. It
+// recurses at most once: an object stream's header is read through a view
+// that resolves nothing inside a stream.
 func (r *Reader) resolve(parent objptr, x interface{}) Value {
-	return r.resolveAt(parent, x, 0)
-}
-
-// resolveAt resolves x, tracking how deeply it has recursed through object
-// streams. The depth is a parameter, and travels on the Values resolved here,
-// rather than being Reader state so that a Reader stays immutable once opened
-// and remains safe to read from concurrently. Carrying it on the Value matters:
-// an object stream's own header (/N, /First, /Length, /Extends) is read
-// through Key, and a reference there back into the stream would otherwise
-// restart the count at zero and recurse until the stack is gone.
-func (r *Reader) resolveAt(parent objptr, x interface{}, depth int) Value {
 	if ptr, ok := x.(objptr); ok {
 		xref := r.xref.get(ptr.id)
 		if xref.ptr != ptr || !xref.inStream && xref.offset == 0 {
 			return Value{}
 		}
-		// An object inside an object stream resolves through its container,
-		// and those references can be made to form a cycle. Bound the nesting:
-		// exhausting the goroutine stack is a fatal error no caller can
-		// recover from.
-		if depth >= maxResolveDepth {
-			panic("PDF object stream nesting too deep")
-		}
-
 		var obj object
 		if xref.inStream {
 			if r.noObjStm {
@@ -1013,9 +990,9 @@ func (r *Reader) resolveAt(parent objptr, x interface{}, depth int) Value {
 
 	switch x := x.(type) {
 	case nil, bool, int64, float64, name, dict, array, stream:
-		return Value{r, parent, x, depth}
+		return Value{r, parent, x}
 	case string:
-		return Value{r, parent, x, depth}
+		return Value{r, parent, x}
 	default:
 		panic(fmt.Errorf("unexpected value type %T in resolve", x))
 	}
