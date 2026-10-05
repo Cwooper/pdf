@@ -38,9 +38,10 @@ const (
 	maxOutlineDepth = 128
 	maxOutlineNodes = 1 << 16
 
-	// maxPageGlyphs bounds the Text values Page.Content builds for one page,
-	// about 64 bytes each. A dense real page holds under ten thousand; an
-	// inflated content stream can show millions from a few kilobytes.
+	// maxPageGlyphs bounds the glyphs, Texts, and Rects text extraction
+	// builds for one page, about 64 bytes each. A dense real page holds under
+	// ten thousand; an inflated content stream can show millions from a few
+	// kilobytes.
 	maxPageGlyphs = 1 << 18
 
 	// maxDocGlyphs bounds the glyphs text extraction shows across one
@@ -285,8 +286,9 @@ type pageFonts struct {
 	shared fontSet
 }
 
-// A glyphBudget counts the glyphs one page's text extraction shows against
-// maxPageGlyphs and its Reader's document-wide budget.
+// A glyphBudget counts the glyphs one page's text extraction shows, or the
+// values it builds for them, against maxPageGlyphs and its Reader's
+// document-wide budget.
 type glyphBudget struct {
 	r *Reader
 	n int
@@ -978,6 +980,7 @@ type Columns []*Column
 func (p Page) GetTextByColumn() (result Columns, err error) {
 	defer recoverTo(&err, func() { result = Columns{} })
 
+	columns := make(map[int64]*Column)
 	showText := func(enc TextEncoding, currentX, currentY float64, s string) {
 		text := Text{
 			S: decodeText(enc, s),
@@ -985,21 +988,13 @@ func (p Page) GetTextByColumn() (result Columns, err error) {
 			Y: currentY,
 		}
 
-		var currentColumn *Column
-		columnFound := false
-		for _, column := range result {
-			if int64(currentX) == column.Position {
-				currentColumn = column
-				columnFound = true
-				break
-			}
-		}
-
-		if !columnFound {
+		currentColumn := columns[int64(currentX)]
+		if currentColumn == nil {
 			currentColumn = &Column{
 				Position: int64(currentX),
 				Content:  TextVertical{},
 			}
+			columns[currentColumn.Position] = currentColumn
 			result = append(result, currentColumn)
 		}
 
@@ -1032,6 +1027,7 @@ type Rows []*Row
 func (p Page) GetTextByRow() (result Rows, err error) {
 	defer recoverTo(&err, func() { result = Rows{} })
 
+	rows := make(map[int64]*Row)
 	showText := func(enc TextEncoding, currentX, currentY float64, s string) {
 		text := Text{
 			S: decodeText(enc, s),
@@ -1039,21 +1035,13 @@ func (p Page) GetTextByRow() (result Rows, err error) {
 			Y: currentY,
 		}
 
-		var currentRow *Row
-		rowFound := false
-		for _, row := range result {
-			if int64(currentY) == row.Position {
-				currentRow = row
-				rowFound = true
-				break
-			}
-		}
-
-		if !rowFound {
+		currentRow := rows[int64(currentY)]
+		if currentRow == nil {
 			currentRow = &Row{
 				Position: int64(currentY),
 				Content:  TextHorizontal{},
 			}
+			rows[currentRow.Position] = currentRow
 			result = append(result, currentRow)
 		}
 
@@ -1085,6 +1073,11 @@ func (p Page) walkTextBlocks(walker func(enc TextEncoding, x, y float64, s strin
 
 	var enc TextEncoding = &nopEncoder{}
 	var currentX, currentY float64
+	glyphs := glyphBudget{r: p.V.r}
+	show := func(s string) {
+		glyphs.spend(1)
+		walker(enc, currentX, currentY, s)
+	}
 	Interpret(strm, func(stk *Stack, op string) {
 		args := popArgs(stk)
 
@@ -1121,17 +1114,17 @@ func (p Page) walkTextBlocks(walker func(enc TextEncoding, x, y float64, s strin
 				panic("bad Tj operator")
 			}
 
-			walker(enc, currentX, currentY, args[0].RawString())
+			show(args[0].RawString())
 		case "TJ": // show text, allowing individual glyph positioning
 			v := args[0]
 			for i := 0; i < v.Len(); i++ {
 				x := v.Index(i)
 				if x.Kind() == String {
-					walker(enc, currentX, currentY, x.RawString())
+					show(x.RawString())
 				}
 			}
 		case "Td":
-			walker(enc, currentX, currentY, "")
+			show("")
 		case "Tm":
 			currentX = args[4].Float64()
 			currentY = args[5].Float64()
@@ -1225,6 +1218,7 @@ func (p Page) Content() Content {
 				panic("bad re")
 			}
 			x, y, w, h := args[0].Float64(), args[1].Float64(), args[2].Float64(), args[3].Float64()
+			glyphs.spend(1)
 			rect = append(rect, Rect{Point{x, y}, Point{x + w, y + h}})
 
 		case "q": // save graphics state
