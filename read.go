@@ -117,7 +117,8 @@ const (
 	// maxXrefEntries bounds the entries a cross-reference table may store.
 	// Object streams are compressed, so the file length is not a usable bound
 	// here: a few kilobytes of xref stream can describe millions of entries.
-	maxXrefEntries = 1 << 23
+	// Real files hold at most a few hundred thousand objects.
+	maxXrefEntries = 1 << 20
 
 	// maxXrefFieldWidth bounds an entry in an xref stream /W array. The
 	// widths are byte counts that decodeInt accumulates into an int, so a
@@ -178,8 +179,8 @@ func (t *xrefTable) get(id uint32) xref {
 // proportion to what the table already holds, so the bytes read from the file
 // bound the allocation; anything further out is kept sparse.
 func (t *xrefTable) put(id int, e xref) {
-	if id >= len(t.dense) && id < 2*t.n+maxXrefPrealloc {
-		t.dense = ensureXrefLen(t.dense, id)
+	if limit := 2*t.n + maxXrefPrealloc; id >= len(t.dense) && id < limit {
+		t.dense = ensureXrefLen(t.dense, id, limit)
 	}
 	if id < len(t.dense) {
 		t.dense[id] = e
@@ -560,13 +561,18 @@ func decodeInt(b []byte) int {
 }
 
 // ensureXrefLen grows table, if needed, so that table[x] is a valid element.
-// The previous idiom (repeatedly append(table[:cap(table)], xref{})) was
-// correct but hard to follow, so this replaces it with an explicit resize.
-func ensureXrefLen(table []xref, x int) []xref {
+// Capacity doubles but never past limit: append's own growth, plus the
+// zeroed slice it was handed, allocated over five times the final table.
+func ensureXrefLen(table []xref, x, limit int) []xref {
 	if x < len(table) {
 		return table
 	}
-	return append(table, make([]xref, x-len(table)+1)...)
+	if x < cap(table) {
+		return table[:x+1]
+	}
+	t := make([]xref, x+1, max(min(2*cap(table), limit), x+1))
+	copy(t, table)
+	return t
 }
 
 func readXrefTable(r *Reader, b *buffer) (*xrefTable, objptr, dict, error) {
