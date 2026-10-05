@@ -289,6 +289,9 @@ func NewReaderEncrypted(f io.ReaderAt, size int64, pw func() string) (r *Reader,
 	if !ok {
 		return nil, fmt.Errorf("malformed PDF file: startxref not followed by integer")
 	}
+	if startxref < 0 {
+		return nil, fmt.Errorf("malformed PDF file: negative startxref %d", startxref)
+	}
 	b = newBuffer(io.NewSectionReader(r.f, startxref, r.end-startxref), startxref)
 	xref, trailerptr, trailer, err := readXref(r, b)
 	if err != nil {
@@ -349,6 +352,9 @@ func readPrevXrefs(r *Reader, first object, parse func(b *buffer) (object, error
 		off, ok := prev.(int64)
 		if !ok {
 			return fmt.Errorf("malformed PDF: xref Prev is not integer: %v", prev)
+		}
+		if off < 0 {
+			return fmt.Errorf("malformed PDF: negative xref Prev %d", off)
 		}
 		if seen[off] {
 			return nil
