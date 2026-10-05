@@ -275,7 +275,7 @@ func (s fontSet) font(fonts Value, key string) (*Font, bool) {
 	}
 	f := &noFont
 	if v := fonts.r.resolve(fonts.ptr, x); !v.IsNull() {
-		f = &Font{V: v}
+		f = &Font{V: v, m: new(fontMetrics)}
 	}
 	if isRef {
 		s[ptr] = f
@@ -288,20 +288,64 @@ func (s fontSet) font(fonts Value, key string) (*Font, bool) {
 type Font struct {
 	V   Value
 	enc TextEncoding
+	// m, when set, keeps the entries Page.Content reads per glyph, so that
+	// each is resolved once rather than per glyph.
+	m *fontMetrics
+}
+
+type fontMetrics struct {
+	loaded      bool
+	base        string
+	first, last int
+	widths      []float64 // for codes first onward
+}
+
+// metrics returns f.m, loading it on first use, or nil if f does not keep one.
+func (f Font) metrics() *fontMetrics {
+	m := f.m
+	if m == nil || m.loaded {
+		return m
+	}
+	m.base = f.V.Key("BaseFont").Name()
+	m.first, m.last = int(f.V.Key("FirstChar").Int64()), int(f.V.Key("LastChar").Int64())
+	if m.last >= m.first {
+		w := f.V.Key("Widths")
+		n := w.Len()
+		if span := m.last - m.first; span >= 0 && span < n {
+			n = span + 1
+		}
+		// Page.Content asks only for the widths of byte codes.
+		n = min(n, max(0, 256-m.first))
+		m.widths = make([]float64, n)
+		for i := range m.widths {
+			m.widths[i] = w.Index(i).Float64()
+		}
+	}
+	m.loaded = true
+	return m
 }
 
 // BaseFont returns the font's name (BaseFont property).
 func (f Font) BaseFont() string {
+	if m := f.metrics(); m != nil {
+		return m.base
+	}
 	return f.V.Key("BaseFont").Name()
 }
 
 // FirstChar returns the code point of the first character in the font.
 func (f Font) FirstChar() int {
+	if m := f.metrics(); m != nil {
+		return m.first
+	}
 	return int(f.V.Key("FirstChar").Int64())
 }
 
 // LastChar returns the code point of the last character in the font.
 func (f Font) LastChar() int {
+	if m := f.metrics(); m != nil {
+		return m.last
+	}
 	return int(f.V.Key("LastChar").Int64())
 }
 
@@ -318,6 +362,12 @@ func (f Font) Widths() []float64 {
 
 // Width returns the width of the given code point.
 func (f Font) Width(code int) float64 {
+	if m := f.metrics(); m != nil {
+		if i := code - m.first; i >= 0 && i < len(m.widths) {
+			return m.widths[i]
+		}
+		return 0
+	}
 	first := f.FirstChar()
 	last := f.LastChar()
 	if code < first || last < code {

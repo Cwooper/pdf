@@ -950,3 +950,42 @@ func TestCmapParsedOncePerReader(t *testing.T) {
 	}
 	wg.Wait()
 }
+
+// TestFontWidthsByteCodes verifies that a font's /Widths are resolved only
+// as far as byte codes reach, however far /LastChar runs.
+func TestFontWidthsByteCodes(t *testing.T) {
+	const entries = 100000
+	p := openPDF(t, pagePDF("/Resources << /Font << /F1 5 0 R >> >>",
+		streamObj("BT /F1 12 Tf (a\377) Tj ET"),
+		fmt.Sprintf("<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica /FirstChar 0 /LastChar %d /Widths 6 0 R >>", entries-1),
+		"["+strings.Repeat("7 0 R ", entries)+"]",
+		"500",
+	)).Page(1)
+	var text []Text
+	if got := allocated(func() { text = p.Content().Text }); got > 16<<20 {
+		t.Errorf("Content allocated %d MB", got>>20)
+	}
+	if len(text) != 2 || text[0].W != 6 || text[1].W != 6 {
+		t.Errorf("got %+v, want two glyphs of width 6", text)
+	}
+}
+
+// TestFontMetricsResolvedOnce verifies that Page.Content resolves a font's
+// /Widths and the entries around it once, not once per glyph, as Word-style
+// files keep /Widths in an indirect object.
+func TestFontMetricsResolvedOnce(t *testing.T) {
+	const glyphs = 20000
+	p := openPDF(t, pagePDF("/Resources << /Font << /F1 5 0 R >> >>",
+		streamObj("BT /F1 12 Tf ("+strings.Repeat("a", glyphs)+") Tj ET"),
+		"<< /Type /Font /Subtype /Type1 /BaseFont 7 0 R /FirstChar 0 /LastChar 255 /Widths 6 0 R >>",
+		"["+strings.Repeat("500 ", 2000)+"]",
+		"/ABCDEF+Helvetica",
+	)).Page(1)
+	var text []Text
+	if got := allocated(func() { text = p.Content().Text }); got > 32<<20 {
+		t.Errorf("Content allocated %d MB", got>>20)
+	}
+	if len(text) != glyphs || text[0].W != 6 || text[0].Font != "Helvetica" {
+		t.Errorf("got %d glyphs, first %+v; want %d of width 6 in Helvetica", len(text), text[0], glyphs)
+	}
+}
