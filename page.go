@@ -187,11 +187,8 @@ func (r *Reader) GetPlainText() (reader io.Reader, err error) {
 
 	pages := r.NumPage()
 	var buf bytes.Buffer
-	// Pages share each font object, so that its charmap is parsed once.
-	shared := make(fontSet)
 	for i := 1; i <= pages; i++ {
-		p := r.Page(i)
-		text, err := p.plainText((&pageFonts{page: p, shared: shared}).lookup)
+		text, err := r.Page(i).GetPlainText(nil)
 		if err != nil {
 			return nil, err
 		}
@@ -289,7 +286,7 @@ func (p Page) Font(name string) Font {
 }
 
 // pageFonts resolves a page's fonts by name as its text operators select
-// them, each once, so that its charmap is parsed once. The /Font dictionary
+// them, each once. The /Font dictionary
 // is looked up on the first selection, since each lookup walks the /Parent
 // chain, and a font on its own first selection, since a page may name
 // thousands it never shows.
@@ -298,7 +295,6 @@ type pageFonts struct {
 	dict   Value
 	looked bool
 	fonts  map[string]*Font
-	shared fontSet // set beforehand to share font objects across pages
 }
 
 // A glyphBudget counts the glyphs one page's text extraction shows, or the
@@ -342,41 +338,38 @@ func (pf *pageFonts) lookup(fontName string) (*Font, bool) {
 		pf.dict = pf.page.Resources().Key("Font")
 		pf.looked = true
 		pf.fonts = make(map[string]*Font)
-		if pf.shared == nil {
-			pf.shared = make(fontSet)
-		}
 	}
-	f, ok := pf.shared.font(pf.dict, fontName)
+	f, ok := font(pf.dict, fontName)
 	if ok {
 		pf.fonts[fontName] = f
 	}
 	return f, ok
 }
 
-// A fontSet holds one Font per font object, so that names referring to one
-// object share it rather than each parsing the object and keeping a copy.
-type fontSet map[objptr]*Font
-
 // font returns the font that entry key of the /Font dictionary fonts names,
-// or noFont for a null entry, with false if fonts has no entry key.
-func (s fontSet) font(fonts Value, key string) (*Font, bool) {
+// or noFont for a null entry, with false if fonts has no entry key. A font
+// object is parsed once per Reader, however many names and pages share it.
+func font(fonts Value, key string) (*Font, bool) {
 	d, _ := fonts.data.(dict)
 	x, ok := d[name(key)]
 	if !ok {
 		return &noFont, false
 	}
+	load := func() *Font {
+		v := fonts.r.resolve(fonts.ptr, x)
+		if v.IsNull() {
+			return &noFont
+		}
+		f := &Font{V: v, m: new(cached[*fontMetrics])}
+		// Set before the font is shared, since Encoder writes it.
+		f.Encoder()
+		return f
+	}
 	ptr, isRef := x.(objptr)
-	if f, ok := s[ptr]; isRef && ok {
-		return f, true
+	if r := fonts.r; isRef && r != nil && r.cache != nil {
+		return cacheEntry(r.cache, &r.cache.fonts, ptr).get(load), true
 	}
-	f := &noFont
-	if v := fonts.r.resolve(fonts.ptr, x); !v.IsNull() {
-		f = &Font{V: v, m: new(fontMetrics)}
-	}
-	if isRef {
-		s[ptr] = f
-	}
-	return f, true
+	return load(), true
 }
 
 // A Font represent a font in a PDF file.
@@ -386,11 +379,10 @@ type Font struct {
 	enc TextEncoding
 	// m, when set, keeps the entries Page.Content reads per glyph, so that
 	// each is resolved once rather than per glyph.
-	m *fontMetrics
+	m *cached[*fontMetrics]
 }
 
 type fontMetrics struct {
-	loaded      bool
 	base        string
 	first, last int
 	widths      []float64   // for codes first onward
@@ -460,12 +452,17 @@ func (m *cidMetrics) width(cid int) float64 {
 	return r.w
 }
 
-// metrics returns f.m, loading it on first use, or nil if f does not keep one.
+// metrics returns f's metrics, loading them on first use, or nil if f does
+// not keep them.
 func (f Font) metrics() *fontMetrics {
-	m := f.m
-	if m == nil || m.loaded {
-		return m
+	if f.m == nil {
+		return nil
 	}
+	return f.m.get(f.loadMetrics)
+}
+
+func (f Font) loadMetrics() *fontMetrics {
+	m := new(fontMetrics)
 	m.base = f.V.Key("BaseFont").Name()
 	m.first, m.last = int(f.V.Key("FirstChar").Int64()), int(f.V.Key("LastChar").Int64())
 	if m.last >= m.first {
@@ -484,7 +481,6 @@ func (f Font) metrics() *fontMetrics {
 	if f.V.Key("Subtype").Name() == "Type0" {
 		m.cid = loadCIDMetrics(f.V)
 	}
-	m.loaded = true
 	return m
 }
 
@@ -528,7 +524,7 @@ func (f Font) Widths() []float64 {
 func (f Font) Width(code int) float64 {
 	m := f.metrics()
 	if m == nil && f.V.Key("Subtype").Name() == "Type0" {
-		m = Font{V: f.V, m: new(fontMetrics)}.metrics()
+		m = f.loadMetrics()
 	}
 	if m != nil {
 		if m.cid != nil {
@@ -1106,18 +1102,6 @@ func decodeText(enc TextEncoding, raw string, glyphs *glyphBudget) string {
 // GetPlainText returns the page's all text without format.
 // fonts can be passed in (to improve parsing performance) or left nil
 func (p Page) GetPlainText(fonts map[string]*Font) (result string, err error) {
-	lookup := (&pageFonts{page: p}).lookup
-	if fonts != nil {
-		lookup = func(name string) (*Font, bool) {
-			f, ok := fonts[name]
-			return f, ok
-		}
-	}
-	return p.plainText(lookup)
-}
-
-// plainText is GetPlainText with the page's fonts found by lookup.
-func (p Page) plainText(lookup func(name string) (*Font, bool)) (result string, err error) {
 	defer recoverTo(&err, func() { result = "" })
 
 	// Handle in case the content page is empty
@@ -1126,6 +1110,14 @@ func (p Page) plainText(lookup func(name string) (*Font, bool)) (result string, 
 	}
 	strm := p.V.Key("Contents")
 	var enc TextEncoding = &nopEncoder{}
+
+	lookup := (&pageFonts{page: p}).lookup
+	if fonts != nil {
+		lookup = func(name string) (*Font, bool) {
+			f, ok := fonts[name]
+			return f, ok
+		}
+	}
 
 	var textBuilder bytes.Buffer
 	showText := func(s string) {
