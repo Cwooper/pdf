@@ -947,6 +947,7 @@ func (p Page) GetPlainText(fonts map[string]*Font) (result string, err error) {
 			if len(args) != 3 {
 				panic("bad \" operator")
 			}
+			args = args[2:]
 			fallthrough
 		case "'": // move to next line and show text
 			if len(args) != 1 {
@@ -1107,6 +1108,7 @@ func (p Page) walkTextBlocks(walker func(enc TextEncoding, x, y float64, s strin
 			if len(args) != 3 {
 				panic("bad \" operator")
 			}
+			args = args[2:]
 			fallthrough
 		case "'": // move to next line and show text
 			if len(args) != 1 {
