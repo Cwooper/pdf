@@ -188,3 +188,26 @@ func TestAESStringPadding(t *testing.T) {
 		}
 	}
 }
+// checkDecrypts verifies that the file encryptedPDF builds from s reads
+// back its page text and outline title.
+func checkDecrypts(t *testing.T, s cryptSpec) {
+	t.Helper()
+	data := encryptedPDF(s, "BT (Hello world) Tj ET", "Chapter One", "")
+	r := openPDF(t, data)
+	if got, err := r.Page(1).GetPlainText(nil); err != nil || !strings.Contains(got, "Hello world") {
+		t.Errorf("GetPlainText = %q, %v; want %q", got, err, "Hello world")
+	}
+	if o := r.Outline(); len(o.Child) != 1 || o.Child[0].Title != "Chapter One" {
+		t.Errorf("Outline = %+v, want one item titled %q", o, "Chapter One")
+	}
+}
+
+// TestCryptFilterLengthBits verifies that a crypt filter's /Length is
+// accepted in bits as well as in bytes.
+func TestCryptFilterLengthBits(t *testing.T) {
+	for _, l := range []string{"16", "128"} {
+		t.Run(l, func(t *testing.T) {
+			checkDecrypts(t, cryptSpec{V: 4, R: 4, bits: 128, aes: true, cfLength: l})
+		})
+	}
+}
