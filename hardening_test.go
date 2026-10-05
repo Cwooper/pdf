@@ -717,8 +717,7 @@ func TestFilterChainCap(t *testing.T) {
 }
 
 // TestDecodeBudgetBeneathPredictor verifies that the inflate beneath a
-// predictor counts against the budget although the predictor yields
-// nothing: with no /Columns every row is the filter byte alone.
+// predictor counts against the budget.
 func TestDecodeBudgetBeneathPredictor(t *testing.T) {
 	var z bytes.Buffer
 	zw := zlib.NewWriter(&z)
@@ -730,8 +729,10 @@ func TestDecodeBudgetBeneathPredictor(t *testing.T) {
 	r := openPDF(t, pagePDF("",
 		fmt.Sprintf("<< /Length %d /Filter /FlateDecode /DecodeParms << /Predictor 12 >> >>\nstream\n%s\nendstream", z.Len(), z.String()),
 	))
-	if _, err := r.Page(1).GetPlainText(nil); err == nil || !strings.Contains(err.Error(), "budget") {
-		t.Errorf("GetPlainText: got %v, want the decode budget reported", err)
+	// Read the stream directly: its rows yield bytes, which would meet
+	// Interpret's content cap first.
+	if _, err := io.Copy(io.Discard, r.Page(1).V.Key("Contents").Reader()); err == nil || !strings.Contains(err.Error(), "budget") {
+		t.Errorf("reading the stream: got %v, want the decode budget reported", err)
 	}
 }
 

@@ -1309,15 +1309,17 @@ func (r *Reader) applyFilter(rd io.Reader, name string, param Value) io.Reader {
 		if pred.Kind() == Null {
 			return zr
 		}
-		// A predictor can consume rows while yielding nothing, so the inflate
-		// beneath it is charged as a stage of its own.
+		// The inflate beneath a predictor is a stage of its own.
 		zrc := r.charge(zr)
-		columns := param.Key("Columns").Int64()
+		columns := int64(1)
+		if c := param.Key("Columns"); c.Kind() != Null {
+			columns = c.Int64()
+		}
 		// /Columns sizes the two row buffers below. A negative value panics in
-		// make, and a large one allocates without bound. Xref streams are
-		// routinely FlateDecode/Predictor 12, so this is reached while merely
-		// opening a file.
-		if columns < 0 || columns > maxPredictorColumns {
+		// make, a large one allocates without bound, and zero reads rows that
+		// yield nothing. Xref streams are routinely FlateDecode/Predictor 12,
+		// so this is reached while merely opening a file.
+		if columns < 1 || columns > maxPredictorColumns {
 			panic(fmt.Errorf("invalid FlateDecode /Columns %d", columns))
 		}
 		switch pred.Int64() {
