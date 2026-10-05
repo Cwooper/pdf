@@ -1569,7 +1569,8 @@ func okayV4(encrypt dict) bool {
 	if cfparam["AuthEvent"] != nil && cfparam["AuthEvent"] != name("DocOpen") {
 		return false
 	}
-	if cfparam["Length"] != nil && cfparam["Length"] != int64(16) {
+	// Writers give the key length in bytes or in bits.
+	if l := cfparam["Length"]; l != nil && l != int64(16) && l != int64(128) {
 		return false
 	}
 	if cfparam["CFM"] != name("AESV2") {
