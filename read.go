@@ -120,6 +120,10 @@ const (
 	// Real files hold at most a few hundred thousand objects.
 	maxXrefEntries = 1 << 20
 
+	// maxXrefRows bounds the rows read across a whole /Prev chain, stored or
+	// not: each costs a decode whether or not it adds an entry.
+	maxXrefRows = 8 * maxXrefEntries
+
 	// maxXrefFieldWidth bounds an entry in an xref stream /W array. The
 	// widths are byte counts that decodeInt accumulates into an int, so a
 	// field wider than an int64 cannot be represented anyway.
@@ -148,6 +152,7 @@ type xrefTable struct {
 	dense  []xref
 	sparse map[uint32]xref
 	n      int // entries stored
+	rows   int // rows read, stored or not
 }
 
 // newXrefTable returns a table sized for the declared number of entries,
@@ -509,6 +514,9 @@ func readXrefStreamData(r *Reader, strm stream, table *xrefTable, size int64) (*
 			return nil, fmt.Errorf("invalid Index range: %v", err)
 		}
 		for i := 0; i < int(n); i++ {
+			if table.rows++; table.rows > maxXrefRows {
+				return nil, fmt.Errorf("xref streams hold more than %d rows", maxXrefRows)
+			}
 			_, err := io.ReadFull(data, buf)
 			if err != nil {
 				return nil, fmt.Errorf("error reading xref stream: %v", err)
@@ -633,6 +641,9 @@ func readXrefTableData(b *buffer, table *xrefTable) (*xrefTable, error) {
 			return nil, fmt.Errorf("malformed xref table: %v", err)
 		}
 		for i := 0; i < int(n); i++ {
+			if table.rows++; table.rows > maxXrefRows {
+				return nil, fmt.Errorf("malformed xref table: more than %d rows", maxXrefRows)
+			}
 			off, ok1 := b.readToken().(int64)
 			gen, ok2 := b.readToken().(int64)
 			alloc, ok3 := b.readToken().(keyword)
