@@ -53,6 +53,10 @@ type buffer struct {
 	useAES      bool
 	objptr      objptr
 	depth       int // current object nesting depth
+	// entries counts the array and dict entries read, against maxEntries
+	// when it is set.
+	entries    int
+	maxEntries int
 }
 
 // newBuffer returns a new buffer reading from r at the given offset.
@@ -504,6 +508,7 @@ func (b *buffer) readArray() object {
 			break
 		}
 		b.unreadToken(tok)
+		b.countEntry()
 		x = append(x, b.readObject())
 	}
 	return x
@@ -527,6 +532,7 @@ func (b *buffer) readDict() object {
 			b.errorf("unexpected non-name key %T(%v) parsing dictionary", tok, tok)
 			continue
 		}
+		b.countEntry()
 		v := b.readObject()
 		if v == io.EOF {
 			// The value is cut off by the end of input; io.EOF is a marker,
@@ -558,6 +564,12 @@ func (b *buffer) readDict() object {
 	}
 
 	return stream{x, b.objptr, b.readOffset()}
+}
+
+func (b *buffer) countEntry() {
+	if b.entries++; b.maxEntries > 0 && b.entries > b.maxEntries {
+		b.errorf("more than %d operands", b.maxEntries)
+	}
 }
 
 func isSpace(b byte) bool {
