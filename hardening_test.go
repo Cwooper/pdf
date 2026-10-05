@@ -536,3 +536,15 @@ func TestGstackDepthCap(t *testing.T) {
 	}()
 	p.Content()
 }
+
+// TestOperandCap verifies that Interpret refuses operands past maxOperands
+// instead of stacking every one a content stream supplies.
+func TestOperandCap(t *testing.T) {
+	p := pageWithContent(strings.Repeat("1 ", maxOperands+2))
+	defer func() {
+		if recover() == nil {
+			t.Error("Content returned, want the operand cap reported")
+		}
+	}()
+	p.Content()
+}
