@@ -81,6 +81,11 @@ func Interpret(strm Value, do func(stk *Stack, op string)) {
 	var dicts []dict
 	var rd io.Reader
 	errs := 0
+	malformed := func() {
+		if errs++; errs > maxInterpretErrors {
+			panic(fmt.Errorf("more than %d malformed operands", maxInterpretErrors))
+		}
+	}
 	if strm.Kind() == Array {
 		readers := make([]io.Reader, 0, 2*strm.Len())
 		for i := 0; i < strm.Len(); i++ {
@@ -109,7 +114,11 @@ Reading:
 		if stk.Len()+b.entries > maxOperands {
 			panic(fmt.Errorf("more than %d operands", maxOperands))
 		}
-		tok := b.readToken()
+		tok, ok := readRecover(b, b.readToken)
+		if !ok {
+			malformed()
+			continue
+		}
 		if tok == io.EOF {
 			break
 		}
@@ -181,42 +190,31 @@ Reading:
 			}
 		}
 		b.unreadToken(tok)
-		obj, ok := readObjectRecover(b)
+		obj, ok := readRecover(b, b.readObject)
 		if !ok {
-			if errs++; errs > maxInterpretErrors {
-				panic(fmt.Errorf("more than %d malformed operands", maxInterpretErrors))
-			}
+			malformed()
 			continue
 		}
 		stk.Push(Value{data: obj})
 	}
 }
 
-// readObjectRecover reads one object, recovering a panic from malformed
-// input rather than letting it escape Interpret.
-//
-// Interpret parses an embedded PostScript-SUBSET stream (a CMap, a function)
-// that is not always a well-formed PDF object graph — for example, a
-// producer's CMap embedding "def" tokens inside what should be a plain
-// dictionary literal, which readObject (correctly, for a real PDF object)
-// treats as a hard parse error. Letting that escape takes the WHOLE calling
-// operation down — e.g. reading a font's /ToUnicode CMap — over one
-// unparseable operand, even when the caller (readCmap) only needs the
-// recognized cmap operators and the rest of the stream is fine. ok=false
-// means the operand is discarded; the Reading loop continues from wherever
-// the underlying buffer's position landed.
-func readObjectRecover(b *buffer) (obj object, ok bool) {
+// readRecover calls read, recovering a panic from malformed input so that one
+// bad operand, such as a cmap's stray def inside a dict literal, is skipped
+// rather than ending Interpret. A failure to read the input is not recovered:
+// it would only recur.
+func readRecover[T any](b *buffer, read func() T) (v T, ok bool) {
 	defer func() {
 		if r := recover(); r != nil {
 			// Parse errors are raised with panic(fmt.Errorf(...)) and mean
 			// "discard this operand and keep going". Anything else (nil
 			// deref, index out of range, ...) is a genuine bug and must not
 			// be silently swallowed as malformed input.
-			if _, isRuntime := r.(runtime.Error); isRuntime {
+			if _, isRuntime := r.(runtime.Error); isRuntime || b.readFailed {
 				panic(r)
 			}
-			obj, ok = nil, false
+			ok = false
 		}
 	}()
-	return b.readObject(), true
+	return read(), true
 }

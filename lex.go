@@ -52,8 +52,9 @@ type buffer struct {
 	key         []byte
 	useAES      bool
 	objptr      objptr
-	depth       int // current object nesting depth
-	entries     int // array and dict entries read, against maxOperands
+	depth       int  // current object nesting depth
+	entries     int  // array and dict entries read, against maxOperands
+	readFailed  bool // reading the input failed, and would fail again
 }
 
 // newBuffer returns a new buffer reading from r at the given offset.
@@ -97,6 +98,7 @@ func (b *buffer) reload() bool {
 			b.eof = true
 			return false
 		}
+		b.readFailed = true
 		b.errorf("malformed PDF: reading at offset %d: %v", b.offset, err)
 		return false
 	}

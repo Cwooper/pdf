@@ -260,28 +260,15 @@ func TestCompressedXrefStreamManyObjects(t *testing.T) {
 
 func rawStream(content string) Value { return memoryStream([]byte(content)) }
 
-// TestMalformedLexer covers tokenizer termination.
+// TestMalformedLexer covers tokenizer termination: readByte reports end of
+// input as '\n' once allowEOF is set, so a token cut off there must still end.
 func TestMalformedLexer(t *testing.T) {
-	// readByte reports end of input as '\n' once allowEOF is set, so a hex
-	// string with no closing '>' used to skip whitespace forever.
-	for _, content := range []string{"<AB", "<AB ", "<", "<A", "< ", "<AB\n\n\n"} {
-		t.Run("unterminated hex string "+content, func(t *testing.T) {
+	for _, content := range []string{"<AB", "<AB ", "<", "<A", "< ", "<AB\n\n\n",
+		"(unterminated", "(nested (deeper", "/name#", "/name#z", "<AB<CD", "<AG>"} {
+		t.Run(content, func(t *testing.T) {
 			mustNotCrash(t, func() {
 				Interpret(rawStream(content), func(stk *Stack, op string) {})
 			})
-		})
-	}
-
-	// These are rejected by design. What matters is that they terminate: the
-	// panic is the library's own error signal, reported to callers by the
-	// public APIs that recover.
-	for _, content := range []string{"(unterminated", "(nested (deeper", "/name#", "/name#z", "<AB<CD", "<AG>"} {
-		t.Run("rejected "+content, func(t *testing.T) {
-			if _, timedOut := run(t, func() {
-				Interpret(rawStream(content), func(stk *Stack, op string) {})
-			}); timedOut {
-				t.Errorf("did not return within %v", caseTimeout)
-			}
 		})
 	}
 }
