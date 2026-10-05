@@ -1621,8 +1621,7 @@ func decryptStream(key []byte, useAES bool, ptr objptr, rd io.Reader) io.Reader 
 		}
 		iv := make([]byte, 16)
 		io.ReadFull(rd, iv)
-		cbc := cipher.NewCBCDecrypter(cb, iv)
-		rd = &cbcReader{cbc: cbc, rd: rd, buf: make([]byte, 16)}
+		rd = &cbcReader{cbc: cipher.NewCBCDecrypter(cb, iv), rd: rd}
 	} else {
 		c, _ := rc4.NewCipher(key)
 		rd = &cipher.StreamReader{S: c, R: rd}
@@ -1630,23 +1629,46 @@ func decryptStream(key []byte, useAES bool, ptr objptr, rd io.Reader) io.Reader 
 	return rd
 }
 
+// A cbcReader decrypts AES-CBC data. It holds the last whole block back
+// until the data ends, so that the padding there can be stripped, and drops
+// a partial block at the end, since /Length can run a few bytes past the
+// data.
 type cbcReader struct {
 	cbc  cipher.BlockMode
 	rd   io.Reader
 	buf  []byte
-	pend []byte
+	held []byte // ciphertext not yet decrypted, at the end of buf's last fill
+	pend []byte // plaintext not yet returned
+	err  error
 }
 
-func (r *cbcReader) Read(b []byte) (n int, err error) {
-	if len(r.pend) == 0 {
-		_, err = io.ReadFull(r.rd, r.buf)
-		if err != nil {
-			return 0, err
+func (r *cbcReader) Read(b []byte) (int, error) {
+	for len(r.pend) == 0 {
+		if r.err != nil {
+			return 0, r.err
 		}
-		r.cbc.CryptBlocks(r.buf, r.buf)
-		r.pend = r.buf
+		if r.buf == nil {
+			// Allocated on first read: callers can open many streams before
+			// reading any.
+			r.buf = make([]byte, 4096)
+		}
+		n := copy(r.buf, r.held)
+		m, err := io.ReadFull(r.rd, r.buf[n:])
+		n += m
+		switch err {
+		case nil:
+			k := n - aes.BlockSize
+			r.cbc.CryptBlocks(r.buf[:k], r.buf[:k])
+			r.pend, r.held = r.buf[:k], r.buf[k:n]
+		case io.EOF, io.ErrUnexpectedEOF:
+			k := n - n%aes.BlockSize
+			r.cbc.CryptBlocks(r.buf[:k], r.buf[:k])
+			r.pend, r.held, r.err = unpad(r.buf[:k]), nil, io.EOF
+		default:
+			r.err = err
+		}
 	}
-	n = copy(b, r.pend)
+	n := copy(b, r.pend)
 	r.pend = r.pend[n:]
 	return n, nil
 }
