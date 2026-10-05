@@ -390,3 +390,21 @@ func TestDocumentBudgets(t *testing.T) {
 		})
 	}
 }
+
+// TestStyledSentenceLinear verifies that GetStyledTexts builds a sentence in
+// time and memory linear in its glyphs: joining them one at a time made a
+// 1.5 KB file of one long sentence run for over 20 seconds.
+func TestStyledSentenceLinear(t *testing.T) {
+	const glyphs = 50000
+	data := pageTreePDF("<< /Type /Pages /Kids [3 0 R] /Count 1 >>",
+		"<< /Type /Page /Contents 4 0 R >>", streamObj("BT ("+strings.Repeat("a", glyphs)+") Tj ET"))
+	r := openPDF(t, data)
+	var sentences []Text
+	var err error
+	if got := allocated(func() { sentences, err = r.GetStyledTexts() }); got > 64<<20 {
+		t.Errorf("GetStyledTexts allocated %d MB", got>>20)
+	}
+	if err != nil || len(sentences) != 1 || len(sentences[0].S) != glyphs {
+		t.Errorf("got %d sentences, err %v; want one of %d glyphs", len(sentences), err, glyphs)
+	}
+}
