@@ -454,3 +454,21 @@ func TestQuoteOperator(t *testing.T) {
 		t.Errorf("GetTextByRow = %v, %v; want hello", rows, err)
 	}
 }
+
+// TestMissingOperands verifies that TJ and Tm with too few operands are
+// reported as malformed content rather than indexing past their operands.
+func TestMissingOperands(t *testing.T) {
+	for _, content := range []string{"BT TJ ET", "BT 1 Tm (a) Tj ET"} {
+		t.Run(content, func(t *testing.T) {
+			p := pageWithContent(content)
+			noRuntimePanic(t, func() { p.Content() })
+			_, err := p.GetPlainText(nil)
+			if err != nil && strings.Contains(err.Error(), "runtime error") {
+				t.Errorf("GetPlainText: %v", err)
+			}
+			if _, err := p.GetTextByRow(); err == nil || strings.Contains(err.Error(), "runtime error") {
+				t.Errorf("GetTextByRow: got %v, want a malformed content error", err)
+			}
+		})
+	}
+}

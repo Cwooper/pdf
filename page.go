@@ -960,6 +960,9 @@ func (p Page) GetPlainText(fonts map[string]*Font) (result string, err error) {
 			}
 			showEncodedText(args[0].RawString())
 		case "TJ": // show text, allowing individual glyph positioning
+			if len(args) != 1 {
+				panic("bad TJ operator")
+			}
 			v := args[0]
 			for i := 0; i < v.Len(); i++ {
 				x := v.Index(i)
@@ -1122,6 +1125,9 @@ func (p Page) walkTextBlocks(walker func(enc TextEncoding, x, y float64, s strin
 
 			show(args[0].RawString())
 		case "TJ": // show text, allowing individual glyph positioning
+			if len(args) != 1 {
+				panic("bad TJ operator")
+			}
 			v := args[0]
 			for i := 0; i < v.Len(); i++ {
 				x := v.Index(i)
@@ -1132,6 +1138,9 @@ func (p Page) walkTextBlocks(walker func(enc TextEncoding, x, y float64, s strin
 		case "Td":
 			show("")
 		case "Tm":
+			if len(args) != 6 {
+				panic("bad Tm")
+			}
 			currentX = args[4].Float64()
 			currentY = args[5].Float64()
 		}
@@ -1314,6 +1323,9 @@ func (p Page) Content() Content {
 			showText(args[0].RawString())
 
 		case "TJ": // show text, allowing individual glyph positioning
+			if len(args) != 1 {
+				panic("bad TJ operator")
+			}
 			v := args[0]
 			for i := 0; i < v.Len(); i++ {
 				x := v.Index(i)
