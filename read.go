@@ -84,6 +84,10 @@ import (
 var DebugOn = false
 
 // A Reader is a single PDF file open for reading.
+// It is safe for concurrent use; goroutines share its caches and one decode
+// budget, which lets its streams decode at most the larger of 128 MB and 32
+// times the file size over the Reader's lifetime. A caller reading the file
+// through many times should open a new Reader for each pass.
 type Reader struct {
 	f          io.ReaderAt
 	end        int64
@@ -154,9 +158,24 @@ const (
 	// streams, which can be made to reference each other in a cycle.
 	maxResolveDepth = 32
 
+	// minDecodeBudget and decodeBudgetRatio bound the bytes a Reader's
+	// streams yield in all, counted at every stage from the raw bytes through
+	// each filter: the larger of the floor and the ratio times the file size.
+	// Every other cap holds per stream or per page, so content shared by many
+	// pages could still decode without end. Reading every page's content once
+	// took at most 22 MB, and 8.7 times the file size, across hundreds of
+	// ordinary documents. The floor stays above every per-stream cap, so that
+	// each still reports its own limit.
+	minDecodeBudget   = 128 << 20
+	decodeBudgetRatio = 32
+
 	// maxPredictorColumns bounds the /Columns of a FlateDecode predictor,
 	// which sizes a row buffer.
 	maxPredictorColumns = 1 << 20
+
+	// maxFilters bounds a stream's /Filter array, whose decoders are all
+	// built before any byte is read. Real files chain two or three.
+	maxFilters = 8
 )
 
 // An xrefTable maps object numbers to cross-reference entries. Numbers near
@@ -318,6 +337,8 @@ func NewReaderEncrypted(f io.ReaderAt, size int64, pw func() string) (r *Reader,
 		end:   end,
 		cache: new(readerCache),
 	}
+	r.cache.limit = max(minDecodeBudget, decodeBudgetRatio*size)
+	r.cache.budget.Store(r.cache.limit)
 	pos := end - chunk + int64(i)
 	b := newBuffer(io.NewSectionReader(f, pos, end-pos), pos)
 	if b.readToken() != keyword("startxref") {
@@ -1035,6 +1056,32 @@ type readerCache struct {
 	// indexed counts the entries every decoded object stream's index has
 	// added, against maxXrefEntries.
 	indexed atomic.Int64
+	// budget is what remains of the limit on the bytes the Reader's
+	// streams may yield.
+	budget atomic.Int64
+	limit  int64
+}
+
+// A budgetReader charges what it reads against its Reader's decode budget.
+type budgetReader struct {
+	r io.Reader
+	c *readerCache
+}
+
+func (b *budgetReader) Read(p []byte) (int, error) {
+	n, err := b.r.Read(p)
+	if b.c.budget.Add(-int64(n)) < 0 {
+		return 0, fmt.Errorf("decoding exceeds the %d-byte budget for this file", b.c.limit)
+	}
+	return n, err
+}
+
+// charge counts what rd yields against r's decode budget.
+func (r *Reader) charge(rd io.Reader) io.Reader {
+	if r.cache == nil {
+		return rd
+	}
+	return &budgetReader{rd, r.cache}
 }
 
 // A cached value is loaded once, by whichever caller asks first. A panic
@@ -1254,6 +1301,7 @@ func (v Value) Reader() io.ReadCloser {
 	if v.r.key != nil {
 		rd = decryptStream(v.r.key, v.r.useAES, x.ptr, rd)
 	}
+	rd = v.r.charge(rd)
 	filter := v.Key("Filter")
 	param := v.Key("DecodeParms")
 	switch filter.Kind() {
@@ -1262,17 +1310,20 @@ func (v Value) Reader() io.ReadCloser {
 	case Null:
 		// ok
 	case Name:
-		rd = applyFilter(rd, filter.Name(), param)
+		rd = v.r.charge(v.r.applyFilter(rd, filter.Name(), param))
 	case Array:
+		if filter.Len() > maxFilters {
+			panic(fmt.Errorf("stream has %d filters, more than %d", filter.Len(), maxFilters))
+		}
 		for i := 0; i < filter.Len(); i++ {
-			rd = applyFilter(rd, filter.Index(i).Name(), param.Index(i))
+			rd = v.r.charge(v.r.applyFilter(rd, filter.Index(i).Name(), param.Index(i)))
 		}
 	}
 
 	return io.NopCloser(rd)
 }
 
-func applyFilter(rd io.Reader, name string, param Value) io.Reader {
+func (r *Reader) applyFilter(rd io.Reader, name string, param Value) io.Reader {
 	switch name {
 	default:
 		panic("unknown filter " + name)
@@ -1285,6 +1336,9 @@ func applyFilter(rd io.Reader, name string, param Value) io.Reader {
 		if pred.Kind() == Null {
 			return zr
 		}
+		// A predictor can consume rows while yielding nothing, so the inflate
+		// beneath it is charged as a stage of its own.
+		zrc := r.charge(zr)
 		columns := param.Key("Columns").Int64()
 		// /Columns sizes the two row buffers below. A negative value panics in
 		// make, and a large one allocates without bound. Xref streams are
@@ -1300,7 +1354,7 @@ func applyFilter(rd io.Reader, name string, param Value) io.Reader {
 			}
 			panic("pred")
 		case 12:
-			return &pngUpReader{r: zr, hist: make([]byte, 1+columns), tmp: make([]byte, 1+columns)}
+			return &pngUpReader{r: zrc, hist: make([]byte, 1+columns), tmp: make([]byte, 1+columns)}
 		}
 	case "ASCII85Decode":
 		cleanASCII85 := newAlphaReader(rd)

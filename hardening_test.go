@@ -7,6 +7,7 @@ package pdf
 import (
 	"bytes"
 	"compress/zlib"
+	"encoding/ascii85"
 	"fmt"
 	"io"
 	"runtime"
@@ -775,5 +776,100 @@ func TestObjectStreamDecodedOnce(t *testing.T) {
 	runtime.ReadMemStats(&after)
 	if got := after.TotalAlloc - before.TotalAlloc; got > 16<<20 {
 		t.Errorf("resolving %d objects from one stream allocated %d MB", pages, got>>20)
+	}
+}
+
+// TestFilterChainCap verifies that a /Filter array of up to maxFilters
+// decodes and a longer one is refused before its decoders are built: an
+// indirect array of a million filters ran a 29.6 KB file out of 2 GB.
+func TestFilterChainCap(t *testing.T) {
+	page := func(layers int) Page {
+		content := "BT (x) Tj ET"
+		for range layers {
+			var b bytes.Buffer
+			w := ascii85.NewEncoder(&b)
+			w.Write([]byte(content))
+			w.Close()
+			content = b.String() + "~>"
+		}
+		data := buildPDF(
+			"<< /Type /Catalog /Pages 2 0 R >>",
+			"<< /Type /Pages /Kids [3 0 R] /Count 1 >>",
+			"<< /Type /Page /Parent 2 0 R /Contents 4 0 R >>",
+			fmt.Sprintf("<< /Length %d /Filter 5 0 R >>\nstream\n%s\nendstream", len(content), content),
+			"["+strings.Repeat("/ASCII85Decode ", layers)+"]",
+		)
+		r, err := NewReader(bytes.NewReader(data), int64(len(data)))
+		if err != nil {
+			t.Fatal(err)
+		}
+		return r.Page(1)
+	}
+	if got, err := page(maxFilters).GetPlainText(nil); err != nil || got != "\nx" {
+		t.Errorf("%d filters: GetPlainText = %q, %v; want %q", maxFilters, got, err, "\nx")
+	}
+	if _, err := page(maxFilters + 1).GetPlainText(nil); err == nil || !strings.Contains(err.Error(), "filters") {
+		t.Errorf("%d filters: got %v, want the filter cap reported", maxFilters+1, err)
+	}
+}
+
+// TestDecodeBudgetBeneathPredictor verifies that the inflate beneath a
+// predictor counts against the budget although the predictor yields
+// nothing: with no /Columns every row is the filter byte alone, and 17 KB
+// held 4 GiB of them.
+func TestDecodeBudgetBeneathPredictor(t *testing.T) {
+	var z bytes.Buffer
+	zw := zlib.NewWriter(&z)
+	row := bytes.Repeat([]byte{2}, 1<<20)
+	for range minDecodeBudget>>20 + 1 {
+		zw.Write(row)
+	}
+	zw.Close()
+	data := buildPDF(
+		"<< /Type /Catalog /Pages 2 0 R >>",
+		"<< /Type /Pages /Kids [3 0 R] /Count 1 >>",
+		"<< /Type /Page /Parent 2 0 R /Contents 4 0 R >>",
+		fmt.Sprintf("<< /Length %d /Filter /FlateDecode /DecodeParms << /Predictor 12 >> >>\nstream\n%s\nendstream", z.Len(), z.String()),
+	)
+	r, err := NewReader(bytes.NewReader(data), int64(len(data)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := r.Page(1).GetPlainText(nil); err == nil || !strings.Contains(err.Error(), "budget") {
+		t.Errorf("GetPlainText: got %v, want the decode budget reported", err)
+	}
+}
+
+// TestDecodeBudget verifies that the bytes all of a Reader's streams decode
+// to count against one budget. Each page's own caps held, but pages sharing
+// one stream that inflates to 64 MiB decoded gigabytes from 70 KB.
+func TestDecodeBudget(t *testing.T) {
+	const chunk = 8 << 20
+	pages := minDecodeBudget/chunk + 1
+	var z bytes.Buffer
+	zw := zlib.NewWriter(&z)
+	zw.Write(make([]byte, chunk))
+	zw.Write([]byte("BT (x) Tj ET"))
+	zw.Close()
+	objs := []string{"<< /Type /Catalog /Pages 2 0 R >>", "",
+		fmt.Sprintf("<< /Length %d /Filter /FlateDecode >>\nstream\n%s\nendstream", z.Len(), z.String())}
+	var kids strings.Builder
+	for i := range pages {
+		fmt.Fprintf(&kids, "%d 0 R ", 4+i)
+		objs = append(objs, "<< /Type /Page /Parent 2 0 R /Contents 3 0 R >>")
+	}
+	objs[1] = fmt.Sprintf("<< /Type /Pages /Kids [%s] /Count %d >>", kids.String(), pages)
+	data := buildPDF(objs...)
+	r, err := NewReader(bytes.NewReader(data), int64(len(data)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	for i := 1; i <= pages; i++ {
+		if _, err = r.Page(i).GetPlainText(nil); err != nil {
+			break
+		}
+	}
+	if err == nil || !strings.Contains(err.Error(), "budget") {
+		t.Errorf("reading %d pages of %d MB each: got %v, want the decode budget reported", pages, chunk>>20, err)
 	}
 }
