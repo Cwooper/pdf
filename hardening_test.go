@@ -793,3 +793,105 @@ func TestDecodeBudgetCountsObjects(t *testing.T) {
 		t.Errorf("%d pages sharing a %d MB dict: got %v, want the decode budget reported", pages, size>>20, err)
 	}
 }
+
+// streamObj returns a stream object holding content.
+func streamObj(content string) string {
+	return fmt.Sprintf("<< /Length %d >>\nstream\n%s\nendstream", len(content), content)
+}
+
+// TestFontLookupOncePerPage verifies that a page resolves its /Font
+// dictionary once, not on every Tf.
+func TestFontLookupOncePerPage(t *testing.T) {
+	p := openPDF(t, pagePDF("/Resources 5 0 R",
+		streamObj(strings.Repeat("/F1 1 Tf /F2 1 Tf ", 20000)),
+		"<< /Font << /F1 6 0 R >> >>",
+		"null",
+	)).Page(1)
+	if got := allocated(func() { p.Content() }); got > 16<<20 {
+		t.Errorf("Content allocated %d MB", got>>20)
+	}
+}
+
+// TestNullFontEntryDecodes verifies that a font entry naming a missing
+// object still decodes through PDFDocEncoding rather than passing raw bytes
+// through.
+func TestNullFontEntryDecodes(t *testing.T) {
+	r := openPDF(t, pagePDF("/Resources << /Font << /F1 99 0 R >> >>", streamObj("BT /F1 12 Tf (\x80) Tj ET")))
+	if got, err := r.Page(1).GetPlainText(nil); err != nil || got != "\n\u2022" {
+		t.Errorf("GetPlainText = %q, %v; want %q", got, err, "\n\u2022")
+	}
+}
+
+// TestFontSharedByNames verifies that names referring to one font object
+// share one parse of it, on a page and across a document.
+func TestFontSharedByNames(t *testing.T) {
+	const names = 64
+	var fonts, content strings.Builder
+	content.WriteString("BT ")
+	for i := range names {
+		fmt.Fprintf(&fonts, "/F%d 5 0 R ", i)
+		fmt.Fprintf(&content, "/F%d 12 Tf (x) Tj ", i)
+	}
+	content.WriteString("ET")
+	font := "<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica /Junk [" + strings.Repeat("0 ", 1<<18) + "] >>"
+	r := openPDF(t, xrefStreamFile(
+		testObj{num: 1, body: "<< /Type /Catalog /Pages 2 0 R >>"},
+		testObj{num: 2, body: "<< /Type /Pages /Kids [3 0 R] /Count 1 >>"},
+		testObj{num: 3, body: "<< /Type /Page /Parent 2 0 R /Contents 4 0 R /Resources << /Font << " + fonts.String() + ">> >> >>"},
+		testObj{num: 4, body: streamObj(content.String())},
+		testObj{num: 6, hdr: "/N NUM /First FIRST", members: []testObj{{num: 5, body: font}}},
+	))
+	if got := allocated(func() { r.Page(1).Content() }); got > 64<<20 {
+		t.Errorf("Content allocated %d MB", got>>20)
+	}
+	if got := allocated(func() { r.GetPlainText() }); got > 64<<20 {
+		t.Errorf("GetPlainText allocated %d MB", got>>20)
+	}
+}
+
+// TestFontsResolvedOnUse verifies that Page.Content resolves only the fonts
+// its text operators select, so that a page inheriting fat resources or naming
+// thousands of fonts pays for those alone, and remembers no name the page does
+// not define.
+func TestFontsResolvedOnUse(t *testing.T) {
+	junk := "/Junk [" + strings.Repeat("0 ", 500000) + "]"
+	t.Run("no font selected", func(t *testing.T) {
+		p := openPDF(t, buildPDF(
+			"<< /Type /Catalog /Pages 2 0 R >>",
+			"<< /Type /Pages /Kids [3 0 R] /Count 1 /Resources << /Font << /F1 << /Type /Font >> >> >> "+junk+" >>",
+			"<< /Type /Page /Parent 2 0 R /Contents 4 0 R >>",
+			streamObj("BT (x) Tj ET"),
+		)).Page(1)
+		if got := allocated(func() { p.Content() }); got > 4<<20 {
+			t.Errorf("Content allocated %d MB", got>>20)
+		}
+	})
+
+	t.Run("one of many fonts selected", func(t *testing.T) {
+		var fonts strings.Builder
+		for i := range 200 {
+			fmt.Fprintf(&fonts, "/F%d 5 0 R ", i)
+		}
+		p := openPDF(t, pagePDF("/Resources << /Font << "+fonts.String()+">> >>",
+			streamObj("BT /F7 12 Tf (x) Tj ET"),
+			"<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica "+junk+" >>",
+		)).Page(1)
+		if got := allocated(func() { p.Content() }); got > 64<<20 {
+			t.Errorf("Content allocated %d MB", got>>20)
+		}
+	})
+
+	t.Run("undefined names", func(t *testing.T) {
+		const n = 200000
+		var distinct strings.Builder
+		for i := range n {
+			fmt.Fprintf(&distinct, "/%x 1 Tf ", i)
+		}
+		same := pageWithContent(strings.Repeat("/7 1 Tf ", n))
+		base := allocated(func() { same.Content() })
+		p := pageWithContent(distinct.String())
+		if got := allocated(func() { p.Content() }); got > base+8<<20 {
+			t.Errorf("Content allocated %d MB for distinct undefined names, %d MB for one repeated", got>>20, base>>20)
+		}
+	})
+}
