@@ -55,3 +55,20 @@ func TestPredictorDefaultColumns(t *testing.T) {
 		t.Errorf("/Columns 0: got %v, want it reported", err)
 	}
 }
+
+// TestFlateIgnoresAdler32 verifies that complete deflate data reads although
+// the Adler-32 trailer after it is wrong or missing, as other readers allow.
+func TestFlateIgnoresAdler32(t *testing.T) {
+	z := deflate([]byte("BT (Hello) Tj ET"))
+	bad := bytes.Clone(z)
+	bad[len(bad)-1] ^= 0xff
+	for name, data := range map[string][]byte{"bad": bad, "missing": z[:len(z)-4], "short": z[:len(z)-2]} {
+		got, err := plainText(t, streamPage("/Filter /FlateDecode", data))
+		if err != nil || !strings.Contains(got, "Hello") {
+			t.Errorf("%s trailer: GetPlainText = %q, %v; want %q", name, got, err, "Hello")
+		}
+	}
+	if _, err := plainText(t, streamPage("/Filter /FlateDecode", z[:len(z)-6])); err == nil {
+		t.Error("truncated deflate data: got no error")
+	}
+}
