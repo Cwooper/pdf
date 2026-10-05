@@ -9,10 +9,10 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"math"
 	"runtime"
 	"sort"
 	"strings"
-	"unicode/utf8"
 )
 
 // The structures a PDF uses to describe pages and outlines are graphs of
@@ -42,6 +42,10 @@ const (
 	// maxOutlineTitleBytes bounds the outline's titles in all, since items
 	// can share one long title by reference.
 	maxOutlineTitleBytes = 1 << 20
+
+	// maxCmapDst bounds a ToUnicode destination string, the CMap format's
+	// own limit; one code otherwise expands to megabytes.
+	maxCmapDst = 512
 
 	// maxPageGlyphs bounds the glyphs, Texts, and Rects text extraction
 	// builds for one page, about 64 bytes each. A dense real page holds under
@@ -315,11 +319,20 @@ type glyphBudget struct {
 
 func (g *glyphBudget) spend(n int) {
 	if g.n += n; g.n > maxPageGlyphs {
-		panic(fmt.Errorf("page shows more than %d glyphs", maxPageGlyphs))
+		panic(errPageGlyphs)
 	}
 	if g.r != nil && g.r.cache != nil && g.r.cache.glyphs.Add(-int64(n)) < 0 {
 		panic(fmt.Errorf("document shows more than %d glyphs", maxDocGlyphs))
 	}
+}
+
+// left returns how many more glyphs the page may show.
+func (g *glyphBudget) left() int {
+	n := maxPageGlyphs - g.n
+	if g.r != nil && g.r.cache != nil {
+		n = min(n, int(max(0, g.r.cache.glyphs.Load())))
+	}
+	return n
 }
 
 // noFont is the font of a name the page does not define. Its encoding is set
@@ -608,9 +621,14 @@ type cmap struct {
 }
 
 func (m *cmap) Decode(raw string) (text string) {
+	return m.decode(raw, math.MaxInt)
+}
+
+// decode decodes raw, stopping once the text holds limit runes.
+func (m *cmap) decode(raw string, limit int) string {
 	var r []rune
 Parse:
-	for len(raw) > 0 {
+	for len(raw) > 0 && len(r) < limit {
 		for n := 1; n <= 4 && n <= len(raw); n++ { // number of digits in character replacement (1-4 possible)
 			for _, space := range m.space[n-1] { // find matching codespace Ranges for number of digits
 				if space.low <= raw[:n] && raw[:n] <= space.high { // see if value is in range
@@ -638,7 +656,7 @@ Parse:
 							if bfrange.dst.Kind() == Array {
 								n := text[len(text)-1] - bfrange.lo[len(bfrange.lo)-1]
 								v := bfrange.dst.Index(int(n))
-								if v.Kind() == String {
+								if v.Kind() == String && len(v.RawString()) <= maxCmapDst {
 									s := v.RawString()
 									r = append(r, []rune(utf16Decode(s))...)
 									continue Parse
@@ -781,7 +799,9 @@ func parseCmap(toUnicode Value) (result *cmap) {
 			n = operandCount(stk, n, 2)
 			for i := 0; i < n; i++ {
 				repl, orig := stk.Pop().RawString(), stk.Pop().RawString()
-				m.bfchar = append(m.bfchar, bfchar{orig, repl})
+				if len(repl) <= maxCmapDst {
+					m.bfchar = append(m.bfchar, bfchar{orig, repl})
+				}
 			}
 			n = -1
 		case "beginbfrange":
@@ -797,7 +817,11 @@ func parseCmap(toUnicode Value) (result *cmap) {
 			n = operandCount(stk, n, 3)
 			for i := 0; i < n; i++ {
 				dst, srcHi, srcLo := stk.Pop(), stk.Pop().RawString(), stk.Pop().RawString()
-				m.bfrange = append(m.bfrange, bfrange{srcLo, srcHi, dst})
+				// An array's strings are checked as they are used, since def
+				// can share one array among many ranges.
+				if dst.Kind() == Array || len(dst.RawString()) <= maxCmapDst {
+					m.bfrange = append(m.bfrange, bfrange{srcLo, srcHi, dst})
+				}
 			}
 			n = -1
 		case "defineresource":
@@ -897,12 +921,31 @@ func recoverTo(err *error, reset func()) {
 	}
 }
 
-// decodeText decodes raw font code points with enc and returns UTF-8 text.
-func decodeText(enc TextEncoding, raw string) string {
-	var b strings.Builder
-	for _, ch := range enc.Decode(raw) {
-		b.WriteRune(ch)
+var errPageGlyphs = fmt.Errorf("page shows more than %d glyphs", maxPageGlyphs)
+
+// decodeLimit decodes raw with enc, stopping once the text holds limit
+// runes or soon after.
+func decodeLimit(enc TextEncoding, raw string, limit int) string {
+	if m, ok := enc.(*cmap); ok {
+		return m.decode(raw, limit)
 	}
+	// The other encodings yield at most one rune per byte.
+	if len(raw) > limit {
+		raw = raw[:limit]
+	}
+	return enc.Decode(raw)
+}
+
+// decodeText decodes raw font code points with enc and returns UTF-8 text,
+// spending its runes from glyphs.
+func decodeText(enc TextEncoding, raw string, glyphs *glyphBudget) string {
+	var b strings.Builder
+	n := 0
+	for _, ch := range decodeLimit(enc, raw, glyphs.left()+1) {
+		b.WriteRune(ch)
+		n++
+	}
+	glyphs.spend(n)
 	return b.String()
 }
 
@@ -932,9 +975,7 @@ func (p Page) GetPlainText(fonts map[string]*Font) (result string, err error) {
 	}
 	glyphs := glyphBudget{r: p.V.r}
 	showEncodedText := func(s string) {
-		s = decodeText(enc, s)
-		glyphs.spend(utf8.RuneCountInString(s))
-		textBuilder.WriteString(s)
+		textBuilder.WriteString(decodeText(enc, s, &glyphs))
 	}
 
 	Interpret(strm, func(stk *Stack, op string) {
@@ -1004,9 +1045,9 @@ func (p Page) GetTextByColumn() (result Columns, err error) {
 	defer recoverTo(&err, func() { result = Columns{} })
 
 	columns := make(map[int64]*Column)
-	showText := func(enc TextEncoding, currentX, currentY float64, s string) {
+	showText := func(currentX, currentY float64, s string) {
 		text := Text{
-			S: decodeText(enc, s),
+			S: s,
 			X: currentX,
 			Y: currentY,
 		}
@@ -1051,9 +1092,9 @@ func (p Page) GetTextByRow() (result Rows, err error) {
 	defer recoverTo(&err, func() { result = Rows{} })
 
 	rows := make(map[int64]*Row)
-	showText := func(enc TextEncoding, currentX, currentY float64, s string) {
+	showText := func(currentX, currentY float64, s string) {
 		text := Text{
-			S: decodeText(enc, s),
+			S: s,
 			X: currentX,
 			Y: currentY,
 		}
@@ -1084,7 +1125,7 @@ func (p Page) GetTextByRow() (result Rows, err error) {
 	return result, err
 }
 
-func (p Page) walkTextBlocks(walker func(enc TextEncoding, x, y float64, s string)) {
+func (p Page) walkTextBlocks(emit func(x, y float64, s string)) {
 	// Handle in case the content page is empty
 	if p.V.IsNull() || p.V.Key("Contents").Kind() == Null {
 		return
@@ -1097,9 +1138,13 @@ func (p Page) walkTextBlocks(walker func(enc TextEncoding, x, y float64, s strin
 	var enc TextEncoding = &nopEncoder{}
 	var currentX, currentY float64
 	glyphs := glyphBudget{r: p.V.r}
-	show := func(s string) {
-		glyphs.spend(1)
-		walker(enc, currentX, currentY, s)
+	// Each Text costs its glyphs, and an empty one, as Td makes, costs one.
+	show := func(raw string) {
+		s := decodeText(enc, raw, &glyphs)
+		if s == "" {
+			glyphs.spend(1)
+		}
+		emit(currentX, currentY, s)
 	}
 	Interpret(strm, func(stk *Stack, op string) {
 		args := popArgs(stk)
@@ -1181,7 +1226,7 @@ func (p Page) Content() Content {
 	glyphs := glyphBudget{r: p.V.r}
 	showText := func(s string) {
 		n := 0
-		decoded := enc.Decode(s)
+		decoded := decodeLimit(enc, s, glyphs.left()+1)
 		for _, ch := range decoded {
 			glyphs.spend(1)
 			var w0 float64
