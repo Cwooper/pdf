@@ -139,27 +139,27 @@ func TestOkayV4(t *testing.T) {
 		name("StmF"): name("StdCF"),
 		name("StrF"): name("StdCF"),
 	}
-	if !okayV4(valid) {
+	if _, ok := okayV4(valid); !ok {
 		t.Fatal("okayV4(valid) = false, want true")
 	}
 
-	if okayV4(dict{name("StmF"): name("A"), name("StrF"): name("B")}) {
+	if _, ok := okayV4(dict{name("StmF"): name("A"), name("StrF"): name("B")}); ok {
 		t.Fatal("okayV4 should reject StmF != StrF")
 	}
 	badCFM := dict{
-		name("CF"):   dict{name("StdCF"): dict{name("CFM"): name("V2"), name("Length"): int64(16)}},
+		name("CF"):   dict{name("StdCF"): dict{name("CFM"): name("None"), name("Length"): int64(16)}},
 		name("StmF"): name("StdCF"),
 		name("StrF"): name("StdCF"),
 	}
-	if okayV4(badCFM) {
-		t.Fatal("okayV4 should reject CFM != AESV2")
+	if _, ok := okayV4(badCFM); ok {
+		t.Fatal("okayV4 should reject a CFM other than AESV2 or V2")
 	}
 	badLength := dict{
 		name("CF"):   dict{name("StdCF"): dict{name("CFM"): name("AESV2"), name("Length"): int64(8)}},
 		name("StmF"): name("StdCF"),
 		name("StrF"): name("StdCF"),
 	}
-	if okayV4(badLength) {
+	if _, ok := okayV4(badLength); ok {
 		t.Fatal("okayV4 should reject non-16-byte key length")
 	}
 	badCFType := dict{
@@ -167,7 +167,7 @@ func TestOkayV4(t *testing.T) {
 		name("StmF"): name("StdCF"),
 		name("StrF"): name("StdCF"),
 	}
-	if okayV4(badCFType) {
+	if _, ok := okayV4(badCFType); ok {
 		t.Fatal("okayV4 should reject a non-dict CF entry")
 	}
 }

@@ -1454,7 +1454,8 @@ func (r *Reader) initEncrypt(password string) error {
 		return fmt.Errorf("unsupported PDF: encryption filter %v", objfmt(encrypt["Filter"]))
 	}
 	V, _ := encrypt["V"].(int64)
-	if V != 1 && V != 2 && (V != 4 || !okayV4(encrypt)) {
+	aesV4, okV4 := okayV4(encrypt)
+	if V != 1 && V != 2 && (V != 4 || !okV4) {
 		return fmt.Errorf("unsupported PDF: encryption version V=%d; %v", V, objfmt(encrypt))
 	}
 	n, _ := encrypt["Length"].(int64)
@@ -1462,8 +1463,8 @@ func (r *Reader) initEncrypt(password string) error {
 		n = minKeyBits
 	}
 	if V == 4 {
-		// AESV2, the one crypt filter okayV4 allows, takes a 128-bit key
-		// whatever /Length says, and a shorter one fails aes.NewCipher.
+		// okayV4 allows only 128-bit crypt filters, whatever /Length says,
+		// and a shorter key fails aes.NewCipher.
 		n = maxKeyBits
 	}
 	if n%8 != 0 || n > maxKeyBits || n < minKeyBits {
@@ -1558,7 +1559,7 @@ func (r *Reader) initEncrypt(password string) error {
 	}
 
 	r.key = key
-	r.useAES = V == 4
+	r.useAES = V == 4 && aesV4
 	r.clearMetadata = clearMetadata
 
 	return nil
@@ -1566,37 +1567,42 @@ func (r *Reader) initEncrypt(password string) error {
 
 var ErrInvalidPassword = fmt.Errorf("encrypted PDF: invalid password")
 
-func okayV4(encrypt dict) bool {
+// okayV4 reports whether a V4 /Encrypt dict is supported, and whether its
+// crypt filter is AES (AESV2) rather than RC4 (V2).
+func okayV4(encrypt dict) (aes, ok bool) {
 	cf, ok := encrypt["CF"].(dict)
 	if !ok {
-		return false
+		return false, false
 	}
 	stmf, ok := encrypt["StmF"].(name)
 	if !ok {
-		return false
+		return false, false
 	}
 	strf, ok := encrypt["StrF"].(name)
 	if !ok {
-		return false
+		return false, false
 	}
 	if stmf != strf {
-		return false
+		return false, false
 	}
 	cfparam, ok := cf[stmf].(dict)
 	if !ok {
-		return false
+		return false, false
 	}
 	if cfparam["AuthEvent"] != nil && cfparam["AuthEvent"] != name("DocOpen") {
-		return false
+		return false, false
 	}
 	// Writers give the key length in bytes or in bits.
 	if l := cfparam["Length"]; l != nil && l != int64(16) && l != int64(128) {
-		return false
+		return false, false
 	}
-	if cfparam["CFM"] != name("AESV2") {
-		return false
+	switch cfparam["CFM"] {
+	case name("AESV2"):
+		return true, true
+	case name("V2"):
+		return false, true
 	}
-	return true
+	return false, false
 }
 
 func cryptKey(key []byte, useAES bool, ptr objptr) []byte {

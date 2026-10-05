@@ -101,6 +101,7 @@ func TestAES256Unsupported(t *testing.T) {
 // spec rather than shared with the reader, so that a mistake there shows.
 type cryptSpec struct {
 	V, R, bits int    // AESV2 when V is 4, else RC4
+	rc4CF      bool   // with V 4, the V2 (RC4) crypt filter instead of AESV2
 	cfLength   string // the crypt filter's /Length, if any
 	noMetadata bool   // /EncryptMetadata false, with a metadata stream
 	slop       int    // bytes after the content stream's data, in its /Length
@@ -153,11 +154,12 @@ func (s cryptSpec) encrypt(key []byte, id int, data []byte) []byte {
 	h := md5.New()
 	h.Write(key)
 	h.Write([]byte{byte(id), byte(id >> 8), byte(id >> 16), 0, 0})
-	if s.V == 4 {
+	aesCF := s.V == 4 && !s.rc4CF
+	if aesCF {
 		h.Write([]byte("sAlT"))
 	}
 	k := h.Sum(nil)[:min(len(key)+5, 16)]
-	if s.V != 4 {
+	if !aesCF {
 		out := make([]byte, len(data))
 		c, _ := rc4.NewCipher(k)
 		c.XORKeyStream(out, data)
@@ -184,7 +186,11 @@ func encryptedPDF(s cryptSpec, content, title, pageExtra string) []byte {
 		if s.cfLength != "" {
 			cfLength = " /Length " + s.cfLength
 		}
-		enc += fmt.Sprintf(" /CF << /StdCF << /CFM /AESV2%s >> >> /StmF /StdCF /StrF /StdCF", cfLength)
+		cfm := "AESV2"
+		if s.rc4CF {
+			cfm = "V2"
+		}
+		enc += fmt.Sprintf(" /CF << /StdCF << /CFM /%s%s >> >> /StmF /StdCF /StrF /StdCF", cfm, cfLength)
 	}
 	catalog := "<< /Type /Catalog /Pages 2 0 R /Outlines 5 0 R >>"
 	if s.noMetadata {
@@ -247,6 +253,13 @@ func TestCryptFilterLengthBits(t *testing.T) {
 			checkDecrypts(t, cryptSpec{V: 4, R: 4, bits: 128, cfLength: l})
 		})
 	}
+}
+
+// TestRC4CryptFilter verifies that a V4 file whose crypt filter is RC4 (V2)
+// decrypts; qpdf writes one for 128-bit RC4 with cleartext metadata.
+func TestRC4CryptFilter(t *testing.T) {
+	checkDecrypts(t, cryptSpec{V: 4, R: 4, bits: 128, rc4CF: true})
+	checkDecrypts(t, cryptSpec{V: 4, R: 4, bits: 128, rc4CF: true, noMetadata: true})
 }
 
 // TestEncryptMetadataFalse verifies that a file leaving its metadata in the
