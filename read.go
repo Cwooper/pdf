@@ -1602,7 +1602,7 @@ func decryptString(key []byte, useAES bool, ptr objptr, x string) string {
 
 		stream := cipher.NewCBCDecrypter(block, iv)
 		stream.CryptBlocks(s, s)
-		x = string(s)
+		x = string(unpad(s))
 	} else {
 		c, _ := rc4.NewCipher(key)
 		data := []byte(x)
@@ -1610,6 +1610,17 @@ func decryptString(key []byte, useAES bool, ptr objptr, x string) string {
 		x = string(data)
 	}
 	return x
+}
+
+// unpad strips the PKCS#7 padding that AES encryption appends, leaving
+// data that does not end in a padding length as it is.
+func unpad(b []byte) []byte {
+	if n := len(b); n > 0 {
+		if p := int(b[n-1]); p >= 1 && p <= aes.BlockSize && p <= n {
+			return b[:n-p]
+		}
+	}
+	return b
 }
 
 func decryptStream(key []byte, useAES bool, ptr objptr, rd io.Reader) io.Reader {
