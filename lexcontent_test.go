@@ -408,3 +408,32 @@ func TestStyledSentenceLinear(t *testing.T) {
 		t.Errorf("got %d sentences, err %v; want one of %d glyphs", len(sentences), err, glyphs)
 	}
 }
+
+// TestTextBlocksBounded verifies that GetTextByRow and GetTextByColumn find a
+// row or column in constant time, where a scan of those so far made 785 KB
+// of distinct rows run for 16 seconds, and that what they and Content
+// build counts against the page's glyph cap: Td and re each added a value
+// per operator with no cap at all.
+func TestTextBlocksBounded(t *testing.T) {
+	var rows strings.Builder
+	rows.WriteString("BT ")
+	for i := range maxPageGlyphs {
+		fmt.Fprintf(&rows, "1 0 0 1 %d %[1]d Tm ()Tj ", i)
+	}
+	rows.WriteString("ET")
+	p := pageWithContent(rows.String())
+	mustNotCrash(t, func() {
+		if got, err := p.GetTextByRow(); err != nil || len(got) != maxPageGlyphs {
+			t.Errorf("GetTextByRow: %d rows, err %v; want %d", len(got), err, maxPageGlyphs)
+		}
+		if got, err := p.GetTextByColumn(); err != nil || len(got) != maxPageGlyphs {
+			t.Errorf("GetTextByColumn: %d columns, err %v; want %d", len(got), err, maxPageGlyphs)
+		}
+	})
+
+	flood := pageWithContent("BT " + strings.Repeat("0 0 Td ", maxPageGlyphs+1) + "ET")
+	if _, err := flood.GetTextByRow(); err == nil || !strings.Contains(err.Error(), "glyphs") {
+		t.Errorf("Td flood: GetTextByRow got %v, want the glyph cap reported", err)
+	}
+	mustPanic(t, "glyphs", func() { pageWithContent(strings.Repeat("0 0 1 1 re ", maxPageGlyphs+1)).Content() })
+}
