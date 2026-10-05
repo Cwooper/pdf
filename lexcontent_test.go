@@ -365,3 +365,18 @@ func TestDocumentGlyphBudget(t *testing.T) {
 		t.Errorf("GetStyledTexts: got %v, want the glyph budget reported", err)
 	}
 }
+
+// TestStyledSentenceLinear verifies that GetStyledTexts builds a sentence in
+// time and memory linear in its glyphs.
+func TestStyledSentenceLinear(t *testing.T) {
+	const glyphs = 50000
+	r := openPDF(t, pagePDF("", streamObj("BT ("+strings.Repeat("a", glyphs)+") Tj ET")))
+	var sentences []Text
+	var err error
+	if got := allocated(func() { sentences, err = r.GetStyledTexts() }); got > 64<<20 {
+		t.Errorf("GetStyledTexts allocated %d MB", got>>20)
+	}
+	if err != nil || len(sentences) != 1 || len(sentences[0].S) != glyphs {
+		t.Errorf("got %d sentences, err %v; want one of %d glyphs", len(sentences), err, glyphs)
+	}
+}
