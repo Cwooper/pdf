@@ -99,6 +99,9 @@ type Reader struct {
 	trailerptr objptr
 	key        []byte
 	useAES     bool
+	// clearMetadata marks /EncryptMetadata false: metadata streams are
+	// stored unencrypted.
+	clearMetadata bool
 
 	// noObjStm marks a view that resolves nothing stored in an object
 	// stream; an object stream's header is read through one, so one stream's
@@ -1273,7 +1276,7 @@ func (v Value) Reader() io.ReadCloser {
 	}
 	var rd io.Reader
 	rd = io.NewSectionReader(v.r.f, x.offset, streamLen)
-	if v.r.key != nil {
+	if v.r.key != nil && !(v.r.clearMetadata && v.Key("Type").Name() == "Metadata") {
 		rd = decryptStream(v.r.key, v.r.useAES, x.ptr, rd)
 	}
 	rd = v.r.charge(rd)
@@ -1467,6 +1470,10 @@ func (r *Reader) initEncrypt(password string) error {
 	h.Write([]byte(O))
 	h.Write([]byte{byte(P), byte(P >> 8), byte(P >> 16), byte(P >> 24)})
 	h.Write([]byte(ID))
+	clearMetadata := R >= 4 && encrypt["EncryptMetadata"] == false
+	if clearMetadata {
+		h.Write([]byte{0xff, 0xff, 0xff, 0xff})
+	}
 	key := h.Sum(nil)
 
 	keyLen := int(n / 8) // encryption key length in bytes
@@ -1515,6 +1522,7 @@ func (r *Reader) initEncrypt(password string) error {
 
 	r.key = key
 	r.useAES = V == 4
+	r.clearMetadata = clearMetadata
 
 	return nil
 }
