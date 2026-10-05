@@ -1035,8 +1035,9 @@ func (c *readerCache) spend(n int64) error {
 	return nil
 }
 
-// spend charges the n bytes of an object parsed from the file against r's
-// decode budget, so that a large object many pages share costs each read.
+// spend charges n bytes against r's decode budget: those of an object parsed
+// from the file, so that a large object many pages share costs each read, or
+// the fixed cost of a /Contents entry.
 func (r *Reader) spend(n int64) {
 	if err := r.cache.spend(n); err != nil {
 		panic(err)

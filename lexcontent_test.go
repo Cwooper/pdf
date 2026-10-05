@@ -293,3 +293,51 @@ func TestInheritedResourcesUnparsed(t *testing.T) {
 func declaredPages(r *Reader) int {
 	return int(r.Trailer().Key("Root").Key("Pages").Key("Count").Int64())
 }
+
+// TestContentsArray verifies that a /Contents array is read stream by
+// stream: an entry that is not a stream is skipped rather than ending the
+// page, and each stream is opened only when the one before it ends.
+func TestContentsArray(t *testing.T) {
+	t.Run("gap", func(t *testing.T) {
+		r := openPDF(t, pagePDF("", "[5 0 R 6 0 R 99 0 R 7 0 R]", streamObj("BT (a) Tj ET"), "<< >>", streamObj("BT (b) Tj ET")))
+		var got string
+		mustNotCrash(t, func() { got = contentText(r.Page(1)) })
+		if got != "ab" {
+			t.Errorf("got %q, want %q", got, "ab")
+		}
+	})
+
+	t.Run("unreadable stream", func(t *testing.T) {
+		r := openPDF(t, pagePDF("", "[5 0 R 6 0 R]", streamObj("BT (a) Tj ET"), "<< /Length 1 /Filter /LZWDecode >>\nstream\nx\nendstream"))
+		mustPanic(t, "LZWDecode", func() { r.Page(1).Content() })
+	})
+
+	t.Run("opened in turn", func(t *testing.T) {
+		const n = 2000
+		contents := openPDF(t, pagePDF("", "["+strings.Repeat("5 0 R ", n)+"]", flateObj("BT (a) Tj ET"))).Page(1).V.Key("Contents")
+
+		var before, first runtime.MemStats
+		runtime.GC()
+		runtime.ReadMemStats(&before)
+		ops := 0
+		Interpret(contents, func(stk *Stack, op string) {
+			if ops++; ops == 1 {
+				runtime.ReadMemStats(&first)
+			}
+			popArgs(stk)
+		})
+		if ops != 3*n {
+			t.Errorf("read %d operators, want %d", ops, 3*n)
+		}
+		if got := first.HeapAlloc - before.HeapAlloc; got > 16<<20 {
+			t.Errorf("%d MB in use by the first operator", got>>20)
+		}
+	})
+
+	// Empty streams decode nothing, so only the entries count.
+	t.Run("entries charged", func(t *testing.T) {
+		const n = minDecodeBudget/contentsEntryCost + 1
+		r := openPDF(t, pagePDF("", "["+strings.Repeat("5 0 R ", n)+"]", streamObj("")))
+		mustPanic(t, "budget", func() { r.Page(1).Content() })
+	})
+}
