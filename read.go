@@ -1611,14 +1611,14 @@ func cryptKey(key []byte, useAES bool, ptr objptr) []byte {
 func decryptString(key []byte, useAES bool, ptr objptr, x string) string {
 	key = cryptKey(key, useAES, ptr)
 	if useAES {
-		s := []byte(x)
-		if len(s) < aes.BlockSize {
-			panic("Encrypted text shorter that AES block size")
+		// Anything shorter than an IV and one block holds no text.
+		if len(x) < 2*aes.BlockSize {
+			return ""
 		}
-
+		s := []byte(x)
 		block, _ := aes.NewCipher(key)
 		iv := s[:aes.BlockSize]
-		s = s[aes.BlockSize:]
+		s = s[aes.BlockSize : len(s)-len(s)%aes.BlockSize]
 
 		stream := cipher.NewCBCDecrypter(block, iv)
 		stream.CryptBlocks(s, s)
