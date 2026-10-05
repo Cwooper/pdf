@@ -505,6 +505,9 @@ func readXrefStreamData(r *Reader, strm stream, table *xrefTable, size int64) (*
 			case 0:
 				table.put(x, xref{ptr: objptr{0, 65535}})
 			case 1:
+				if v2 < 0 {
+					return nil, fmt.Errorf("negative offset in xref stream entry %d", x)
+				}
 				table.put(x, xref{ptr: objptr{uint32(x), uint16(v3)}, offset: int64(v2)})
 			case 2:
 				table.put(x, xref{ptr: objptr{uint32(x), 0}, inStream: true, stream: objptr{uint32(v2), 0}, offset: int64(v3)})
@@ -600,6 +603,9 @@ func readXrefTableData(b *buffer, table *xrefTable) (*xrefTable, error) {
 			alloc, ok3 := b.readToken().(keyword)
 			if !ok1 || !ok2 || !ok3 || alloc != keyword("f") && alloc != keyword("n") {
 				return nil, fmt.Errorf("malformed xref table")
+			}
+			if off < 0 {
+				return nil, fmt.Errorf("malformed xref table: negative offset %d", off)
 			}
 			x := int(start) + i
 			if table.n >= maxXrefEntries {
@@ -948,6 +954,9 @@ func (r *Reader) resolveAt(parent objptr, x interface{}, depth int) Value {
 				first := strm.Key("First").Int64()
 				if first == 0 {
 					panic("missing First")
+				}
+				if first < 0 {
+					panic(fmt.Errorf("malformed PDF: object stream /First %d", first))
 				}
 				b := newBuffer(strm.Reader(), 0)
 				b.allowEOF = true

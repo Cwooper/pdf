@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"fmt"
 	"io"
+	"runtime"
 	"strings"
 	"testing"
 )
@@ -337,4 +338,69 @@ func TestObjectStreamIndexJunk(t *testing.T) {
 			}
 		})
 	}
+}
+
+// noRuntimePanic fails if fn panics with a runtime error. Page and NumPage
+// report malformed input by panicking, so other panics are expected.
+func noRuntimePanic(t *testing.T, fn func()) {
+	t.Helper()
+	p, timedOut := run(t, fn)
+	if timedOut {
+		t.Errorf("did not return within %v", caseTimeout)
+	}
+	if _, ok := p.(runtime.Error); ok {
+		t.Errorf("runtime panic: %v", p)
+	}
+}
+
+// TestNegativeOffsets verifies that negative offsets in the xref table or in
+// an object stream, and an object stream entry that points back before the
+// window its index table has already read past, are reported as malformed
+// input rather than indexing a buffer out of range.
+func TestNegativeOffsets(t *testing.T) {
+	negXref := buildPDF(
+		"<< /Type /Catalog /Pages 2 0 R >>",
+		"<< /Type /Pages /Kids [] /Count 0 >>",
+	)
+	i := bytes.Index(negXref, []byte(" 65535 f \n")) + len(" 65535 f \n")
+	copy(negXref[i:], "-000000001")
+
+	tests := []struct {
+		name string
+		data []byte
+	}{
+		{"xref offset", negXref},
+		{"xref stream offset", xrefStreamPDF("/Size 2 /W [1 8 0] /Index [1 1] /Root 1 0 R", "\x01"+strings.Repeat("\xff", 8))},
+		{"object stream First", objStmPDFWith("/N 3 /First -100000")},
+		{"object stream seek back", buildObjStmPDF("/N 1103 /First 1", strings.Repeat("9 0 ", 1100), 0)},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			r, err := NewReader(bytes.NewReader(tt.data), int64(len(tt.data)))
+			if err != nil {
+				return
+			}
+			noRuntimePanic(t, func() { r.NumPage() })
+			noRuntimePanic(t, func() { r.Page(1) })
+		})
+	}
+}
+
+// buildPDF returns a file holding objs as objects 1, 2, ..., with object 1
+// as the catalog.
+func buildPDF(objs ...string) []byte {
+	var b bytes.Buffer
+	b.WriteString("%PDF-1.4\n")
+	offs := make([]int, len(objs))
+	for i, o := range objs {
+		offs[i] = b.Len()
+		fmt.Fprintf(&b, "%d 0 obj\n%s\nendobj\n", i+1, o)
+	}
+	xref := b.Len()
+	fmt.Fprintf(&b, "xref\n0 %d\n0000000000 65535 f \n", len(objs)+1)
+	for _, off := range offs {
+		fmt.Fprintf(&b, "%010d 00000 n \n", off)
+	}
+	fmt.Fprintf(&b, "trailer\n<< /Size %d /Root 1 0 R >>\nstartxref\n%d\n%%%%EOF\n", len(objs)+1, xref)
+	return b.Bytes()
 }

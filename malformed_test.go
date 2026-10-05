@@ -428,32 +428,13 @@ func TestCyclicReferences(t *testing.T) {
 // validPDF builds a small, well-formed PDF with one page of text.
 func validPDF() []byte {
 	const content = "BT /F1 24 Tf 100 700 Td (Hello World) Tj ET\n"
-
-	objs := []string{
+	return buildPDF(
 		"<< /Type /Catalog /Pages 2 0 R >>",
 		"<< /Type /Pages /Kids [3 0 R] /Count 1 >>",
 		"<< /Type /Page /Parent 2 0 R /Resources << /Font << /F1 4 0 R >> >> /Contents 5 0 R /MediaBox [0 0 612 792] >>",
 		"<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica /Encoding /WinAnsiEncoding >>",
 		fmt.Sprintf("<< /Length %d >>\nstream\n%sendstream", len(content), content),
-	}
-
-	var b strings.Builder
-	b.WriteString("%PDF-1.4\n")
-	offsets := make([]int, len(objs))
-	for i, body := range objs {
-		offsets[i] = b.Len()
-		fmt.Fprintf(&b, "%d 0 obj\n%s\nendobj\n", i+1, body)
-	}
-
-	xrefOff := b.Len()
-	fmt.Fprintf(&b, "xref\n0 %d\n", len(objs)+1)
-	b.WriteString("0000000000 65535 f \n")
-	for _, off := range offsets {
-		fmt.Fprintf(&b, "%010d 00000 n \n", off)
-	}
-	fmt.Fprintf(&b, "trailer\n<< /Size %d /Root 1 0 R >>\n", len(objs)+1)
-	fmt.Fprintf(&b, "startxref\n%d\n%%%%EOF\n", xrefOff)
-	return []byte(b.String())
+	)
 }
 
 // TestValidPDFStillParses guards against the bounds checks rejecting

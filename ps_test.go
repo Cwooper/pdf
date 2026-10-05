@@ -83,36 +83,13 @@ func textY(t *testing.T, pdfData []byte, word string) float64 {
 }
 
 func contentStreamsPDF(streams []string) []byte {
-	var pdf bytes.Buffer
-	pdf.WriteString("%PDF-1.4\n")
-	numObjects := 4 + len(streams)
-	offsets := make([]int, numObjects+1)
-	writeObject := func(number int, body string) {
-		offsets[number] = pdf.Len()
-		fmt.Fprintf(&pdf, "%d 0 obj\n%s\nendobj\n", number, body)
-	}
-
-	contents := ""
-	for i := range streams {
-		if i > 0 {
-			contents += " "
-		}
-		contents += fmt.Sprintf("%d 0 R", 4+i)
-	}
-
-	writeObject(1, "<< /Type /Catalog /Pages 2 0 R >>")
-	writeObject(2, "<< /Type /Pages /Kids [3 0 R] /Count 1 >>")
-	writeObject(3, fmt.Sprintf("<< /Type /Page /Parent 2 0 R /MediaBox [0 0 200 200] /Resources << /Font << /F1 %d 0 R >> >> /Contents [%s] >>", numObjects, contents))
+	objs := []string{"<< /Type /Catalog /Pages 2 0 R >>", "<< /Type /Pages /Kids [3 0 R] /Count 1 >>", ""}
+	var contents []string
 	for i, content := range streams {
-		writeObject(4+i, fmt.Sprintf("<< /Length %d >>\nstream\n%s\nendstream", len(content), content))
+		contents = append(contents, fmt.Sprintf("%d 0 R", 4+i))
+		objs = append(objs, fmt.Sprintf("<< /Length %d >>\nstream\n%s\nendstream", len(content), content))
 	}
-	writeObject(numObjects, "<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>")
-
-	xrefOffset := pdf.Len()
-	fmt.Fprintf(&pdf, "xref\n0 %d\n0000000000 65535 f \n", numObjects+1)
-	for number := 1; number <= numObjects; number++ {
-		fmt.Fprintf(&pdf, "%010d 00000 n \n", offsets[number])
-	}
-	fmt.Fprintf(&pdf, "trailer\n<< /Size %d /Root 1 0 R >>\nstartxref\n%d\n%%%%EOF\n", numObjects+1, xrefOffset)
-	return pdf.Bytes()
+	objs[2] = fmt.Sprintf("<< /Type /Page /Parent 2 0 R /MediaBox [0 0 200 200] /Resources << /Font << /F1 %d 0 R >> >> /Contents [%s] >>",
+		len(objs)+1, strings.Join(contents, " "))
+	return buildPDF(append(objs, "<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>")...)
 }
