@@ -5,6 +5,7 @@
 package pdf
 
 import (
+	"fmt"
 	"io"
 	"runtime"
 	"strings"
@@ -14,6 +15,12 @@ import (
 // page's content streams or a cmap. Flate expands about 1000:1, so a small
 // file could otherwise feed the lexer gigabytes.
 const maxInterpretBytes = 64 << 20
+
+// maxOperands bounds the operand stack in Interpret. Each operand is a
+// 32-byte Value, so operands never consumed by an operator, from a few
+// kilobytes of Flate, otherwise held gigabytes. A cmap block mapping all
+// 65536 glyphs at once needs 131072.
+const maxOperands = 1 << 18
 
 // A Stack represents a stack of values.
 type Stack struct {
@@ -83,6 +90,9 @@ func Interpret(strm Value, do func(stk *Stack, op string)) {
 
 Reading:
 	for {
+		if stk.Len() > maxOperands {
+			panic(fmt.Errorf("more than %d operands", maxOperands))
+		}
 		tok := b.readToken()
 		if tok == io.EOF {
 			break
