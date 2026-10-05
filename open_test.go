@@ -87,14 +87,19 @@ func TestNewReaderEncryptedStopsOnEmptyPassword(t *testing.T) {
 
 func TestEnsureXrefLen(t *testing.T) {
 	var table []xref
-	table = ensureXrefLen(table, 3)
+	table = ensureXrefLen(table, 3, 8)
 	if len(table) != 4 || cap(table) < 4 {
 		t.Fatalf("len/cap = %d/%d, want len 4", len(table), cap(table))
 	}
 	table[3] = xref{ptr: objptr{id: 3}}
 	// Already-large-enough table is returned unchanged.
-	table2 := ensureXrefLen(table, 1)
+	table2 := ensureXrefLen(table, 1, 8)
 	if len(table2) != len(table) || table2[3].ptr.id != 3 {
 		t.Fatal("ensureXrefLen mutated an already-sufficient table")
+	}
+	// Doubling would pass the limit, so growth stops at it.
+	table3 := ensureXrefLen(make([]xref, 4), 4, 6)
+	if len(table3) != 5 || cap(table3) != 6 {
+		t.Fatalf("len/cap = %d/%d, want 5/6", len(table3), cap(table3))
 	}
 }
