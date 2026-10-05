@@ -1006,6 +1006,7 @@ type readerCache struct {
 	mu      sync.Mutex
 	objStms map[objptr]*cached[*objStm]
 	cmaps   map[objptr]*cached[*cmap]
+	cids    map[objptr]*cached[*cidMetrics]
 	pages   cached[[]pageEntry]
 	// indexed counts the entries every decoded object stream's index has
 	// added, against maxXrefEntries.
