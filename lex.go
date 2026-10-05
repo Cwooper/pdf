@@ -51,6 +51,7 @@ type buffer struct {
 	eof         bool
 	key         []byte
 	useAES      bool
+	decrypter   stringDecrypter
 	objptr      objptr
 	depth       int  // current object nesting depth
 	entries     int  // array and dict entries read, against maxOperands
@@ -489,7 +490,7 @@ func (b *buffer) readObject() object {
 	}
 
 	if str, ok := tok.(string); ok && b.key != nil && b.objptr.id != 0 {
-		tok = decryptString(b.key, b.useAES, b.objptr, str)
+		tok = b.decrypter.decrypt(b.key, b.useAES, b.objptr, str)
 	}
 
 	if !b.allowObjptr {

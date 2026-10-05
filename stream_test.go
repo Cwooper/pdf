@@ -97,12 +97,12 @@ func TestDecryptStringRC4RoundTrip(t *testing.T) {
 	plaintext := "hello, encrypted world"
 
 	// RC4 is a stream cipher; applying the same keystream twice recovers the
-	// plaintext, so decryptString is its own inverse here.
-	enc := decryptString(key, false, ptr, plaintext)
+	// plaintext, so decrypt is its own inverse here.
+	enc := new(stringDecrypter).decrypt(key, false, ptr, plaintext)
 	if enc == plaintext {
 		t.Fatal("RC4 pass did not transform the plaintext")
 	}
-	if got := decryptString(key, false, ptr, enc); got != plaintext {
+	if got := new(stringDecrypter).decrypt(key, false, ptr, enc); got != plaintext {
 		t.Fatalf("round trip = %q, want %q", got, plaintext)
 	}
 }
@@ -122,7 +122,7 @@ func TestDecryptStringAESRoundTrip(t *testing.T) {
 	cipher.NewCBCEncrypter(block, iv).CryptBlocks(ct, plaintext)
 
 	sealed := string(append(append([]byte{}, iv...), ct...))
-	if got := decryptString(key, true, ptr, sealed); got != string(plaintext) {
+	if got := new(stringDecrypter).decrypt(key, true, ptr, sealed); got != string(plaintext) {
 		t.Fatalf("round trip = %q, want %q", got, plaintext)
 	}
 }
