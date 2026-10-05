@@ -51,8 +51,8 @@ package pdf
 // BUG(rsc): There is no support for closing open PDF files. If you drop all references to a Reader,
 // the underlying reader will eventually be garbage collected.
 
-// BUG(rsc): The library makes no attempt at efficiency. A value cache maintained in the Reader
-// would probably help significantly.
+// BUG(rsc): Apart from the object streams a Reader decodes, which it keeps, the library
+// makes no attempt at efficiency. A value cache maintained in the Reader would probably help.
 
 // BUG(rsc): The support for reading encrypted files is weak.
 
@@ -61,6 +61,7 @@ package pdf
 
 import (
 	"bytes"
+	"cmp"
 	"compress/zlib"
 	"crypto/aes"
 	"crypto/cipher"
@@ -72,8 +73,11 @@ import (
 	"io"
 	"math"
 	"os"
+	"runtime"
 	"sort"
 	"strconv"
+	"sync"
+	"sync/atomic"
 )
 
 // DebugOn is responsible for logging messages into stdout. If problems arise during reading, set it true.
@@ -95,6 +99,8 @@ type Reader struct {
 	// is left unsupported, since a reference from one stream's header into
 	// another made each level of nesting double the work.
 	noObjStm bool
+
+	cache *readerCache
 }
 
 type xref struct {
@@ -308,8 +314,9 @@ func NewReaderEncrypted(f io.ReaderAt, size int64, pw func() string) (r *Reader,
 	}
 
 	r = &Reader{
-		f:   f,
-		end: end,
+		f:     f,
+		end:   end,
+		cache: new(readerCache),
 	}
 	pos := end - chunk + int64(i)
 	b := newBuffer(io.NewSectionReader(f, pos, end-pos), pos)
@@ -972,10 +979,6 @@ func (r *Reader) resolve(parent objptr, x interface{}) Value {
 // an object stream's own header (/N, /First, /Length, /Extends) is read
 // through Key, and a reference there back into the stream would otherwise
 // restart the count at zero and recurse until the stack is gone.
-//
-// The index table of an object stream declares /N pairs, but /N is a claim
-// rather than a measurement: the end of the stream ends the scan, and a pair
-// the file got wrong is skipped so that the ones after it still resolve.
 func (r *Reader) resolveAt(parent objptr, x interface{}, depth int) Value {
 	if ptr, ok := x.(objptr); ok {
 		xref := r.xref.get(ptr.id)
@@ -995,55 +998,7 @@ func (r *Reader) resolveAt(parent objptr, x interface{}, depth int) Value {
 			if r.noObjStm {
 				return Value{}
 			}
-			view := *r
-			view.noObjStm = true
-			strm := view.resolveAt(parent, xref.stream, depth+1)
-			extends := 0
-		Search:
-			for {
-				// /Extends is an object reference and can point back into the
-				// chain, so cap its length rather than following it forever.
-				if extends++; extends > maxObjStmExtends {
-					panic("object stream /Extends chain too long")
-				}
-				if strm.Kind() != Stream {
-					panic("not a stream")
-				}
-				if strm.Key("Type").Name() != "ObjStm" {
-					panic("not an object stream")
-				}
-				n := int(strm.Key("N").Int64())
-				first := strm.Key("First").Int64()
-				if first == 0 {
-					panic("missing First")
-				}
-				if first < 0 {
-					panic(fmt.Errorf("malformed PDF: object stream /First %d", first))
-				}
-				b := newBuffer(newLimitedReader(strm.Reader(), maxObjStmBytes), 0)
-				b.allowEOF = true
-				for i := 0; i < n; i++ {
-					tok1, tok2 := b.readToken(), b.readToken()
-					if tok1 == io.EOF || tok2 == io.EOF {
-						break
-					}
-					id, ok1 := tok1.(int64)
-					off, ok2 := tok2.(int64)
-					if !ok1 || !ok2 || off < 0 {
-						continue
-					}
-					if id == int64(ptr.id) {
-						b.seekForward(first + off)
-						x = b.readObject()
-						break Search
-					}
-				}
-				ext := strm.Key("Extends")
-				if ext.Kind() != Stream {
-					panic("cannot find object in stream")
-				}
-				strm = ext
-			}
+			x = r.objectInStream(ptr, xref.stream)
 		} else {
 			b := newBuffer(io.NewSectionReader(r.f, xref.offset, r.end-xref.offset), xref.offset)
 			b.key = r.key
@@ -1069,6 +1024,177 @@ func (r *Reader) resolveAt(parent objptr, x interface{}, depth int) Value {
 		return Value{r, parent, x, depth}
 	default:
 		panic(fmt.Errorf("unexpected value type %T in resolve", x))
+	}
+}
+
+// A readerCache holds what a Reader decodes once and reuses. A Reader and
+// the views made of it share one.
+type readerCache struct {
+	mu      sync.Mutex
+	objStms map[objptr]*cached[*objStm]
+	// indexed counts the entries every decoded object stream's index has
+	// added, against maxXrefEntries.
+	indexed atomic.Int64
+}
+
+// A cached value is loaded once, by whichever caller asks first. A panic
+// raised loading it is kept and raised again for every caller.
+type cached[T any] struct {
+	once sync.Once
+	v    T
+	err  any
+}
+
+// cacheEntry returns the entry for key in *m, adding an empty one if there is
+// none.
+func cacheEntry[T any](c *readerCache, m *map[objptr]*cached[T], key objptr) *cached[T] {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	e := (*m)[key]
+	if e == nil {
+		if *m == nil {
+			*m = make(map[objptr]*cached[T])
+		}
+		e = new(cached[T])
+		(*m)[key] = e
+	}
+	return e
+}
+
+func (e *cached[T]) get(load func() T) T {
+	e.once.Do(func() {
+		defer func() { e.err = recover() }()
+		e.v = load()
+	})
+	if e.err != nil {
+		panic(e.err)
+	}
+	return e.v
+}
+
+// An objStm is a decoded object stream.
+type objStm struct {
+	data    []byte
+	offs    map[uint32]int // object number to offset in data
+	extends objptr
+	// readErr ended the read early, and scanErr the index scan; an object
+	// either cut off reports it.
+	readErr, scanErr error
+}
+
+// objStm returns the decoded object stream ptr, decoding it on first use.
+func (r *Reader) objStm(ptr objptr) *objStm {
+	load := func() *objStm { return r.loadObjStm(ptr) }
+	if r.cache == nil {
+		return load()
+	}
+	return cacheEntry(r.cache, &r.cache.objStms, ptr).get(load)
+}
+
+// loadObjStm decodes object stream ptr and indexes the objects it holds.
+//
+// The index table declares /N pairs, but /N is a claim rather than a
+// measurement: the end of the table ends the scan, and a pair the file got
+// wrong is skipped so that the ones after it still resolve.
+func (r *Reader) loadObjStm(ptr objptr) *objStm {
+	view := *r
+	view.noObjStm = true
+	strm := view.resolve(objptr{}, ptr)
+	if strm.Kind() != Stream {
+		panic("not a stream")
+	}
+	if strm.Key("Type").Name() != "ObjStm" {
+		panic("not an object stream")
+	}
+	n := strm.Key("N").Int64()
+	first := strm.Key("First").Int64()
+	if first == 0 {
+		panic("missing First")
+	}
+	if first < 0 {
+		panic(fmt.Errorf("malformed PDF: object stream /First %d", first))
+	}
+	s := &objStm{offs: make(map[uint32]int)}
+	if ext := strm.Key("Extends"); ext.Kind() == Stream {
+		s.extends = ext.ptr
+	}
+	s.data, s.readErr = io.ReadAll(newLimitedReader(strm.Reader(), maxObjStmBytes))
+	s.index(r, n, first)
+	return s
+}
+
+// index records where each object listed in the first n pairs of the
+// stream's index table begins.
+func (s *objStm) index(r *Reader, n, first int64) {
+	defer func() {
+		if x := recover(); x != nil {
+			if _, ok := x.(runtime.Error); ok {
+				panic(x)
+			}
+			s.scanErr = fmt.Errorf("%v", x)
+		}
+	}()
+	b := newBuffer(bytes.NewReader(s.data), 0)
+	b.allowEOF = true
+	for i := int64(0); i < n && b.readOffset() < first; i++ {
+		tok1, tok2 := b.readToken(), b.readToken()
+		if tok1 == io.EOF || tok2 == io.EOF {
+			break
+		}
+		id, ok1 := tok1.(int64)
+		off, ok2 := tok2.(int64)
+		if !ok1 || !ok2 || off < 0 || int64(uint32(id)) != id {
+			continue
+		}
+		// Only numbers the xref places in a stream are ever looked up here,
+		// though one it places in another stream may be, through /Extends.
+		if _, ok := s.offs[uint32(id)]; ok || !r.xref.get(uint32(id)).inStream {
+			continue
+		}
+		if r.cache != nil && r.cache.indexed.Add(1) > maxXrefEntries {
+			panic(fmt.Errorf("object streams index more than %d objects", maxXrefEntries))
+		}
+		pos := int64(len(s.data))
+		if first < pos && off < pos {
+			pos = min(first+off, pos)
+		}
+		s.offs[uint32(id)] = int(pos)
+	}
+}
+
+// objectInStream reads object ptr out of object stream strm, or a stream
+// that strm extends.
+func (r *Reader) objectInStream(ptr objptr, strm objptr) object {
+	for extends := 0; ; extends++ {
+		// /Extends is an object reference and can point back into the
+		// chain, so cap its length rather than following it forever.
+		if extends >= maxObjStmExtends {
+			panic("object stream /Extends chain too long")
+		}
+		s := r.objStm(strm)
+		off, ok := s.offs[ptr.id]
+		if ok && off >= len(s.data) {
+			if s.readErr != nil {
+				panic(s.readErr)
+			}
+			panic(fmt.Errorf("object %d lies past the end of its object stream", ptr.id))
+		}
+		if ok {
+			var rd io.Reader = bytes.NewReader(s.data[off:])
+			if s.readErr != nil {
+				rd = io.MultiReader(rd, &errorReadCloser{s.readErr})
+			}
+			b := newBuffer(rd, int64(off))
+			b.allowEOF = true
+			return b.readObject()
+		}
+		if err := cmp.Or(s.readErr, s.scanErr); err != nil {
+			panic(err)
+		}
+		if s.extends == (objptr{}) {
+			panic("cannot find object in stream")
+		}
+		strm = s.extends
 	}
 }
 

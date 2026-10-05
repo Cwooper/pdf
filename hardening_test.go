@@ -583,12 +583,14 @@ func TestObjectStreamByteCap(t *testing.T) {
 }
 
 // A testObj is an object for xrefStreamFile: a body, or the members of an
-// object stream whose header is hdr with FIRST and NUM filled in.
+// object stream whose header is hdr with FIRST and NUM filled in, or with in
+// set, an entry alone placing the object in object stream in.
 type testObj struct {
 	num     int
 	body    string
 	hdr     string
 	members []testObj
+	in      int
 }
 
 // objStmLayout returns the decoded data of an object stream holding members
@@ -610,8 +612,12 @@ func xrefStreamFile(objs ...testObj) []byte {
 	rows := map[int][3]int{0: {0, 0, 65535}}
 	size := 0
 	for _, o := range objs {
-		rows[o.num] = [3]int{1, b.Len(), 0}
 		size = max(size, o.num+1)
+		if o.in != 0 {
+			rows[o.num] = [3]int{2, o.in, 0}
+			continue
+		}
+		rows[o.num] = [3]int{1, b.Len(), 0}
 		if o.members == nil {
 			fmt.Fprintf(&b, "%d 0 obj\n%s\nendobj\n", o.num, o.body)
 			continue
@@ -676,5 +682,98 @@ func TestObjectStreamHeaderFanout(t *testing.T) {
 	runtime.ReadMemStats(&after)
 	if got := after.TotalAlloc - before.TotalAlloc; got > 8<<20 {
 		t.Errorf("NumPage on a %d-byte file allocated %d MB", len(data), got>>20)
+	}
+}
+
+// TestObjectStreamIndexCap verifies that object streams may index exactly
+// maxXrefEntries objects between them, and not one more.
+func TestObjectStreamIndexCap(t *testing.T) {
+	data := xrefStreamFile(testObj{num: 2, hdr: "/N NUM /First FIRST", members: []testObj{
+		{num: 3, body: "null"},
+		{num: 1, body: "<< /Type /Catalog /Pages << /Type /Pages /Kids [] /Count 7 >> >>"},
+	}})
+	for _, tt := range []struct {
+		before int64
+		ok     bool
+	}{{maxXrefEntries - 2, true}, {maxXrefEntries - 1, false}} {
+		r, err := NewReader(bytes.NewReader(data), int64(len(data)))
+		if err != nil {
+			t.Fatal(err)
+		}
+		r.cache.indexed.Store(tt.before)
+		got := 0
+		p, _ := run(t, func() { got = r.NumPage() })
+		if tt.ok && (p != nil || got != 7) {
+			t.Errorf("%d indexed before: NumPage = %d, panic %v; want 7", tt.before, got, p)
+		}
+		if !tt.ok && !strings.Contains(fmt.Sprint(p), "index more than") {
+			t.Errorf("%d indexed before: got panic %v, want the index cap reported", tt.before, p)
+		}
+	}
+}
+
+// TestObjectStreamExtendsCap verifies that an object found maxObjStmExtends
+// streams down an /Extends chain resolves, and one a stream further does not.
+func TestObjectStreamExtendsCap(t *testing.T) {
+	const catalog = "<< /Type /Catalog /Pages << /Type /Pages /Kids [] /Count 7 >> >>"
+	for _, n := range []int{maxObjStmExtends, maxObjStmExtends + 1} {
+		var objs []testObj
+		for i := range n {
+			hdr, member := "/N NUM /First FIRST", testObj{num: 1, body: catalog}
+			if i < n-1 {
+				hdr += fmt.Sprintf(" /Extends %d 0 R", 101+i)
+				member = testObj{num: 200 + i, body: "null"}
+			}
+			objs = append(objs, testObj{num: 100 + i, hdr: hdr, members: []testObj{member}})
+		}
+		data := xrefStreamFile(append(objs, testObj{num: 1, in: 100})...)
+		r, err := NewReader(bytes.NewReader(data), int64(len(data)))
+		if err != nil {
+			t.Fatal(err)
+		}
+		got := 0
+		p, _ := run(t, func() { got = r.NumPage() })
+		if n == maxObjStmExtends && (p != nil || got != 7) {
+			t.Errorf("chain of %d: NumPage = %d, panic %v; want 7", n, got, p)
+		}
+		if n > maxObjStmExtends && !strings.Contains(fmt.Sprint(p), "too long") {
+			t.Errorf("chain of %d: got panic %v, want the chain cap reported", n, p)
+		}
+	}
+}
+
+// TestObjectStreamDecodedOnce verifies that resolving many objects from one
+// object stream decodes it once, not once per object: a 23-page paper took
+// 3.8 seconds re-inflating its streams.
+func TestObjectStreamDecodedOnce(t *testing.T) {
+	const pages = 1000
+	members := []testObj{
+		{num: 3, body: "(" + strings.Repeat("x", 1<<20) + ")"},
+		{num: 1, body: "<< /Type /Catalog /Pages 2 0 R >>"},
+	}
+	var kids strings.Builder
+	for i := range pages {
+		fmt.Fprintf(&kids, "%d 0 R ", 10+i)
+		members = append(members, testObj{num: 10 + i, body: "<< /Type /Page /Parent 2 0 R >>"})
+	}
+	members = append(members, testObj{num: 2, body: fmt.Sprintf("<< /Type /Pages /Kids [%s] /Count %d >>", kids.String(), pages)})
+	data := xrefStreamFile(testObj{num: 5, hdr: "/N NUM /First FIRST", members: members})
+
+	r, err := NewReader(bytes.NewReader(data), int64(len(data)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var before, after runtime.MemStats
+	runtime.GC()
+	runtime.ReadMemStats(&before)
+	kidsV := r.Trailer().Key("Root").Key("Pages").Key("Kids")
+	for i := range kidsV.Len() {
+		if got := kidsV.Index(i).Key("Type").Name(); got != "Page" {
+			t.Fatalf("kid %d has /Type %q, want Page", i, got)
+		}
+	}
+	runtime.ReadMemStats(&after)
+	if got := after.TotalAlloc - before.TotalAlloc; got > 16<<20 {
+		t.Errorf("resolving %d objects from one stream allocated %d MB", pages, got>>20)
 	}
 }
