@@ -131,3 +131,19 @@ func TestMalformedTokenKeepsPage(t *testing.T) {
 		})
 	}
 }
+
+// TestInlineImageSkipped verifies that an inline image's binary data is
+// skipped rather than lexed: an unbalanced "(" in it opened a string that
+// swallowed the rest of the page.
+func TestInlineImageSkipped(t *testing.T) {
+	for _, data := range []string{"(\x80", " (EI\x80", "\nEIx("} {
+		t.Run(fmt.Sprintf("%q", data), func(t *testing.T) {
+			content := "BT (a) Tj ET q BI /W 2 /H 1 /BPC 8 /CS /G ID " + data + "\nEI Q BT (b) Tj ET"
+			var got string
+			mustNotCrash(t, func() { got = contentText(pageWithContent(content)) })
+			if got != "ab" {
+				t.Errorf("got %q, want %q", got, "ab")
+			}
+		})
+	}
+}

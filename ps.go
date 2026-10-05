@@ -186,6 +186,10 @@ Reading:
 			case "pop":
 				stk.Pop()
 				continue
+			case "ID":
+				do(&stk, string(kw))
+				b.skipInlineImage()
+				continue
 			}
 		}
 		b.unreadToken(tok)
