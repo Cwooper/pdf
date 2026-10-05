@@ -254,3 +254,24 @@ func TestRC4ObjectKeyLength(t *testing.T) {
 		t.Run(fmt.Sprint(s.bits), func(t *testing.T) { checkDecrypts(t, s) })
 	}
 }
+
+// TestAESShortStrings verifies that an AES string too short to hold an IV
+// and a block, or with a partial block at its end, decrypts to what whole
+// blocks it has instead of panicking out of Page.
+func TestAESShortStrings(t *testing.T) {
+	junk := []string{"", "abc", strings.Repeat("a", 16), strings.Repeat("a", 31), strings.Repeat("a", 33)}
+	extra := "/Junk ["
+	for _, j := range junk {
+		extra += fmt.Sprintf("<%x> ", j)
+	}
+	data := encryptedPDF(cryptSpec{V: 4, R: 4, bits: 128}, "BT (Hello world) Tj ET", "", extra+"]")
+	r := openPDF(t, data)
+	mustNotCrash(t, func() {
+		if got := r.Page(1).V.Key("Junk"); got.Len() != len(junk) || got.Index(3).RawString() != "" || len(got.Index(4).RawString()) > 16 {
+			t.Errorf("Junk = %v, want %d strings, the fourth empty and the last at most one block", got, len(junk))
+		}
+		if got, err := r.Page(1).GetPlainText(nil); err != nil || !strings.Contains(got, "Hello world") {
+			t.Errorf("GetPlainText = %q, %v; want %q", got, err, "Hello world")
+		}
+	})
+}
