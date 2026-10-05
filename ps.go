@@ -5,10 +5,16 @@
 package pdf
 
 import (
+	"fmt"
 	"io"
 	"runtime"
 	"strings"
 )
+
+// maxInterpretBytes bounds the decoded bytes one Interpret call reads: a
+// page's content streams or a cmap. Flate expands about 1000:1, so a small
+// file could otherwise feed the lexer gigabytes.
+const maxInterpretBytes = 64 << 20
 
 // A Stack represents a stack of values.
 type Stack struct {
@@ -71,7 +77,7 @@ func Interpret(strm Value, do func(stk *Stack, op string)) {
 		rd = strm.Reader()
 	}
 
-	b := newBuffer(rd, 0)
+	b := newBuffer(&limitedReader{rd, maxInterpretBytes}, 0)
 	b.allowEOF = true
 	b.allowObjptr = false
 	b.allowStream = false
@@ -182,4 +188,20 @@ func readObjectRecover(b *buffer) (obj object, ok bool) {
 		}
 	}()
 	return b.readObject(), true
+}
+
+// A limitedReader fails once more than n bytes have been read from r, where
+// io.LimitReader would end quietly and truncated content would read as a
+// shorter page.
+type limitedReader struct {
+	r io.Reader
+	n int64
+}
+
+func (l *limitedReader) Read(p []byte) (int, error) {
+	n, err := l.r.Read(p)
+	if l.n -= int64(n); l.n < 0 {
+		return 0, fmt.Errorf("stream exceeds %d bytes", maxInterpretBytes)
+	}
+	return n, err
 }

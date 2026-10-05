@@ -6,6 +6,7 @@ package pdf
 
 import (
 	"bytes"
+	"compress/zlib"
 	"fmt"
 	"io"
 	"runtime"
@@ -475,4 +476,38 @@ func TestFontLookupOncePerPage(t *testing.T) {
 			}
 		})
 	})
+}
+
+// flatePage returns a one-page file whose content stream is unit repeated n
+// times, Flate-compressed.
+func flatePage(unit string, n int) []byte {
+	var z bytes.Buffer
+	w := zlib.NewWriter(&z)
+	chunk := []byte(strings.Repeat(unit, 1<<16/len(unit)))
+	for n > 0 {
+		k := min(n, len(chunk)/len(unit))
+		w.Write(chunk[:k*len(unit)])
+		n -= k
+	}
+	w.Close()
+	return buildPDF(
+		"<< /Type /Catalog /Pages 2 0 R >>",
+		"<< /Type /Pages /Kids [3 0 R] /Count 1 >>",
+		"<< /Type /Page /Parent 2 0 R /Contents 4 0 R >>",
+		fmt.Sprintf("<< /Length %d /Filter /FlateDecode >>\nstream\n%s\nendstream", z.Len(), z.String()),
+	)
+}
+
+// TestInterpretByteCap verifies that content inflating past maxInterpretBytes
+// is reported rather than read to the end: a few kilobytes of Flate can
+// expand to gigabytes.
+func TestInterpretByteCap(t *testing.T) {
+	data := flatePage(" ", maxInterpretBytes+1)
+	r, err := NewReader(bytes.NewReader(data), int64(len(data)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := r.Page(1).GetPlainText(nil); err == nil || !strings.Contains(err.Error(), "exceeds") {
+		t.Errorf("GetPlainText: got %v, want the size cap reported", err)
+	}
 }
