@@ -2,6 +2,7 @@ package pdf
 
 import (
 	"bytes"
+	"encoding/hex"
 	"fmt"
 	"strings"
 	"testing"
@@ -51,5 +52,22 @@ func TestFlateIgnoresAdler32(t *testing.T) {
 	}
 	if _, err := plainText(t, streamPage("/Filter /FlateDecode", z[:len(z)-6])); err == nil {
 		t.Error("truncated deflate data: got no error")
+	}
+}
+
+// withEncrypt returns data, a file from buildPDF, with encrypt as its
+// trailer's /Encrypt entry.
+func withEncrypt(data []byte, encrypt string) []byte {
+	return bytes.Replace(data, []byte("/Root 1 0 R >>"), []byte("/Root 1 0 R /Encrypt "+encrypt+" /ID [<"+hex.EncodeToString([]byte(testID))+"> <>] >>"), 1)
+}
+
+const testID = "0123456789abcdef"
+
+// TestAES256Unsupported verifies that AES-256 files are reported as
+// unsupported rather than malformed.
+func TestAES256Unsupported(t *testing.T) {
+	data := withEncrypt(buildPDF("<< /Type /Catalog >>"), "<< /Filter /Standard /V 5 /R 6 /Length 256 /CF << /StdCF << /CFM /AESV3 /Length 32 >> >> /StmF /StdCF /StrF /StdCF >>")
+	if err := openBytes(data); err == nil || !strings.HasPrefix(err.Error(), "unsupported") {
+		t.Errorf("got %v, want AES-256 reported as unsupported", err)
 	}
 }
