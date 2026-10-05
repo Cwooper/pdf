@@ -103,6 +103,7 @@ type cryptSpec struct {
 	V, R, bits int    // AESV2 when V is 4, else RC4
 	cfLength   string // the crypt filter's /Length, if any
 	noMetadata bool   // /EncryptMetadata false, with a metadata stream
+	slop       int    // bytes after the content stream's data, in its /Length
 }
 
 // fileKey derives the file key (Algorithm 2).
@@ -176,7 +177,7 @@ func (s cryptSpec) encrypt(key []byte, id int, data []byte) []byte {
 func encryptedPDF(s cryptSpec, content, title, pageExtra string) []byte {
 	O := strings.Repeat("O", 32)
 	key := s.fileKey(O)
-	strm := s.encrypt(key, 4, []byte(content))
+	strm := append(s.encrypt(key, 4, []byte(content)), strings.Repeat(" ", s.slop)...)
 	enc := fmt.Sprintf("<< /Filter /Standard /V %d /R %d /Length %d /O <%x> /U <%x> /P -4", s.V, s.R, s.bits, O, s.userEntry(key))
 	if s.V == 4 {
 		cfLength := ""
@@ -308,4 +309,24 @@ func TestAESShortStrings(t *testing.T) {
 			t.Errorf("GetPlainText = %q, %v; want %q", got, err, "Hello world")
 		}
 	})
+}
+
+// TestAESStreamEnd verifies that an AES stream loses its padding and ends at
+// a partial final block, as /Length running a few bytes past the data has
+// it, rather than failing there.
+func TestAESStreamEnd(t *testing.T) {
+	for _, n := range []int{0, 15, 16, 4000, 4080, 4096, 10000} {
+		for _, slop := range []int{0, 3} {
+			content := strings.Repeat("x", n)
+			data := encryptedPDF(cryptSpec{V: 4, R: 4, bits: 128, slop: slop}, content, "", "")
+			r, err := NewReader(bytes.NewReader(data), int64(len(data)))
+			if err != nil {
+				t.Fatal(err)
+			}
+			got, err := io.ReadAll(r.Page(1).V.Key("Contents").Reader())
+			if err != nil || string(got) != content {
+				t.Errorf("%d bytes, %d of slop: read %d bytes, %v; want the %d of content", n, slop, len(got), err, n)
+			}
+		}
+	}
 }
