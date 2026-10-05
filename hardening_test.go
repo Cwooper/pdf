@@ -1144,3 +1144,59 @@ func TestCmapParsedOncePerReader(t *testing.T) {
 	}
 	wg.Wait()
 }
+
+// TestFontWidthsByteCodes verifies that a font's /Widths are resolved only
+// as far as byte codes reach: a /LastChar of 800000 over as many indirect
+// entries cost every page 3.3 GB.
+func TestFontWidthsByteCodes(t *testing.T) {
+	const entries = 100000
+	data := buildPDF(
+		"<< /Type /Catalog /Pages 2 0 R >>",
+		"<< /Type /Pages /Kids [3 0 R] /Count 1 >>",
+		"<< /Type /Page /Parent 2 0 R /Contents 4 0 R /Resources << /Font << /F1 5 0 R >> >> >>",
+		streamObj("BT /F1 12 Tf (a\377) Tj ET"),
+		fmt.Sprintf("<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica /FirstChar 0 /LastChar %d /Widths 6 0 R >>", entries-1),
+		"["+strings.Repeat("7 0 R ", entries)+"]",
+		"500",
+	)
+	r, err := NewReader(bytes.NewReader(data), int64(len(data)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	p := r.Page(1)
+	var text []Text
+	if got := allocated(func() { text = p.Content().Text }); got > 16<<20 {
+		t.Errorf("Content allocated %d MB", got>>20)
+	}
+	if len(text) != 2 || text[0].W != 6 || text[1].W != 6 {
+		t.Errorf("got %+v, want two glyphs of width 6", text)
+	}
+}
+
+// TestFontMetricsResolvedOnce verifies that Page.Content resolves a font's
+// /Widths and the entries around it once, not once per glyph: Word-style
+// files keep /Widths in an indirect object, which each glyph parsed again.
+func TestFontMetricsResolvedOnce(t *testing.T) {
+	const glyphs = 20000
+	data := buildPDF(
+		"<< /Type /Catalog /Pages 2 0 R >>",
+		"<< /Type /Pages /Kids [3 0 R] /Count 1 >>",
+		"<< /Type /Page /Parent 2 0 R /Contents 4 0 R /Resources << /Font << /F1 5 0 R >> >> >>",
+		streamObj("BT /F1 12 Tf ("+strings.Repeat("a", glyphs)+") Tj ET"),
+		"<< /Type /Font /Subtype /Type1 /BaseFont 7 0 R /FirstChar 0 /LastChar 255 /Widths 6 0 R >>",
+		"["+strings.Repeat("500 ", 2000)+"]",
+		"/ABCDEF+Helvetica",
+	)
+	r, err := NewReader(bytes.NewReader(data), int64(len(data)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	p := r.Page(1)
+	var text []Text
+	if got := allocated(func() { text = p.Content().Text }); got > 32<<20 {
+		t.Errorf("Content allocated %d MB", got>>20)
+	}
+	if len(text) != glyphs || text[0].W != 6 || text[0].Font != "Helvetica" {
+		t.Errorf("got %d glyphs, first %+v; want %d of width 6 in Helvetica", len(text), text[0], glyphs)
+	}
+}
