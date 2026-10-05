@@ -407,3 +407,35 @@ func TestTextBlocksBounded(t *testing.T) {
 	}
 	mustPanic(t, "glyphs", func() { pageWithContent(strings.Repeat("0 0 1 1 re ", maxPageGlyphs+1)).Content() })
 }
+
+// TestOutlineTitleBudget verifies that outline titles count against one
+// budget for the whole outline, as items can share one long title by
+// reference, and that a title past it reads as empty.
+func TestOutlineTitleBudget(t *testing.T) {
+	const items, size = 200, 256 << 10
+	objs := []string{"<< /First 5 0 R >>", "(" + strings.Repeat("t", size) + ")"}
+	for i := range items {
+		next := ""
+		if i+1 < items {
+			next = fmt.Sprintf(" /Next %d 0 R", 6+i)
+		}
+		objs = append(objs, "<< /Title 4 0 R"+next+" >>")
+	}
+	data := buildPDF(append([]string{"<< /Type /Catalog /Pages 2 0 R /Outlines 3 0 R >>",
+		"<< /Type /Pages /Kids [] /Count 0 >>"}, objs...)...)
+	r := openPDF(t, data)
+	var o Outline
+	if got := allocated(func() { o = r.Outline() }); got > 32<<20 {
+		t.Errorf("Outline allocated %d MB", got>>20)
+	}
+	if len(o.Child) != items || len(o.Child[0].Title) != size {
+		t.Fatalf("got %d items, the first titled with %d bytes; want %d, the first with %d", len(o.Child), len(o.Child[0].Title), items, size)
+	}
+	total := 0
+	for _, c := range o.Child {
+		total += len(c.Title)
+	}
+	if total > maxOutlineTitleBytes {
+		t.Errorf("titles hold %d bytes in all, want at most %d", total, maxOutlineTitleBytes)
+	}
+}

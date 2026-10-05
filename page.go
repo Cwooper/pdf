@@ -38,6 +38,10 @@ const (
 	maxOutlineDepth = 128
 	maxOutlineNodes = 1 << 16
 
+	// maxOutlineTitleBytes bounds the outline's titles in all, since items
+	// can share one long title by reference.
+	maxOutlineTitleBytes = 1 << 20
+
 	// maxPageGlyphs bounds the glyphs, Texts, and Rects text extraction
 	// builds for one page, about 64 bytes each. A dense real page holds under
 	// ten thousand; an inflated content stream can show millions from a few
@@ -1405,7 +1409,8 @@ type Outline struct {
 // The Outline returned is the root of the outline tree and typically has no Title itself.
 // That is, the children of the returned root are the top-level entries in the outline.
 // A malformed reference somewhere in the tree yields the empty outline, as a
-// missing /Outlines does.
+// missing /Outlines does. The tree is cut off past 65,536 items or 128
+// levels, and titles past the first 1 MB of them read as empty.
 func (r *Reader) Outline() (x Outline) {
 	var err error
 	defer recoverTo(&err, func() { x = Outline{} })
@@ -1422,6 +1427,9 @@ type outlineWalk struct {
 	// objects, so a reference met again is a cycle, and the item it names is
 	// already built.
 	seen map[objptr]bool
+	// titles counts the title bytes read; once past maxOutlineTitleBytes,
+	// titles are left empty and not read at all.
+	titles int
 }
 
 func (w *outlineWalk) build(entry Value, depth int) Outline {
@@ -1433,7 +1441,12 @@ func (w *outlineWalk) build(entry Value, depth int) Outline {
 	if depth > maxOutlineDepth {
 		return x
 	}
-	x.Title = entry.Key("Title").Text()
+	if w.titles <= maxOutlineTitleBytes {
+		title := entry.Key("Title").Text()
+		if w.titles += len(title); w.titles <= maxOutlineTitleBytes {
+			x.Title = title
+		}
+	}
 	child, ok := w.follow(entry, "First")
 	for ok && child.Kind() == Dict {
 		if w.budget <= 0 {
