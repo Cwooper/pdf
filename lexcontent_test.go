@@ -348,3 +348,45 @@ func TestContentsArray(t *testing.T) {
 		}
 	})
 }
+
+// TestDocumentBudgets verifies that the glyphs text extraction shows and the
+// content Interpret reads count against budgets shared by every page and
+// call on a Reader. Each page's caps held, but 300 pages sharing one content
+// stream ran 56 KB out of memory in GetStyledTexts.
+func TestDocumentBudgets(t *testing.T) {
+	const content = "BT (0123456789) Tj ET"
+	data := pageTreePDF("<< /Type /Pages /Kids [3 0 R 4 0 R] /Count 2 >>",
+		"<< /Type /Page /Contents 5 0 R >>", "<< /Type /Page /Contents 5 0 R >>", streamObj(content))
+	tests := []struct {
+		name string
+		set  func(c *readerCache)
+		want string
+	}{
+		{"glyphs", func(c *readerCache) { c.glyphs.Store(15) }, "glyphs"},
+		{"content", func(c *readerCache) { c.content.Store(int64(len(content)) + 10) }, "content exceeds"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name+" Content", func(t *testing.T) {
+			r := openPDF(t, data)
+			tt.set(r.cache)
+			if got := contentText(r.Page(1)); got != "0123456789" {
+				t.Fatalf("page 1 shows %q", got)
+			}
+			mustPanic(t, tt.want, func() { r.Page(2).Content() })
+		})
+		t.Run(tt.name+" GetPlainText", func(t *testing.T) {
+			r := openPDF(t, data)
+			tt.set(r.cache)
+			if _, err := r.GetPlainText(); err == nil || !strings.Contains(err.Error(), tt.want) {
+				t.Errorf("got %v, want %q reported", err, tt.want)
+			}
+		})
+		t.Run(tt.name+" GetStyledTexts", func(t *testing.T) {
+			r := openPDF(t, data)
+			tt.set(r.cache)
+			if _, err := r.GetStyledTexts(); err == nil || !strings.Contains(err.Error(), tt.want) {
+				t.Errorf("got %v, want %q reported", err, tt.want)
+			}
+		})
+	}
+}
