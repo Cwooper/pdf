@@ -81,7 +81,7 @@ func TestDictEncoder(t *testing.T) {
 func TestCmapDecodeBFChar(t *testing.T) {
 	m := &cmap{
 		space:  [4][]byteRange{},
-		bfchar: []bfchar{{orig: "\x00\x01", repl: "\x00A"}}, // 0x0001 -> UTF-16BE "A"
+		bfchar: map[string]string{"\x00\x01": "\x00A"}, // 0x0001 -> UTF-16BE "A"
 	}
 	m.space[1] = []byteRange{{low: "\x00\x00", high: "\xff\xff"}}
 

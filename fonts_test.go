@@ -1,6 +1,7 @@
 package pdf
 
 import (
+	"fmt"
 	"strings"
 	"testing"
 	"time"
@@ -80,5 +81,93 @@ func TestDecodeBoundedByGlyphCap(t *testing.T) {
 	}
 	if got := allocated(func() { _, err = p.GetTextByRow() }); got > limit || err == nil {
 		t.Errorf("GetTextByRow allocated %d MB, err %v; want the glyph cap reported", got>>20, err)
+	}
+}
+
+// TestCmapLookupScales verifies that decoding a code does not scan every
+// entry of the cmap, which 30 KB of input can fill with millions of codes.
+func TestCmapLookupScales(t *testing.T) {
+	var cm strings.Builder
+	cm.WriteString("1 begincodespacerange <000000> <ffffff> endcodespacerange\n")
+	const blocks = 60
+	for b := range blocks {
+		cm.WriteString("1000 beginbfchar\n")
+		for i := range 1000 {
+			fmt.Fprintf(&cm, "<01%04x> <0041>\n", b*1000+i)
+		}
+		cm.WriteString("endbfchar\n1000 beginbfrange\n")
+		for i := range 1000 {
+			fmt.Fprintf(&cm, "<02%04x> <02%04x> <0042>\n", b*1000+i, b*1000+i)
+		}
+		cm.WriteString("endbfrange\n")
+	}
+	m := readCmap(rawStream(cm.String()))
+	if m == nil {
+		t.Fatal("readCmap returned nil")
+	}
+	codes := strings.Repeat("\x03\x00\x00", 20000)
+	start := time.Now()
+	if got := m.Decode(codes); got != strings.Repeat(string(noRune), 20000) {
+		t.Errorf("Decode = %.20q, want only replacement characters", got)
+	}
+	if d := time.Since(start); d > time.Second {
+		t.Errorf("decoding 20000 codes against %d entries took %v", 2*blocks*1000, d)
+	}
+}
+
+// TestCmapLookup verifies how codes resolve against a cmap's entries:
+// bfchar before bfrange, the first of duplicate bfchar entries, and a code
+// inside a range nested in another.
+func TestCmapLookup(t *testing.T) {
+	const cm = "4 begincodespacerange <00> <3f> <20> <5f> <66> <01> <8000> <ffff> endcodespacerange\n" +
+		"1 begincodespacerange <68> <7f> endcodespacerange\n" +
+		"2 beginbfchar <05> <0058> <05> <0059> endbfchar\n" +
+		"1 beginbfchar <05> <005a> endbfchar\n" +
+		"3 beginbfrange <00> <7f> <0061> <20> <21> [<0031> <0032>] <8000> <8001> <0041> endbfrange\n"
+	m := readCmap(rawStream(cm))
+	if m == nil {
+		t.Fatal("readCmap returned nil")
+	}
+	tests := []struct{ in, want string }{
+		{"\x05", "Y"},      // the first bfchar of a block is popped last
+		{"\x01", "b"},      // outer range
+		{"\x21", "2"},      // inner range
+		{"\x22", "\u0083"}, // outer range past the inner one
+		{"\x80\x01", "B"},
+		{"\x50", "\u00b1"}, // overlapping codespace ranges
+		{"\x64", "\ufffd"}, // between codespace ranges
+		{"\x02", "c"},      // before an inverted codespace range
+	}
+	for _, tt := range tests {
+		if got := m.Decode(tt.in); got != tt.want {
+			t.Errorf("Decode(%q) = %q, want %q", tt.in, got, tt.want)
+		}
+	}
+}
+
+// TestCmapEntryCap verifies that a cmap holding more entries than a full
+// CID table needs is refused, and that entries no code can match, 72 bytes
+// each for 6 bytes of input, are not kept.
+func TestCmapEntryCap(t *testing.T) {
+	block := func(n int) string {
+		var b strings.Builder
+		fmt.Fprintf(&b, "%d beginbfchar\n", n)
+		for i := range n {
+			fmt.Fprintf(&b, "<%06x> <0041>\n", i)
+		}
+		b.WriteString("endbfchar\n")
+		return b.String()
+	}
+	if m := readCmap(rawStream(block(maxCmapEntries))); m == nil {
+		t.Error("readCmap refused a cmap at the entry cap")
+	}
+	if m := readCmap(rawStream(block(maxCmapEntries) + "1 beginbfchar <ffffff> <0041> endbfchar")); m != nil {
+		t.Error("readCmap kept a cmap past the entry cap")
+	}
+	junk := "80000 beginbfrange " + strings.Repeat("()()()", 80000) + " endbfrange\n" +
+		"100000 beginbfchar " + strings.Repeat("()()", 100000) + " endbfchar\n"
+	m := readCmap(rawStream(strings.Repeat(junk, 3)))
+	if m == nil || len(m.bfchar)+len(m.bfrange) != 0 {
+		t.Errorf("readCmap kept unmatchable entries")
 	}
 }

@@ -6,11 +6,13 @@ package pdf
 
 import (
 	"bytes"
+	"cmp"
 	"errors"
 	"fmt"
 	"io"
 	"math"
 	"runtime"
+	"slices"
 	"sort"
 	"strings"
 )
@@ -46,6 +48,10 @@ const (
 	// maxCmapDst bounds a ToUnicode destination string, the CMap format's
 	// own limit; one code otherwise expands to megabytes.
 	maxCmapDst = 512
+
+	// maxCmapEntries bounds the codespace ranges, bfchar and bfrange entries
+	// one cmap keeps; a full CID table maps 65,536 glyphs.
+	maxCmapEntries = 1 << 17
 
 	// maxPageGlyphs bounds the glyphs, Texts, and Rects text extraction
 	// builds for one page, about 64 bytes each. A dense real page holds under
@@ -603,21 +609,19 @@ type byteRange struct {
 	high string
 }
 
-type bfchar struct {
-	orig string
-	repl string
-}
-
 type bfrange struct {
 	lo  string
 	hi  string
 	dst Value
+	// reach indexes the range of this width, at or before this one, whose
+	// hi is greatest, so a code past a range nested in it is still found.
+	reach int
 }
 
 type cmap struct {
-	space   [4][]byteRange // codespace range
-	bfrange []bfrange
-	bfchar  []bfchar
+	space   [4][]byteRange    // codespace ranges by width, sorted and disjoint
+	bfrange []bfrange         // sorted by width, then lo
+	bfchar  map[string]string // the first destination given for a code
 }
 
 func (m *cmap) Decode(raw string) (text string) {
@@ -627,64 +631,117 @@ func (m *cmap) Decode(raw string) (text string) {
 // decode decodes raw, stopping once the text holds limit runes.
 func (m *cmap) decode(raw string, limit int) string {
 	var r []rune
-Parse:
 	for len(raw) > 0 && len(r) < limit {
-		for n := 1; n <= 4 && n <= len(raw); n++ { // number of digits in character replacement (1-4 possible)
-			for _, space := range m.space[n-1] { // find matching codespace Ranges for number of digits
-				if space.low <= raw[:n] && raw[:n] <= space.high { // see if value is in range
-					text := raw[:n]
-					raw = raw[n:]
-					for _, bfchar := range m.bfchar { // check for matching bfchar
-						if len(bfchar.orig) == n && bfchar.orig == text {
-							r = append(r, []rune(utf16Decode(bfchar.repl))...)
-							continue Parse
-						}
-					}
-					for _, bfrange := range m.bfrange { // check for matching bfrange
-						if len(bfrange.lo) == n && bfrange.lo <= text && text <= bfrange.hi {
-							if bfrange.dst.Kind() == String {
-								s := bfrange.dst.RawString()
-								// An empty destination has no low byte to scale.
-								if bfrange.lo != text && len(s) > 0 { // value isn't at the beginning of the range so scale result
-									b := []byte(s)
-									b[len(b)-1] += text[len(text)-1] - bfrange.lo[len(bfrange.lo)-1] // increment last byte by difference
-									s = string(b)
-								}
-								r = append(r, []rune(utf16Decode(s))...)
-								continue Parse
-							}
-							if bfrange.dst.Kind() == Array {
-								n := text[len(text)-1] - bfrange.lo[len(bfrange.lo)-1]
-								v := bfrange.dst.Index(int(n))
-								if v.Kind() == String && len(v.RawString()) <= maxCmapDst {
-									s := v.RawString()
-									r = append(r, []rune(utf16Decode(s))...)
-									continue Parse
-								}
-								if DebugOn {
-									fmt.Printf("array %v\n", bfrange.dst)
-								}
-							} else {
-								if DebugOn {
-									fmt.Printf("unknown dst %v\n", bfrange.dst)
-								}
-							}
-							r = append(r, noRune)
-							continue Parse
-						}
-					}
-					r = append(r, noRune)
-					continue Parse
-				}
+		n := m.codeLen(raw)
+		if n == 0 {
+			if DebugOn {
+				println("no code space found")
 			}
+			r = append(r, noRune)
+			raw = raw[1:]
+			continue
 		}
-		if DebugOn {
-			println("no code space found")
-		}
-		r = append(r, noRune)
-		raw = raw[1:]
+		r = m.lookup(r, raw[:n])
+		raw = raw[n:]
 	}
 	return string(r)
+}
+
+// codeLen returns the length of the code raw starts with, or 0 if no
+// codespace range holds it.
+func (m *cmap) codeLen(raw string) int {
+	for n := 1; n <= 4 && n <= len(raw); n++ {
+		code, space := raw[:n], m.space[n-1]
+		i := sort.Search(len(space), func(i int) bool { return space[i].high >= code })
+		if i < len(space) && space[i].low <= code {
+			return n
+		}
+	}
+	return 0
+}
+
+// lookup appends the text code maps to to r.
+func (m *cmap) lookup(r []rune, text string) []rune {
+	if repl, ok := m.bfchar[text]; ok {
+		return append(r, []rune(utf16Decode(repl))...)
+	}
+	bfrange := m.findRange(text)
+	if bfrange == nil {
+		return append(r, noRune)
+	}
+	if bfrange.dst.Kind() == String {
+		s := bfrange.dst.RawString()
+		// An empty destination has no low byte to scale.
+		if bfrange.lo != text && len(s) > 0 { // value isn't at the beginning of the range so scale result
+			b := []byte(s)
+			b[len(b)-1] += text[len(text)-1] - bfrange.lo[len(bfrange.lo)-1] // increment last byte by difference
+			s = string(b)
+		}
+		return append(r, []rune(utf16Decode(s))...)
+	}
+	if bfrange.dst.Kind() == Array {
+		n := text[len(text)-1] - bfrange.lo[len(bfrange.lo)-1]
+		v := bfrange.dst.Index(int(n))
+		if v.Kind() == String && len(v.RawString()) <= maxCmapDst {
+			return append(r, []rune(utf16Decode(v.RawString()))...)
+		}
+		if DebugOn {
+			fmt.Printf("array %v\n", bfrange.dst)
+		}
+	} else if DebugOn {
+		fmt.Printf("unknown dst %v\n", bfrange.dst)
+	}
+	return append(r, noRune)
+}
+
+// findRange returns the bfrange holding code, or nil. Where ranges overlap,
+// the one starting nearest below code is preferred.
+func (m *cmap) findRange(code string) *bfrange {
+	rs := m.bfrange
+	i := sort.Search(len(rs), func(i int) bool {
+		return len(rs[i].lo) > len(code) || len(rs[i].lo) == len(code) && rs[i].lo > code
+	}) - 1
+	if i < 0 || len(rs[i].lo) != len(code) {
+		return nil
+	}
+	if r := &rs[i]; code <= r.hi {
+		return r
+	}
+	if r := &rs[rs[i].reach]; code <= r.hi {
+		return r
+	}
+	return nil
+}
+
+// index sorts the codespace ranges and bfranges for lookup.
+func (m *cmap) index() {
+	for w, space := range m.space {
+		slices.SortFunc(space, func(a, b byteRange) int { return strings.Compare(a.low, b.low) })
+		merged := space[:0]
+		for _, r := range space {
+			if r.low > r.high {
+				continue
+			}
+			if k := len(merged) - 1; k >= 0 && r.low <= merged[k].high {
+				merged[k].high = max(merged[k].high, r.high)
+				continue
+			}
+			merged = append(merged, r)
+		}
+		m.space[w] = merged
+	}
+	slices.SortStableFunc(m.bfrange, func(a, b bfrange) int {
+		return cmp.Or(cmp.Compare(len(a.lo), len(b.lo)), strings.Compare(a.lo, b.lo))
+	})
+	for i := range m.bfrange {
+		r := &m.bfrange[i]
+		r.reach = i
+		if i > 0 && len(m.bfrange[i-1].lo) == len(r.lo) {
+			if prev := m.bfrange[i-1].reach; m.bfrange[prev].hi > r.hi {
+				r.reach = prev
+			}
+		}
+	}
 }
 
 // operandCount returns how many entries of per operands a block can supply:
@@ -739,7 +796,13 @@ func parseCmap(toUnicode Value) (result *cmap) {
 	}()
 
 	n := -1
-	var m cmap
+	m := cmap{bfchar: make(map[string]string)}
+	entries := 0
+	keep := func() {
+		if entries++; entries > maxCmapEntries {
+			panic("cmap has too many entries")
+		}
+	}
 	ok := true
 	Interpret(toUnicode, func(stk *Stack, op string) {
 		if !ok {
@@ -783,6 +846,7 @@ func parseCmap(toUnicode Value) (result *cmap) {
 					ok = false
 					return
 				}
+				keep()
 				m.space[len(lo)-1] = append(m.space[len(lo)-1], byteRange{lo, hi})
 			}
 			n = -1
@@ -799,8 +863,9 @@ func parseCmap(toUnicode Value) (result *cmap) {
 			n = operandCount(stk, n, 2)
 			for i := 0; i < n; i++ {
 				repl, orig := stk.Pop().RawString(), stk.Pop().RawString()
-				if len(repl) <= maxCmapDst {
-					m.bfchar = append(m.bfchar, bfchar{orig, repl})
+				if _, dup := m.bfchar[orig]; !dup && codeFits(orig) && len(repl) <= maxCmapDst {
+					keep()
+					m.bfchar[orig] = repl
 				}
 			}
 			n = -1
@@ -819,8 +884,9 @@ func parseCmap(toUnicode Value) (result *cmap) {
 				dst, srcHi, srcLo := stk.Pop(), stk.Pop().RawString(), stk.Pop().RawString()
 				// An array's strings are checked as they are used, since def
 				// can share one array among many ranges.
-				if dst.Kind() == Array || len(dst.RawString()) <= maxCmapDst {
-					m.bfrange = append(m.bfrange, bfrange{srcLo, srcHi, dst})
+				if codeFits(srcLo) && (dst.Kind() == Array || len(dst.RawString()) <= maxCmapDst) {
+					keep()
+					m.bfrange = append(m.bfrange, bfrange{lo: srcLo, hi: srcHi, dst: dst})
 				}
 			}
 			n = -1
@@ -838,7 +904,13 @@ func parseCmap(toUnicode Value) (result *cmap) {
 	if !ok {
 		return nil
 	}
+	m.index()
 	return &m
+}
+
+// codeFits reports whether code has a width some code can match.
+func codeFits(code string) bool {
+	return len(code) >= 1 && len(code) <= 4
 }
 
 type matrix [3][3]float64
