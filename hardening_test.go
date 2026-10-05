@@ -191,10 +191,9 @@ func TestOutlineMalformedReturns(t *testing.T) {
 	mustNotCrash(t, func() { r.Outline() })
 }
 
-// TestObjectStreamHeaderCycle verifies the resolve depth cap holds when the
-// cycle runs through an object stream's own header: /N is a reference to an
-// object the stream claims to contain, so resolving it re-enters the stream.
-// Before the fix the depth counter restarted at zero on each hop and the
+// TestObjectStreamHeaderCycle verifies that a cycle through an object
+// stream's own header terminates: /N is a reference to an object the stream
+// claims to contain, so resolving it re-entered the stream until the
 // goroutine stack overflowed, which is fatal rather than recoverable.
 func TestObjectStreamHeaderCycle(t *testing.T) {
 	data := buildObjStmPDF("/N 7 0 R /First FIRST", "", 1)
@@ -887,4 +886,19 @@ func TestDecodeBudget(t *testing.T) {
 	if err == nil || !strings.Contains(err.Error(), "budget") {
 		t.Errorf("reading %d pages of %d MB each: got %v, want the decode budget reported", pages, chunk>>20, err)
 	}
+}
+
+// BenchmarkValueIndex measures the accessor every traversal runs through. A
+// field added to Value once made it four times slower.
+func BenchmarkValueIndex(b *testing.B) {
+	arr := make(array, 256)
+	for i := range arr {
+		arr[i] = int64(500)
+	}
+	v := Value{data: arr}
+	var sum float64
+	for i := 0; b.Loop(); i++ {
+		sum += v.Index(i & 255).Float64()
+	}
+	_ = sum
 }
