@@ -3,6 +3,10 @@ package pdf
 import (
 	"bytes"
 	"compress/zlib"
+	"crypto/aes"
+	"crypto/cipher"
+	"crypto/md5"
+	"crypto/rc4"
 	"encoding/hex"
 	"fmt"
 	"strings"
@@ -88,5 +92,121 @@ func TestAES256Unsupported(t *testing.T) {
 	data := withEncrypt(buildPDF("<< /Type /Catalog >>"), "<< /Filter /Standard /V 5 /R 6 /Length 256 /CF << /StdCF << /CFM /AESV3 /Length 32 >> >> /StmF /StdCF /StrF /StdCF >>")
 	if err := openBytes(data); err == nil || !strings.HasPrefix(err.Error(), "unsupported") {
 		t.Errorf("got %v, want AES-256 reported as unsupported", err)
+	}
+}
+
+// A cryptSpec describes the Standard security handler encryptedPDF writes,
+// for the empty user password. Its derivations are written out from the
+// spec rather than shared with the reader, so that a mistake there shows.
+type cryptSpec struct {
+	V, R, bits int
+	aes        bool
+	cfLength   string // the crypt filter's /Length, if any
+}
+
+// fileKey derives the file key (Algorithm 2).
+func (s cryptSpec) fileKey(O string) []byte {
+	h := md5.New()
+	h.Write(passwordPad)
+	h.Write([]byte(O))
+	h.Write([]byte{0xfc, 0xff, 0xff, 0xff}) // /P -4
+	h.Write([]byte(testID))
+	key := h.Sum(nil)
+	n := s.bits / 8
+	if s.R >= 3 {
+		for range 50 {
+			sum := md5.Sum(key[:n])
+			key = sum[:]
+		}
+	}
+	return key[:n]
+}
+
+// userEntry computes /U (Algorithms 4 and 5).
+func (s cryptSpec) userEntry(key []byte) []byte {
+	if s.R == 2 {
+		u := bytes.Clone(passwordPad)
+		c, _ := rc4.NewCipher(key)
+		c.XORKeyStream(u, u)
+		return u
+	}
+	sum := md5.Sum(append(bytes.Clone(passwordPad), testID...))
+	u := sum[:]
+	for i := range 20 {
+		k := bytes.Clone(key)
+		for j := range k {
+			k[j] ^= byte(i)
+		}
+		c, _ := rc4.NewCipher(k)
+		c.XORKeyStream(u, u)
+	}
+	return append(u, make([]byte, 16)...)
+}
+
+// encrypt encrypts data as object id's (Algorithm 1).
+func (s cryptSpec) encrypt(key []byte, id int, data []byte) []byte {
+	h := md5.New()
+	h.Write(key)
+	h.Write([]byte{byte(id), byte(id >> 8), byte(id >> 16), 0, 0})
+	if s.aes {
+		h.Write([]byte("sAlT"))
+	}
+	k := h.Sum(nil)[:min(len(key)+5, 16)]
+	if !s.aes {
+		out := make([]byte, len(data))
+		c, _ := rc4.NewCipher(k)
+		c.XORKeyStream(out, data)
+		return out
+	}
+	pad := 16 - len(data)%16
+	data = append(bytes.Clone(data), bytes.Repeat([]byte{byte(pad)}, pad)...)
+	out := append(bytes.Repeat([]byte{7}, 16), make([]byte, len(data))...)
+	b, _ := aes.NewCipher(k)
+	cipher.NewCBCEncrypter(b, out[:16]).CryptBlocks(out[16:], data)
+	return out
+}
+
+// encryptedPDF returns a file encrypted under s whose page shows content and
+// whose one outline item is titled title. Page object 3 carries pageExtra as
+// it stands.
+func encryptedPDF(s cryptSpec, content, title, pageExtra string) []byte {
+	O := strings.Repeat("O", 32)
+	key := s.fileKey(O)
+	strm := s.encrypt(key, 4, []byte(content))
+	enc := fmt.Sprintf("<< /Filter /Standard /V %d /R %d /Length %d /O <%x> /U <%x> /P -4", s.V, s.R, s.bits, O, s.userEntry(key))
+	if s.V == 4 {
+		cfm, cfLength := "V2", ""
+		if s.aes {
+			cfm = "AESV2"
+		}
+		if s.cfLength != "" {
+			cfLength = " /Length " + s.cfLength
+		}
+		enc += fmt.Sprintf(" /CF << /StdCF << /CFM /%s%s >> >> /StmF /StdCF /StrF /StdCF", cfm, cfLength)
+	}
+	return withEncrypt(buildPDF(
+		"<< /Type /Catalog /Pages 2 0 R /Outlines 5 0 R >>",
+		"<< /Type /Pages /Kids [3 0 R] /Count 1 >>",
+		"<< /Type /Page /Parent 2 0 R /Contents 4 0 R "+pageExtra+" >>",
+		fmt.Sprintf("<< /Length %d >>\nstream\n%s\nendstream", len(strm), strm),
+		"<< /Type /Outlines /First 6 0 R /Last 6 0 R /Count 1 >>",
+		fmt.Sprintf("<< /Title <%x> /Parent 5 0 R >>", s.encrypt(key, 6, []byte(title))),
+		enc+" >>",
+	), "7 0 R")
+}
+
+// TestAESStringPadding verifies that an AES-encrypted string loses its
+// PKCS#7 padding, a whole block of it when the text fills its last block.
+func TestAESStringPadding(t *testing.T) {
+	s := cryptSpec{V: 4, R: 4, bits: 128, aes: true}
+	for _, title := range []string{"Chapter One", "Sixteen bytes!!!", ""} {
+		data := encryptedPDF(s, "", title, "")
+		r, err := NewReader(bytes.NewReader(data), int64(len(data)))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if o := r.Outline(); len(o.Child) != 1 || o.Child[0].Title != title {
+			t.Errorf("Outline = %q, want one item titled %q", o.Child, title)
+		}
 	}
 }
