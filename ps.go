@@ -22,6 +22,10 @@ const maxInterpretBytes = 64 << 20
 // 65536 glyphs at once needs 131072.
 const maxOperands = 1 << 18
 
+// maxDictStack bounds the dicts begin opens in Interpret: every keyword is
+// looked up in each of them. Real cmaps nest two or three.
+const maxDictStack = 64
+
 // A Stack represents a stack of values.
 type Stack struct {
 	stack []Value
@@ -124,6 +128,9 @@ Reading:
 				d := stk.Pop()
 				if d.Kind() != Dict {
 					panic("cannot begin non-dict")
+				}
+				if len(dicts) >= maxDictStack {
+					panic(fmt.Errorf("begin nests more than %d dicts", maxDictStack))
 				}
 				dicts = append(dicts, d.data.(dict))
 				continue
