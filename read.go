@@ -88,6 +88,13 @@ type Reader struct {
 	trailerptr objptr
 	key        []byte
 	useAES     bool
+
+	// noObjStm marks a view of the file that does not resolve objects stored
+	// in object streams. An object stream's header is read through one: the
+	// spec bars only /Length from an object stream, but a header value there
+	// is left unsupported, since a reference from one stream's header into
+	// another made each level of nesting double the work.
+	noObjStm bool
 }
 
 type xref struct {
@@ -985,7 +992,12 @@ func (r *Reader) resolveAt(parent objptr, x interface{}, depth int) Value {
 
 		var obj object
 		if xref.inStream {
-			strm := r.resolveAt(parent, xref.stream, depth+1)
+			if r.noObjStm {
+				return Value{}
+			}
+			view := *r
+			view.noObjStm = true
+			strm := view.resolveAt(parent, xref.stream, depth+1)
 			extends := 0
 		Search:
 			for {
