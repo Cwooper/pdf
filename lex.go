@@ -88,6 +88,14 @@ func (b *buffer) errorf(format string, args ...interface{}) {
 }
 
 func (b *buffer) reload() bool {
+	// A read that failed, by error or by panic, would fail again, so
+	// Interpret must raise it rather than skip it as a malformed token.
+	defer func() {
+		if r := recover(); r != nil {
+			b.readFailed = true
+			panic(r)
+		}
+	}()
 	size := cap(b.buf) - int(b.offset%int64(cap(b.buf)))
 	n, err := b.r.Read(b.buf[:size])
 	// io.Reader allows a read to return nothing and no error; give up after
@@ -110,7 +118,6 @@ func (b *buffer) reload() bool {
 			b.eof = true
 			return false
 		}
-		b.readFailed = true
 		b.errorf("malformed PDF: reading at offset %d: %v", b.offset, err)
 		return false
 	}
