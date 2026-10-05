@@ -62,12 +62,14 @@ package pdf
 import (
 	"bytes"
 	"cmp"
+	"compress/flate"
 	"compress/zlib"
 	"crypto/aes"
 	"crypto/cipher"
 	"crypto/md5"
 	"crypto/rc4"
 	"encoding/ascii85"
+	"encoding/binary"
 	"errors"
 	"fmt"
 	"io"
@@ -1326,10 +1328,16 @@ func (r *Reader) applyFilter(rd io.Reader, name string, param Value) io.Reader {
 	default:
 		panic("unknown filter " + name)
 	case "FlateDecode":
-		zr, err := zlib.NewReader(rd)
-		if err != nil {
+		// The Adler-32 trailer goes unread, as in other readers: some writers
+		// get it wrong or drop it after complete data.
+		var hdr [2]byte
+		if _, err := io.ReadFull(rd, hdr[:]); err != nil {
 			panic(err)
 		}
+		if hdr[0]&0x0f != 8 || binary.BigEndian.Uint16(hdr[:])%31 != 0 || hdr[1]&0x20 != 0 {
+			panic(zlib.ErrHeader)
+		}
+		zr := flate.NewReader(rd)
 		pred := param.Key("Predictor")
 		if pred.Kind() == Null {
 			return zr
