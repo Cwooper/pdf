@@ -10,6 +10,11 @@ import (
 	"strings"
 )
 
+// maxInterpretBytes bounds the decoded bytes one Interpret call reads: a
+// page's content streams or a cmap. Flate expands about 1000:1, so a small
+// file could otherwise feed the lexer gigabytes.
+const maxInterpretBytes = 64 << 20
+
 // A Stack represents a stack of values.
 type Stack struct {
 	stack []Value
@@ -71,7 +76,7 @@ func Interpret(strm Value, do func(stk *Stack, op string)) {
 		rd = strm.Reader()
 	}
 
-	b := newBuffer(rd, 0)
+	b := newBuffer(newLimitedReader(rd, maxInterpretBytes), 0)
 	b.allowEOF = true
 	b.allowObjptr = false
 	b.allowStream = false
