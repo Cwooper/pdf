@@ -188,8 +188,8 @@ func (w *pageWalk) kid(kids Value, i int, x object, resources *unresolved, depth
 
 // GetPlainText returns all the text in the PDF file
 func (r *Reader) GetPlainText() (reader io.Reader, err error) {
-	// Resolving objects panics on malformed input, and that happens here in
-	// NumPage, Page and Fonts as well as inside Page.GetPlainText.
+	// NumPage and Page panic on malformed input; Page.GetPlainText recovers
+	// its own.
 	defer func() {
 		if e := recover(); e != nil {
 			reader, err = &bytes.Buffer{}, fmt.Errorf("malformed PDF: %v", e)
@@ -198,18 +198,11 @@ func (r *Reader) GetPlainText() (reader io.Reader, err error) {
 
 	pages := r.NumPage()
 	var buf bytes.Buffer
-	fonts := make(map[string]*Font)
+	// Pages share each font object, so that its charmap is parsed once.
 	shared := make(fontSet)
 	for i := 1; i <= pages; i++ {
 		p := r.Page(i)
-		// Fonts are shared by name so that each charmap is parsed once.
-		dict := p.Resources().Key("Font")
-		for _, name := range dict.Keys() {
-			if _, ok := fonts[name]; !ok {
-				fonts[name], _ = shared.font(dict, name)
-			}
-		}
-		text, err := p.GetPlainText(fonts)
+		text, err := p.plainText((&pageFonts{page: p, shared: shared}).lookup)
 		if err != nil {
 			return nil, err
 		}
@@ -316,7 +309,7 @@ type pageFonts struct {
 	dict   Value
 	looked bool
 	fonts  map[string]*Font
-	shared fontSet
+	shared fontSet // set beforehand to share font objects across pages
 }
 
 // A glyphBudget counts the glyphs one page's text extraction shows, or the
@@ -360,7 +353,9 @@ func (pf *pageFonts) lookup(fontName string) (*Font, bool) {
 		pf.dict = pf.page.Resources().Key("Font")
 		pf.looked = true
 		pf.fonts = make(map[string]*Font)
-		pf.shared = make(fontSet)
+		if pf.shared == nil {
+			pf.shared = make(fontSet)
+		}
 	}
 	f, ok := pf.shared.font(pf.dict, fontName)
 	if ok {
@@ -1113,9 +1108,21 @@ func decodeText(enc TextEncoding, raw string, glyphs *glyphBudget) string {
 	return b.String()
 }
 
-// GetPlainText returns the page's all text without format.
-// fonts can be passed in (to improve parsing performance) or left nil
+// GetPlainText returns the page's text without format. A non-nil fonts maps
+// the names Tf selects to the fonts to use in place of the page's own.
 func (p Page) GetPlainText(fonts map[string]*Font) (result string, err error) {
+	lookup := (&pageFonts{page: p}).lookup
+	if fonts != nil {
+		lookup = func(name string) (*Font, bool) {
+			f, ok := fonts[name]
+			return f, ok
+		}
+	}
+	return p.plainText(lookup)
+}
+
+// plainText is GetPlainText with the page's fonts found by lookup.
+func (p Page) plainText(lookup func(name string) (*Font, bool)) (result string, err error) {
 	defer recoverTo(&err, func() { result = "" })
 
 	// Handle in case the content page is empty
@@ -1124,14 +1131,6 @@ func (p Page) GetPlainText(fonts map[string]*Font) (result string, err error) {
 	}
 	strm := p.V.Key("Contents")
 	var enc TextEncoding = &nopEncoder{}
-
-	lookup := (&pageFonts{page: p}).lookup
-	if fonts != nil {
-		lookup = func(name string) (*Font, bool) {
-			f, ok := fonts[name]
-			return f, ok
-		}
-	}
 
 	var textBuilder bytes.Buffer
 	showText := func(s string) {
