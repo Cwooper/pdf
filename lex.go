@@ -307,6 +307,26 @@ Loop:
 	return string(tmp)
 }
 
+// skipInlineImage skips the data of an inline image, which follows its ID
+// operator, leaving EI as the next token. The data is binary, and its length
+// depends on the image's filters, so it ends at the first EI between
+// whitespace.
+func (b *buffer) skipInlineImage() {
+	var last [3]byte
+	for {
+		c := b.readByte()
+		if b.eof {
+			return
+		}
+		if isSpace(last[0]) && last[1] == 'E' && last[2] == 'I' && isSpace(c) {
+			b.unreadByte()
+			b.unreadToken(keyword("EI"))
+			return
+		}
+		last = [3]byte{last[1], last[2], c}
+	}
+}
+
 func (b *buffer) readName() token {
 	tmp := b.tmp[:0]
 	for {
