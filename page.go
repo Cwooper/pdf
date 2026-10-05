@@ -38,6 +38,10 @@ const (
 	maxOutlineDepth = 128
 	maxOutlineNodes = 1 << 16
 
+	// maxOutlineTitleBytes bounds the outline's titles in all, since items
+	// can share one long title by reference.
+	maxOutlineTitleBytes = 1 << 20
+
 	// maxCmapBytes bounds a ToUnicode cmap read into memory. Real cmaps run
 	// to a few hundred kilobytes at most.
 	maxCmapBytes = 32 << 20
@@ -1427,6 +1431,9 @@ type outlineWalk struct {
 	// objects, so a reference met again is a cycle, and the item it names is
 	// already built.
 	seen map[objptr]bool
+	// titles counts the title bytes read; once past maxOutlineTitleBytes,
+	// titles are left empty and not read at all.
+	titles int
 }
 
 func (w *outlineWalk) build(entry Value, depth int) Outline {
@@ -1440,7 +1447,12 @@ func (w *outlineWalk) build(entry Value, depth int) Outline {
 	if depth > maxOutlineDepth {
 		return x
 	}
-	x.Title = entry.Key("Title").Text()
+	if w.titles <= maxOutlineTitleBytes {
+		title := entry.Key("Title").Text()
+		if w.titles += len(title); w.titles <= maxOutlineTitleBytes {
+			x.Title = title
+		}
+	}
 	child, ok := w.follow(entry, "First")
 	for ok && child.Kind() == Dict {
 		if w.budget <= 0 {
