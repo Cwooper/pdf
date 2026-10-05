@@ -2,6 +2,7 @@ package pdf
 
 import (
 	"fmt"
+	"runtime"
 	"strings"
 	"testing"
 )
@@ -178,4 +179,117 @@ func TestLexOutOfRangeNumbers(t *testing.T) {
 	if got != "AB" {
 		t.Errorf("Content shows %q, want %q", got, "AB")
 	}
+}
+
+// pageTreePDF returns a file whose catalog is object 1 and whose page tree
+// root is object 2, then objs as objects 3, 4, ....
+func pageTreePDF(root string, objs ...string) []byte {
+	return buildPDF(append([]string{"<< /Type /Catalog /Pages 2 0 R >>", root}, objs...)...)
+}
+
+// TestPageTreeWalk verifies that pages are counted and numbered from the
+// page tree as it is, not from /Count, and that a node listed twice counts
+// once, where one listed twice at every level makes 2.9 KB hold 2^31 pages.
+func TestPageTreeWalk(t *testing.T) {
+	const levels = 31
+	var dag []string
+	for l := range levels {
+		dag = append(dag, fmt.Sprintf("<< /Type /Pages /Kids [%d 0 R %[1]d 0 R] /Count %d >>", l+3, 1<<(levels-l)))
+	}
+	dag = append(dag, "<< /Type /Page >>")
+	page := func(n int) string { return fmt.Sprintf("<< /Type /Page /N %d >>", n) }
+
+	tests := []struct {
+		name  string
+		data  []byte
+		pages int
+	}{
+		{"node listed twice", buildPDF(append([]string{"<< /Type /Catalog /Pages 2 0 R >>"}, dag...)...), 1},
+		{"count overstated", pageTreePDF("<< /Type /Pages /Kids [3 0 R] /Count 5 >>", page(1)), 1},
+		{"count understated", pageTreePDF("<< /Type /Pages /Kids [3 0 R 4 0 R 5 0 R] /Count 1 >>", page(1), page(2), page(3)), 3},
+		{"page listed twice", pageTreePDF("<< /Type /Pages /Kids [3 0 R 4 0 R 3 0 R] /Count 3 >>", page(1), page(2)), 2},
+		{"cycle", pageTreePDF("<< /Type /Pages /Kids [2 0 R 3 0 R 2 0 R] /Count 2 >>", page(1)), 1},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			r := openPDF(t, tt.data)
+			var n int
+			mustNotCrash(t, func() { n = r.NumPage() })
+			if n != tt.pages {
+				t.Fatalf("NumPage = %d, want %d", n, tt.pages)
+			}
+			for i := 1; i <= n; i++ {
+				if got := r.Page(i).V.Key("N").Int64(); n > 1 && got != int64(i) {
+					t.Errorf("Page(%d) is page %d", i, got)
+				}
+			}
+			if !r.Page(n + 1).V.IsNull() {
+				t.Errorf("Page(%d) found past the last page", n+1)
+			}
+		})
+	}
+}
+
+// TestPagesParsedOnce verifies that looking up every page, and the resources
+// each inherits, parses each node of the page tree once rather than once per
+// page.
+func TestPagesParsedOnce(t *testing.T) {
+	const pages = 2000
+	var kids strings.Builder
+	objs := []string{"<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>"}
+	for i := range pages {
+		fmt.Fprintf(&kids, "%d 0 R ", 4+i)
+		objs = append(objs, fmt.Sprintf("<< /Type /Page /Parent 2 0 R /N %d >>", i+1))
+	}
+	root := fmt.Sprintf("<< /Type /Pages /Kids [%s] /Count %d /Resources << /Font << /F1 3 0 R >> >> /Junk [%s] >>",
+		kids.String(), pages, strings.Repeat("0 ", 50000))
+	r := openPDF(t, pageTreePDF(root, objs...))
+	got := allocated(func() {
+		for i := 1; i <= r.NumPage(); i++ {
+			p := r.Page(i)
+			if n := p.V.Key("N").Int64(); n != int64(i) {
+				t.Fatalf("Page(%d) is page %d", i, n)
+			}
+			if f := p.Fonts(); len(f) != 1 {
+				t.Fatalf("page %d fonts %v, want F1 inherited", i, f)
+			}
+		}
+	})
+	if got > 64<<20 {
+		t.Errorf("looking up %d pages allocated %d MB", pages, got>>20)
+	}
+}
+
+// TestInheritedResourcesUnparsed verifies that the page walk keeps the
+// /Resources each page inherits unparsed, since many /Pages nodes can name
+// one large dict.
+func TestInheritedResourcesUnparsed(t *testing.T) {
+	const nodes = 32
+	var kids strings.Builder
+	objs := []string{"<< /Junk (" + strings.Repeat("x", 1<<20) + ") >>"}
+	for i := range nodes {
+		fmt.Fprintf(&kids, "%d 0 R ", 4+2*i)
+		objs = append(objs,
+			fmt.Sprintf("<< /Type /Pages /Parent 2 0 R /Kids [%d 0 R] /Count 1 /Resources 3 0 R >>", 5+2*i),
+			fmt.Sprintf("<< /Type /Page /Parent %d 0 R >>", 4+2*i))
+	}
+	r := openPDF(t, pageTreePDF(fmt.Sprintf("<< /Type /Pages /Kids [%s] /Count %d >>", kids.String(), nodes), objs...))
+	var before, after runtime.MemStats
+	runtime.GC()
+	runtime.ReadMemStats(&before)
+	n := r.NumPage()
+	runtime.GC()
+	runtime.ReadMemStats(&after)
+	if held := int64(after.HeapAlloc) - int64(before.HeapAlloc); held > 8<<20 {
+		t.Errorf("the page walk held %d MB", held>>20)
+	}
+	if got := len(r.Page(n).Resources().Key("Junk").RawString()); n != nodes || got != 1<<20 {
+		t.Errorf("%d pages, the last inheriting a %d-byte string; want %d, %d", n, got, nodes, 1<<20)
+	}
+}
+
+// declaredPages returns the /Count of r's page tree root, which shows that
+// the catalog resolved even where the tree lists no pages.
+func declaredPages(r *Reader) int {
+	return int(r.Trailer().Key("Root").Key("Pages").Key("Count").Int64())
 }
