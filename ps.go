@@ -27,6 +27,11 @@ const maxOperands = 1 << 18
 // looked up in each of them. Real cmaps nest two or three.
 const maxDictStack = 64
 
+// maxInterpretErrors bounds the malformed operands Interpret skips before
+// giving up. Each costs a recovered panic, many times the work of a valid
+// operand, and no ordinary document has any.
+const maxInterpretErrors = 1 << 10
+
 // A Stack represents a stack of values.
 type Stack struct {
 	stack []Value
@@ -75,6 +80,7 @@ func Interpret(strm Value, do func(stk *Stack, op string)) {
 	var stk Stack
 	var dicts []dict
 	var rd io.Reader
+	errs := 0
 	if strm.Kind() == Array {
 		readers := make([]io.Reader, 0, 2*strm.Len())
 		for i := 0; i < strm.Len(); i++ {
@@ -177,6 +183,9 @@ Reading:
 		b.unreadToken(tok)
 		obj, ok := readObjectRecover(b)
 		if !ok {
+			if errs++; errs > maxInterpretErrors {
+				panic(fmt.Errorf("more than %d malformed operands", maxInterpretErrors))
+			}
 			continue
 		}
 		stk.Push(Value{data: obj})
