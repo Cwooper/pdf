@@ -57,6 +57,7 @@ type buffer struct {
 	// when it is set.
 	entries    int
 	maxEntries int
+	readFailed bool // reading the input failed, and would fail again
 }
 
 // newBuffer returns a new buffer reading from r at the given offset.
@@ -100,6 +101,7 @@ func (b *buffer) reload() bool {
 			b.eof = true
 			return false
 		}
+		b.readFailed = true
 		b.errorf("malformed PDF: reading at offset %d: %v", b.offset, err)
 		return false
 	}
