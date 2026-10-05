@@ -1005,3 +1005,10 @@ func TestInterpretByteCap(t *testing.T) {
 		t.Errorf("readCmap: got panic %v, want the size cap reported", p)
 	}
 }
+
+// TestPageGlyphCap verifies that Page.Content stops at maxPageGlyphs instead
+// of building a Text for every glyph a content stream shows.
+func TestPageGlyphCap(t *testing.T) {
+	p := pageWithContent("BT (" + strings.Repeat("A", maxPageGlyphs+1) + ") Tj ET")
+	mustPanic(t, "glyphs", func() { p.Content() })
+}

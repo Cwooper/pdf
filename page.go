@@ -38,6 +38,11 @@ const (
 	// many pages there are, and a hostile one would otherwise have the tree
 	// walked billions of times.
 	maxMissingPages = 64
+
+	// maxPageGlyphs bounds the Text values Page.Content builds for one page,
+	// about 64 bytes each. A dense real page holds under ten thousand; an
+	// inflated content stream can show millions from a few kilobytes.
+	maxPageGlyphs = 1 << 20
 )
 
 // A Page represent a single page in a PDF file.
@@ -1084,6 +1089,9 @@ func (p Page) Content() Content {
 		n := 0
 		decoded := enc.Decode(s)
 		for _, ch := range decoded {
+			if len(text) >= maxPageGlyphs {
+				panic(fmt.Errorf("page shows more than %d glyphs", maxPageGlyphs))
+			}
 			var w0 float64
 			if n < len(s) {
 				w0 = g.Tf.Width(int(s[n]))

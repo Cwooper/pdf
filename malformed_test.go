@@ -45,6 +45,20 @@ func mustNotCrash(t *testing.T, fn func()) {
 	}
 }
 
+// mustPanic fails unless fn panics with a message containing want.
+func mustPanic(t *testing.T, want string, fn func()) {
+	t.Helper()
+	p, timedOut := run(t, fn)
+	switch {
+	case timedOut:
+		t.Errorf("did not return within %v", caseTimeout)
+	case p == nil:
+		t.Errorf("returned, want a panic reporting %q", want)
+	case !strings.Contains(fmt.Sprint(p), want):
+		t.Errorf("panicked with %v, want %q", p, want)
+	}
+}
+
 // openBytes reads data as a PDF, reporting the error rather than the Reader.
 func openBytes(data []byte) error {
 	_, err := NewReader(bytes.NewReader(data), int64(len(data)))
