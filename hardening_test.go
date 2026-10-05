@@ -1026,3 +1026,10 @@ func TestGstackDepthCap(t *testing.T) {
 		t.Errorf("Content allocated %d MB and showed %d texts, want 1", got>>20, len(text))
 	}
 }
+
+// TestOperandCap verifies that Interpret refuses operands past maxOperands
+// instead of stacking every one a content stream supplies.
+func TestOperandCap(t *testing.T) {
+	p := pageWithContent(strings.Repeat("1 ", maxOperands+2))
+	mustPanic(t, "operands", func() { p.Content() })
+}
