@@ -220,7 +220,7 @@ func (b *buffer) readHexString() token {
 		}
 		x := unhex(c)<<4 | unhex(c2)
 		if x < 0 {
-			b.errorf("malformed hex string %c %c %s", c, c2, b.buf[b.pos:])
+			b.errorf("malformed hex string %c %c", c, c2)
 			break
 		}
 		tmp = append(tmp, byte(x))
@@ -350,13 +350,13 @@ func (b *buffer) readKeyword() token {
 	case isInteger(s):
 		x, err := strconv.ParseInt(s, 10, 64)
 		if err != nil {
-			b.errorf("invalid integer %s", s)
+			b.errorf("invalid integer %.64q", s)
 		}
 		return x
 	case isReal(s):
 		x, err := strconv.ParseFloat(s, 64)
 		if err != nil {
-			b.errorf("invalid real %s", s)
+			b.errorf("invalid real %.64q", s)
 		}
 		return x
 	}
@@ -455,7 +455,7 @@ func (b *buffer) readObject() object {
 			// stop the object - these mark the end of dict/array
 			return nil
 		}
-		b.errorf("unexpected keyword %q parsing object", kw)
+		b.errorf("unexpected keyword %.64q parsing object", kw)
 		return nil
 	}
 
@@ -529,7 +529,7 @@ func (b *buffer) readDict() object {
 			if DebugOn {
 				fmt.Printf("DEBUG: %T(%v)\n. Skip dict", tok, tok)
 			}
-			b.errorf("unexpected non-name key %T(%v) parsing dictionary", tok, tok)
+			b.errorf("unexpected non-name key %T parsing dictionary", tok)
 			continue
 		}
 		b.countEntry()
