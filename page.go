@@ -516,7 +516,7 @@ func (f Font) getEncoder() TextEncoding {
 			return &nopEncoder{}
 		}
 	case Dict:
-		return &dictEncoder{enc.Key("Differences")}
+		return &byteEncoder{differences(enc.Key("Differences"))}
 	case Null:
 		return f.charmapEncoding()
 	default:
@@ -540,35 +540,30 @@ func (f *Font) charmapEncoding() TextEncoding {
 	return &byteEncoder{&pdfDocEncoding}
 }
 
-type dictEncoder struct {
-	v Value
-}
-
-func (e *dictEncoder) Decode(raw string) (text string) {
-	r := make([]rune, 0, len(raw))
-	for i := 0; i < len(raw); i++ {
-		ch := rune(raw[i])
-		n := -1
-		for j := 0; j < e.v.Len(); j++ {
-			x := e.v.Index(j)
-			if x.Kind() == Integer {
-				n = int(x.Int64())
-				continue
-			}
-			if x.Kind() == Name {
-				if int(raw[i]) == n {
-					r := nameToRune[x.Name()]
-					if r != 0 {
-						ch = r
-						break
-					}
-				}
-				n++
-			}
-		}
-		r = append(r, ch)
+// differences returns the byte table a /Differences array makes of the
+// identity mapping, the first known glyph name given for a code winning.
+func differences(v Value) *[256]rune {
+	var table [256]rune
+	var set [256]bool
+	for i := range table {
+		table[i] = rune(i)
 	}
-	return string(r)
+	n := -1
+	for i := range v.Len() {
+		x := v.Index(i)
+		switch x.Kind() {
+		case Integer:
+			n = int(x.Int64())
+		case Name:
+			if n >= 0 && n < len(table) && !set[n] {
+				if r := nameToRune[x.Name()]; r != 0 {
+					table[n], set[n] = r, true
+				}
+			}
+			n++
+		}
+	}
+	return &table
 }
 
 // A TextEncoding represents a mapping between

@@ -171,3 +171,35 @@ func TestCmapEntryCap(t *testing.T) {
 		t.Errorf("readCmap kept unmatchable entries")
 	}
 }
+
+// TestDifferencesTable verifies that a font's /Differences array is read
+// once, not once per byte shown.
+func TestDifferencesTable(t *testing.T) {
+	const entries, shown = 200000, 2000
+	r := fontPage(t, "BT /F1 12 Tf ("+strings.Repeat("B", shown)+") Tj ET",
+		"<< /Type /Font /Subtype /Type1 /BaseFont /X /Encoding << /Differences 6 0 R >> >>",
+		"[0 "+strings.Repeat("/q0 ", entries)+"]")
+	start := time.Now()
+	text, err := r.Page(1).GetPlainText(nil)
+	if err != nil || text != "\n"+strings.Repeat("B", shown) {
+		t.Errorf("GetPlainText = %.20q, %v", text, err)
+	}
+	if d := time.Since(start); d > time.Second {
+		t.Errorf("showing %d bytes against %d differences took %v", shown, entries, d)
+	}
+}
+
+// TestDifferences verifies how a /Differences array maps codes.
+func TestDifferences(t *testing.T) {
+	diff := array{
+		name("Alpha"), // before any code
+		int64(65), name("Beta"), name("NotAGlyphName"), name("Gamma"),
+		int64(66), name("Delta"), // the first known name for a code wins
+		int64(66), name("Alpha"),
+		int64(300), name("Alpha"), int64(-1), name("Alpha"),
+	}
+	enc := (&Font{V: testValue(dict{name("Encoding"): dict{name("Differences"): diff}})}).Encoder()
+	if got, want := enc.Decode("\x00ABCD"), "\x00\u0392\u2206\u0393D"; got != want {
+		t.Errorf("Decode = %q, want %q", got, want)
+	}
+}
