@@ -9,6 +9,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"runtime"
 	"sort"
 	"strings"
 	"unicode/utf8"
@@ -147,13 +148,27 @@ func (w *pageWalk) walk(node Value, resources *unresolved, depth int) {
 			}
 			w.seen[ref] = true
 		}
-		kid := kids.Index(i)
-		switch kid.Key("Type").Name() {
-		case "Pages":
-			w.walk(kid, resources, depth+1)
-		case "Page":
-			w.pages = append(w.pages, pageEntry{kids.ptr, x, resources})
+		w.kid(kids, i, x, resources, depth)
+	}
+}
+
+// kid walks kids' entry i, skipping it if it fails to parse, so that one
+// malformed node or page loses only the pages under it. A runtime error is a
+// bug, not malformed input, and is raised again.
+func (w *pageWalk) kid(kids Value, i int, x object, resources *unresolved, depth int) {
+	defer func() {
+		if e := recover(); e != nil {
+			if _, ok := e.(runtime.Error); ok {
+				panic(e)
+			}
 		}
+	}()
+	kid := kids.Index(i)
+	switch kid.Key("Type").Name() {
+	case "Pages":
+		w.walk(kid, resources, depth+1)
+	case "Page":
+		w.pages = append(w.pages, pageEntry{kids.ptr, x, resources})
 	}
 }
 

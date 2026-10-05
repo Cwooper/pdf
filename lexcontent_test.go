@@ -472,3 +472,25 @@ func TestMissingOperands(t *testing.T) {
 		})
 	}
 }
+
+// TestPageTreeMalformedKid verifies that a kid that fails to parse loses
+// only the pages under it, not the whole tree.
+func TestPageTreeMalformedKid(t *testing.T) {
+	data := pageTreePDF("<< /Type /Pages /Kids [3 0 R 4 0 R 5 0 R 6 0 R] /Count 4 >>",
+		"<< /Type /Page /N 1 >>",
+		"<< /Type /Pages /Kids [7 0 R] /Count 1 /Junk <zz> >>",
+		"<< /Type /Page /N 2 /Junk <zz> >>",
+		"<< /Type /Page /N 3 >>",
+		"<< /Type /Page /N 4 >>")
+	r := openPDF(t, data)
+	var n int
+	mustNotCrash(t, func() { n = r.NumPage() })
+	if n != 2 {
+		t.Fatalf("NumPage = %d, want 2", n)
+	}
+	for i, want := range []int64{1, 3} {
+		if got := r.Page(i + 1).V.Key("N").Int64(); got != want {
+			t.Errorf("Page(%d) is page %d, want %d", i+1, got, want)
+		}
+	}
+}
