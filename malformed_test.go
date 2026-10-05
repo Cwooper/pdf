@@ -118,7 +118,7 @@ func TestMalformedXref(t *testing.T) {
 		{"size past file length", xrefStreamPDF("/Size 100000000 /W [1 1 1]", entry)},
 
 		// /Index names the object numbers a subsection describes.
-		{"index start huge", xrefStreamPDF("/Size 1 /W [1 1 1] /Index [4000000000 1]", entry)},
+		{"index start huge", xrefStreamPDF("/Size 1 /W [1 1 1] /Index [5000000000 1]", entry)},
 		{"index start negative", xrefStreamPDF("/Size 4 /W [1 1 1] /Index [-1 1]", entry)},
 		{"index count negative", xrefStreamPDF("/Size 4 /W [1 1 1] /Index [0 -1]", entry)},
 		{"index odd length", xrefStreamPDF("/Size 4 /W [1 1 1] /Index [0]", entry)},
@@ -130,7 +130,7 @@ func TestMalformedXref(t *testing.T) {
 		{"w missing", xrefStreamPDF("/Size 4", entry)},
 
 		// Classic cross-reference tables take the same values as tokens.
-		{"table start huge", xrefTablePDF("4000000000 1\n0000000016 00000 n \n", "<< /Size 5 >>")},
+		{"table start huge", xrefTablePDF("5000000000 1\n0000000016 00000 n \n", "<< /Size 5 >>")},
 		{"table start negative", xrefTablePDF("-1 1\n0000000016 00000 n \n", "<< /Size 5 >>")},
 		{"table count negative", xrefTablePDF("0 -1\n0000000016 00000 n \n", "<< /Size 5 >>")},
 		{"trailer size missing", xrefTablePDF("0 1\n0000000000 65535 f \n", "<< /Root 1 0 R >>")},
