@@ -522,3 +522,41 @@ func TestXrefRowsBounded(t *testing.T) {
 		t.Errorf("NewReader: got %v, want the row budget reported", err)
 	}
 }
+
+// TestObjectStreamByteCap verifies that resolving an object placed far into an
+// object stream is refused once the stream has decoded maxObjStmBytes,
+// rather than inflating the whole gap: 17 KB of nested Flate put an object
+// 4 GiB in, and every resolve took ten seconds.
+func TestObjectStreamByteCap(t *testing.T) {
+	const gap = maxObjStmBytes + 1<<20
+	const catalog = "<< /Type /Catalog /Pages << /Type /Pages /Kids [] /Count 7 >> >>"
+	index := fmt.Sprintf("1 %d ", gap)
+	var comp bytes.Buffer
+	zw := zlib.NewWriter(&comp)
+	zw.Write([]byte(index))
+	zw.Write(make([]byte, gap))
+	zw.Write([]byte(catalog))
+	zw.Close()
+
+	var b strings.Builder
+	b.WriteString("%PDF-1.5\n")
+	off := b.Len()
+	fmt.Fprintf(&b, "2 0 obj\n<< /Type /ObjStm /N 1 /First %d /Filter /FlateDecode /Length %d >>\nstream\n%s\nendstream\nendobj\n",
+		len(index), comp.Len(), comp.String())
+	xref := b.Len()
+	rows := []byte{0, 0, 0, 0, 0, 2, 0, 0, 2, 0}
+	rows = append(rows, 1, byte(off>>16), byte(off>>8), byte(off), 0)
+	rows = append(rows, 1, byte(xref>>16), byte(xref>>8), byte(xref), 0)
+	fmt.Fprintf(&b, "3 0 obj\n<< /Type /XRef /Size 4 /W [1 3 1] /Root 1 0 R /Length %d >>\nstream\n%s\nendstream\nendobj\n", len(rows), rows)
+	fmt.Fprintf(&b, "startxref\n%d\n%%%%EOF\n", xref)
+	data := []byte(b.String())
+
+	r, err := NewReader(bytes.NewReader(data), int64(len(data)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	p, _ := run(t, func() { r.NumPage() })
+	if p == nil || !strings.Contains(fmt.Sprint(p), "exceeds") {
+		t.Errorf("NumPage: got panic %v, want the object stream size cap reported", p)
+	}
+}
