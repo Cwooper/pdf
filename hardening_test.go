@@ -32,25 +32,27 @@ func TestSparseXrefIndexAllocation(t *testing.T) {
 
 // TestSparseObjectNumberResolves verifies that an object numbered far past
 // its neighbours, which the table keeps outside the dense slice, still
-// resolves.
+// resolves. 3000000000 is past the int range of a 32-bit build.
 func TestSparseObjectNumberResolves(t *testing.T) {
-	var b strings.Builder
-	b.WriteString("%PDF-1.4\n")
-	b.WriteString(pad())
-	objOff := b.Len()
-	b.WriteString("500000 0 obj\n<< /Type /Catalog /Pages << /Type /Pages /Kids [] /Count 3 >> >>\nendobj\n")
-	xrefOff := b.Len()
-	fmt.Fprintf(&b, "xref\n0 1\n0000000000 65535 f \n500000 1\n%010d 00000 n \n", objOff)
-	b.WriteString("trailer\n<< /Size 500001 /Root 500000 0 R >>\n")
-	fmt.Fprintf(&b, "startxref\n%d\n%%%%EOF\n", xrefOff)
-	data := []byte(b.String())
+	for _, id := range []int64{500000, 3000000000} {
+		var b strings.Builder
+		b.WriteString("%PDF-1.4\n")
+		b.WriteString(pad())
+		objOff := b.Len()
+		fmt.Fprintf(&b, "%d 0 obj\n<< /Type /Catalog /Pages << /Type /Pages /Kids [] /Count 3 >> >>\nendobj\n", id)
+		xrefOff := b.Len()
+		fmt.Fprintf(&b, "xref\n0 1\n0000000000 65535 f \n%d 1\n%010d 00000 n \n", id, objOff)
+		fmt.Fprintf(&b, "trailer\n<< /Size %d /Root %d 0 R >>\n", id+1, id)
+		fmt.Fprintf(&b, "startxref\n%d\n%%%%EOF\n", xrefOff)
+		data := []byte(b.String())
 
-	r, err := NewReader(bytes.NewReader(data), int64(len(data)))
-	if err != nil {
-		t.Fatalf("NewReader: %v", err)
-	}
-	if got := r.NumPage(); got != 3 {
-		t.Errorf("NumPage = %d, want 3 (catalog at object 500000 not resolved)", got)
+		r, err := NewReader(bytes.NewReader(data), int64(len(data)))
+		if err != nil {
+			t.Fatalf("object %d: NewReader: %v", id, err)
+		}
+		if got := r.NumPage(); got != 3 {
+			t.Errorf("object %d: NumPage = %d, want 3 (catalog not resolved)", id, got)
+		}
 	}
 }
 
@@ -61,8 +63,8 @@ func TestXrefTableDenseGrowthKeepsSparse(t *testing.T) {
 	const far = 200000
 	table := newXrefTable(0)
 	table.put(far, xref{ptr: objptr{far, 0}, offset: 99})
-	for i := 0; i < 70000; i++ {
-		table.put(i, xref{ptr: objptr{uint32(i), 0}, offset: 9})
+	for i := range uint32(70000) {
+		table.put(i, xref{ptr: objptr{i, 0}, offset: 9})
 	}
 	table.put(far+1, xref{ptr: objptr{far + 1, 0}, offset: 9})
 	if got := table.get(far); got.offset != 99 {

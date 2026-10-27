@@ -176,18 +176,18 @@ func (t *xrefTable) get(id uint32) xref {
 // put stores the entry for object number id. The dense slice grows only in
 // proportion to what the table already holds, so the bytes read from the file
 // bound the allocation; anything further out is kept sparse.
-func (t *xrefTable) put(id int, e xref) {
-	if id >= len(t.dense) && id < 2*t.n+maxXrefPrealloc {
-		t.dense = ensureXrefLen(t.dense, id)
+func (t *xrefTable) put(id uint32, e xref) {
+	if i := int64(id); i >= int64(len(t.dense)) && i < int64(2*t.n+maxXrefPrealloc) {
+		t.dense = ensureXrefLen(t.dense, int(id))
 	}
-	if id < len(t.dense) {
+	if int64(id) < int64(len(t.dense)) {
 		t.dense[id] = e
-		delete(t.sparse, uint32(id))
+		delete(t.sparse, id)
 	} else {
 		if t.sparse == nil {
 			t.sparse = make(map[uint32]xref)
 		}
-		t.sparse[uint32(id)] = e
+		t.sparse[id] = e
 	}
 	t.n++
 }
@@ -515,7 +515,7 @@ func readXrefStreamData(r *Reader, strm stream, table *xrefTable, size int64) (*
 		if err := checkObjectNumber(start + n); err != nil {
 			return nil, fmt.Errorf("invalid Index range: %v", err)
 		}
-		for i := 0; i < int(n); i++ {
+		for i := range n {
 			_, err := io.ReadFull(data, buf)
 			if err != nil {
 				return nil, fmt.Errorf("error reading xref stream: %v", err)
@@ -526,8 +526,8 @@ func readXrefStreamData(r *Reader, strm stream, table *xrefTable, size int64) (*
 			}
 			v2 := decodeInt(buf[w[0] : w[0]+w[1]])
 			v3 := decodeInt(buf[w[0]+w[1] : w[0]+w[1]+w[2]])
-			x := int(start) + i
-			if table.get(uint32(x)).ptr != (objptr{}) {
+			x := uint32(start + i)
+			if table.get(x).ptr != (objptr{}) {
 				continue
 			}
 			if table.n >= maxXrefEntries {
@@ -537,9 +537,9 @@ func readXrefStreamData(r *Reader, strm stream, table *xrefTable, size int64) (*
 			case 0:
 				table.put(x, xref{ptr: objptr{0, 65535}})
 			case 1:
-				table.put(x, xref{ptr: objptr{uint32(x), uint16(v3)}, offset: int64(v2)})
+				table.put(x, xref{ptr: objptr{x, uint16(v3)}, offset: int64(v2)})
 			case 2:
-				table.put(x, xref{ptr: objptr{uint32(x), 0}, inStream: true, stream: objptr{uint32(v2), 0}, offset: int64(v3)})
+				table.put(x, xref{ptr: objptr{x, 0}, inStream: true, stream: objptr{uint32(v2), 0}, offset: int64(v3)})
 			default:
 				if DebugOn {
 					fmt.Printf("invalid xref stream type %d: %x\n", v1, buf)
@@ -635,19 +635,19 @@ func readXrefTableData(b *buffer, table *xrefTable) (*xrefTable, error) {
 		if err := checkObjectNumber(start + n); err != nil {
 			return nil, fmt.Errorf("malformed xref table: %v", err)
 		}
-		for i := 0; i < int(n); i++ {
+		for i := range n {
 			off, ok1 := b.readToken().(int64)
 			gen, ok2 := b.readToken().(int64)
 			alloc, ok3 := b.readToken().(keyword)
 			if !ok1 || !ok2 || !ok3 || alloc != keyword("f") && alloc != keyword("n") {
 				return nil, fmt.Errorf("malformed xref table")
 			}
-			x := int(start) + i
+			x := uint32(start + i)
 			if table.n >= maxXrefEntries {
 				return nil, fmt.Errorf("malformed xref table: more than %d entries", maxXrefEntries)
 			}
-			if alloc == "n" && table.get(uint32(x)).offset == 0 {
-				table.put(x, xref{ptr: objptr{uint32(x), uint16(gen)}, offset: int64(off)})
+			if alloc == "n" && table.get(x).offset == 0 {
+				table.put(x, xref{ptr: objptr{x, uint16(gen)}, offset: int64(off)})
 			}
 		}
 	}
