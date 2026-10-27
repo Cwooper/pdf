@@ -204,11 +204,6 @@ func (t *xrefTable) truncate(size int64) {
 	}
 }
 
-// size returns the number of object numbers the table spans.
-func (t *xrefTable) size() int {
-	return len(t.dense) + len(t.sparse)
-}
-
 // checkObjectNumber reports whether x may be used as a cross-reference table
 // index.
 func checkObjectNumber(x int64) error {
