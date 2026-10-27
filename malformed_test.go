@@ -218,9 +218,7 @@ func TestLargeXrefTableGrows(t *testing.T) {
 	if err != nil {
 		t.Fatalf("NewReader: %v", err)
 	}
-	if got := r.xref.n; got != n {
-		t.Errorf("xref table has %d entries, want %d", got, n)
-	}
+	checkXrefEntries(t, r.xref, n)
 }
 
 // TestCompressedXrefStreamManyObjects is why the table is not bounded by the
@@ -253,8 +251,17 @@ func TestCompressedXrefStreamManyObjects(t *testing.T) {
 	if err != nil {
 		t.Fatalf("NewReader on a %d-byte file describing %d objects: %v", len(data), n, err)
 	}
-	if got := r.xref.n; got != n {
-		t.Errorf("xref table has %d entries, want %d", got, n)
+	checkXrefEntries(t, r.xref, n)
+}
+
+// checkXrefEntries fails unless objects 0 through n-1 each hold the type 1,
+// offset 9 entry the tests above write.
+func checkXrefEntries(t *testing.T, table *xrefTable, n int) {
+	t.Helper()
+	for i := range uint32(n) {
+		if got := table.get(i); got.ptr != (objptr{i, 0}) || got.offset != 9 {
+			t.Fatalf("xref entry %d = %+v, want offset 9", i, got)
+		}
 	}
 }
 
