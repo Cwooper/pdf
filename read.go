@@ -292,7 +292,8 @@ func NewReader(f io.ReaderAt, size int64) (*Reader, error) {
 // NewReaderEncrypted opens a file for reading, using the data in f with the given total size.
 // If the PDF is encrypted, NewReaderEncrypted calls pw repeatedly to obtain passwords
 // to try. If pw returns the empty string, NewReaderEncrypted stops trying to decrypt
-// the file and returns an error.
+// the file and returns an error, except for a file that encrypts only its
+// attachments: that file opens anyway, and its attachments fail to read.
 func NewReaderEncrypted(f io.ReaderAt, size int64, pw func() string) (r *Reader, err error) {
 	defer func() {
 		if x := recover(); x != nil {
@@ -649,6 +650,10 @@ func readXrefTable(r *Reader, b *buffer) (*xrefTable, objptr, dict, error) {
 	if !ok {
 		return nil, objptr{}, nil, fmt.Errorf("malformed PDF: trailer missing /Size entry")
 	}
+	// A negative /Size would panic in truncate.
+	if err := checkObjectNumber(size); err != nil {
+		return nil, objptr{}, nil, fmt.Errorf("malformed PDF: trailer /Size: %v", err)
+	}
 
 	table.truncate(size)
 
@@ -955,7 +960,10 @@ func (v Value) Key(key string) Value {
 		x = strm.hdr
 	}
 	res := v.r.resolve(v.ptr, x[name(key)])
-	res.viaEF = v.viaEF || key == "EF"
+	// A file specification's /EF names its embedded file streams; /Type is
+	// required on one that has it.
+	_, isStream := v.data.(stream)
+	res.viaEF = v.viaEF && !isStream || key == "EF" && v.Key("Type").Name() == "Filespec"
 	return res
 }
 

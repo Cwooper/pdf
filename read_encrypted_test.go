@@ -306,6 +306,17 @@ func TestAttachments(t *testing.T) {
 	}
 }
 
+// Only a file specification's /EF marks an embedded file: a font resource
+// named /EF in a file that encrypts only its attachments reads in the clear.
+func TestEFOnlyUnderFilespec(t *testing.T) {
+	s := cryptSpec{V: 4, R: 4, bits: 128, user: "secret", stmF: "Identity", strF: "Identity", eff: "StdCF", attachment: "attached"}
+	data := encryptedPDF(s, "BT (Hello world) Tj ET", "", "/Resources << /Font << /EF << /Type /Font /Subtype /Type1 /ToUnicode 4 0 R >> >> >>")
+	r := openWith(t, data, "secret")
+	if got, err := io.ReadAll(r.Page(1).Font("EF").V.Key("ToUnicode").Reader()); err != nil || string(got) != "BT (Hello world) Tj ET" {
+		t.Errorf("font /EF's stream = %q, %v; want it in the clear", got, err)
+	}
+}
+
 // Every /Encrypt entry may be an indirect reference, a stream's /Crypt filter
 // with no /Name is /Identity, and a 40-bit key under revision 3 takes the
 // owner password's whole MD5 through its 50 rehashes (Algorithm 3).

@@ -49,6 +49,8 @@ func main() {
 			inc(ctr, len(alpha)+1)
 		}
 		if done(ctr) {
+			// A file that encrypts only its attachments opens anyway.
+			last = ""
 			return ""
 		}
 		buf := make([]byte, len(ctr))
