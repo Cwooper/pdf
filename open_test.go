@@ -3,6 +3,9 @@ package pdf
 import (
 	"bytes"
 	"fmt"
+	"io"
+	"os"
+	"slices"
 	"strings"
 	"testing"
 )
@@ -31,14 +34,60 @@ func TestNewReaderRejectsInvalidHeader(t *testing.T) {
 	}
 }
 
-func TestNewReaderRejectsMissingEOF(t *testing.T) {
-	// Must be longer than the 100-byte EOF lookback chunk so the tail is
-	// actually read (NewReader reads the last 100 bytes).
-	data := []byte("%PDF-1.4\n" + strings.Repeat("x", 200))
-	_, err := NewReader(bytes.NewReader(data), int64(len(data)))
-	if err == nil || !strings.Contains(err.Error(), "EOF") {
-		t.Fatalf("err = %v, want missing %%EOF error", err)
+// TestLenientFileEnd verifies that a file opens with bytes after its %%EOF,
+// or with none at all, so long as its last startxref lies in the last 1,024
+// bytes.
+func TestLenientFileEnd(t *testing.T) {
+	const window = 1024
+	for _, name := range []string{"pdf20.pdf", "ascii85_flate_chain.pdf", "rc4-40.pdf"} {
+		data, err := os.ReadFile("testdata/" + name)
+		if err != nil {
+			t.Fatal(err)
+		}
+		want := fileText(t, data)
+		tail := data[bytes.LastIndex(data, []byte("startxref")):]
+		tests := []struct {
+			name string
+			data []byte
+			ok   bool
+		}{
+			{"junk after %%EOF", slices.Concat(data, []byte("<signature>\r\n trailing junk")), true},
+			{"nulls after %%EOF", slices.Concat(data, make([]byte, 512)), true},
+			{"no %%EOF", bytes.TrimSuffix(bytes.TrimRight(data, "\r\n"), []byte("%%EOF")), true},
+			{"no line after startxref", bytes.TrimRight(bytes.TrimSuffix(bytes.TrimRight(data, "\r\n"), []byte("%%EOF")), "\r\n"), true},
+			{"startxref first in the window", slices.Concat(data, make([]byte, window-len(tail))), true},
+			{"startxref before the window", slices.Concat(data, make([]byte, window-len(tail)+1)), false},
+		}
+		for _, tt := range tests {
+			t.Run(name+" "+tt.name, func(t *testing.T) {
+				_, err := NewReader(bytes.NewReader(tt.data), int64(len(tt.data)))
+				if !tt.ok {
+					if err == nil || !strings.Contains(err.Error(), "startxref") {
+						t.Errorf("err = %v, want missing startxref", err)
+					}
+					return
+				}
+				if got := fileText(t, tt.data); got != want {
+					t.Errorf("text = %q, want %q", got, want)
+				}
+			})
+		}
 	}
+}
+
+// fileText returns the text of every page of data.
+func fileText(t *testing.T, data []byte) string {
+	t.Helper()
+	r, err := NewReader(bytes.NewReader(data), int64(len(data)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	rd, err := r.GetPlainText()
+	if err != nil {
+		t.Fatal(err)
+	}
+	text, _ := io.ReadAll(rd)
+	return string(text)
 }
 
 func TestNewReaderRejectsMissingStartXref(t *testing.T) {

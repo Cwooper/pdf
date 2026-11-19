@@ -84,8 +84,8 @@ func allocated(fn func()) uint64 {
 	return after.TotalAlloc - before.TotalAlloc
 }
 
-// pad returns a comment line long enough to push a file past the 100-byte
-// window NewReader reads from the end.
+// pad returns a comment line of filler between a file's header and the
+// rest of it.
 func pad() string { return "%" + strings.Repeat("p", 90) + "\n" }
 
 // xrefStreamPDF builds a PDF whose startxref points at an xref stream carrying

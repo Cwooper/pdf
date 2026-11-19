@@ -341,8 +341,12 @@ func FuzzPageText(f *testing.F) {
 	})
 }
 
-// objSep separates the trailer entries and the objects of FuzzOpen's input.
-const objSep = "\nendobj\n"
+// objSep separates the trailer entries and the objects of FuzzOpen's input,
+// and tailSep ends them: what follows it follows the file's %%EOF.
+const (
+	objSep  = "\nendobj\n"
+	tailSep = "\n%%EOF\n"
+)
 
 var (
 	fileObject  = regexp.MustCompile(`(?s)\d+ 0 obj\n(.*?)\nendobj\n`)
@@ -360,8 +364,9 @@ func openInput(file []byte) []byte {
 }
 
 // FuzzOpen reads a whole file the way a text extractor does. The input is
-// its trailer entries and objects, and the xref is built around them: nearly
-// every mutation of a raw file shifts an offset, and would stop at the xref.
+// its trailer entries and objects, and the xref is built around them (nearly
+// every mutation of a raw file shifts an offset, and would stop at the xref),
+// then any bytes to follow the file.
 func FuzzOpen(f *testing.F) {
 	content := "BT /F1 12 Tf 72 700 Td (Hello) Tj ET"
 	for _, seed := range [][]byte{
@@ -378,6 +383,7 @@ func FuzzOpen(f *testing.F) {
 	} {
 		f.Add(openInput(seed))
 	}
+	f.Add(slices.Concat(openInput(validPDF()), []byte(tailSep+"<signature> trailing junk\r\n"), make([]byte, 64)))
 	for _, name := range []string{"testdata/ascii85_flate_chain.pdf", "testdata/ascii85_zero_group.pdf", "testdata/aes256-r6.pdf", "testdata/aes256-r5.pdf", "testdata/owner-empty-r6.pdf"} {
 		data, err := os.ReadFile(name)
 		if err != nil {
@@ -386,10 +392,11 @@ func FuzzOpen(f *testing.F) {
 		f.Add(openInput(data))
 	}
 	f.Fuzz(func(t *testing.T, input []byte) {
-		parts := strings.Split(string(input), objSep)
+		objs, tail, _ := strings.Cut(string(input), tailSep)
+		parts := strings.Split(objs, objSep)
 		data := buildPDF(parts[1:]...)
 		i := bytes.LastIndex(data, []byte(">>\nstartxref"))
-		data = slices.Concat(data[:i], []byte(parts[0]), data[i:])
+		data = slices.Concat(data[:i], []byte(parts[0]), data[i:], []byte(tail))
 		r, err := NewReader(bytes.NewReader(data), int64(len(data)))
 		checkErr(t, "NewReader", err)
 		if err != nil {

@@ -315,18 +315,14 @@ func NewReaderEncrypted(f io.ReaderAt, size int64, pw func() string) (r *Reader,
 		return nil, fmt.Errorf("not a PDF file: invalid header")
 	}
 	end := size
-	const endChunk = 100
-	chunk := int64(endChunk)
-	if chunk > end {
-		chunk = end
-	}
+	// Acrobat takes the last startxref in the last 1,024 bytes, whatever
+	// follows it; the byte before them is read for the line break a
+	// startxref first in them needs.
+	const endChunk = 1024
+	chunk := min(endChunk+1, end)
 	buf = make([]byte, chunk)
 	if _, err := f.ReadAt(buf, end-chunk); err != nil && err != io.EOF {
-		return nil, fmt.Errorf("not a PDF file: %v", err)
-	}
-	buf = bytes.TrimRight(buf, "\r\n\t ")
-	if !bytes.HasSuffix(buf, []byte("%%EOF")) {
-		return nil, fmt.Errorf("not a PDF file: missing %%%%EOF")
+		return nil, fmt.Errorf("not a PDF file: %w", err)
 	}
 	i := findLastLine(buf, "startxref")
 	if i < 0 {
@@ -343,6 +339,7 @@ func NewReaderEncrypted(f io.ReaderAt, size int64, pw func() string) (r *Reader,
 	r.cache.glyphs.Store(maxDocGlyphs)
 	pos := end - chunk + int64(i)
 	b := newBuffer(io.NewSectionReader(f, pos, end-pos), pos)
+	b.allowEOF = true
 	if b.readToken() != keyword("startxref") {
 		return nil, fmt.Errorf("malformed PDF file: missing startxref")
 	}
