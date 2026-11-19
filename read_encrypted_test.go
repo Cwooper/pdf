@@ -121,6 +121,25 @@ func TestAES256EncryptDict(t *testing.T) {
 	}
 }
 
+// A file that encrypts only its attachments, its strings and streams under
+// /Identity, reads as plain text whatever its other entries hold; one with
+// only streams under /Identity is unsupported.
+func TestIdentityCryptFilters(t *testing.T) {
+	page := streamPage("", []byte("BT (Hello world) Tj ET"))
+	for _, enc := range []string{
+		"<< /Filter /Standard /V 4 /R 4 /StmF /Identity /StrF /Identity /EFF /StdCF /CF << /StdCF << /CFM /AESV2 >> >> >>",
+		"<< /Filter /Standard /V 5 /R 6 /StmF /Identity /StrF /Identity /EFF /StdCF /CF << /StdCF << /CFM /AESV3 >> >> >>",
+	} {
+		if got, err := plainText(t, withEncrypt(page, enc)); err != nil || !strings.Contains(got, "Hello world") {
+			t.Errorf("%s: GetPlainText = %q, %v; want %q", enc, got, err, "Hello world")
+		}
+	}
+	mixed := "<< /Filter /Standard /V 5 /R 6 /StmF /Identity /StrF /StdCF /CF << /StdCF << /CFM /AESV3 >> >> >>"
+	if err := openBytes(withEncrypt(page, mixed)); err == nil || !strings.HasPrefix(err.Error(), "unsupported") {
+		t.Errorf("mixed filters: got %v, want unsupported", err)
+	}
+}
+
 func TestHeaderVersion(t *testing.T) {
 	r, err := openFixture(t, "pdf20.pdf")
 	if err != nil {

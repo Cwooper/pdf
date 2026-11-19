@@ -1453,6 +1453,9 @@ const (
 	cryptAESV3 // AES-256, under the file key itself
 )
 
+// TODO: initEncrypt tries password only as the user password; viewers also
+// try it as the owner password, which opens a file whose owner password is
+// empty though its user password is not.
 func (r *Reader) initEncrypt(password string) error {
 	// See PDF 32000-1:2008, §7.6.
 	encrypt, _ := r.resolve(objptr{}, r.trailer["Encrypt"]).data.(dict)
@@ -1460,6 +1463,13 @@ func (r *Reader) initEncrypt(password string) error {
 		return fmt.Errorf("unsupported PDF: encryption filter %v", objfmt(encrypt["Filter"]))
 	}
 	V, _ := encrypt["V"].(int64)
+	// Acrobat's "encrypt only file attachments" leaves strings and streams in
+	// the clear, and the file opens without a password.
+	// TODO: a file with only one of StmF and StrF /Identity fails as
+	// unsupported, as does a stream's own /Crypt filter.
+	if V >= 4 && encrypt["StmF"] == name("Identity") && encrypt["StrF"] == name("Identity") {
+		return nil
+	}
 	if V == 5 {
 		return r.initEncryptAES256(encrypt, password)
 	}

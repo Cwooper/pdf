@@ -377,7 +377,7 @@ func FuzzOpen(f *testing.F) {
 	} {
 		f.Add(openInput(seed))
 	}
-	for _, name := range []string{"testdata/ascii85_flate_chain.pdf", "testdata/ascii85_zero_group.pdf", "testdata/aes256-r6.pdf", "testdata/aes256-r5.pdf", "testdata/pdf20.pdf"} {
+	for _, name := range []string{"testdata/ascii85_flate_chain.pdf", "testdata/ascii85_zero_group.pdf", "testdata/aes256-r6.pdf", "testdata/aes256-r5.pdf"} {
 		data, err := os.ReadFile(name)
 		if err != nil {
 			f.Fatal(err)
