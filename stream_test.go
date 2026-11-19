@@ -133,50 +133,39 @@ func TestDecryptStringAESRoundTrip(t *testing.T) {
 	}
 }
 
-func TestStdCryptFilter(t *testing.T) {
-	valid := dict{
-		name("CF"): dict{
-			name("StdCF"): dict{
-				name("CFM"):       name("AESV2"),
-				name("Length"):    int64(16),
-				name("AuthEvent"): name("DocOpen"),
-			},
-		},
-		name("StmF"): name("StdCF"),
-		name("StrF"): name("StdCF"),
-	}
-	if cfm, ok := stdCryptFilter(valid, 16); !ok || cfm != name("AESV2") {
-		t.Fatalf("stdCryptFilter(valid) = %v, %v; want AESV2, true", cfm, ok)
-	}
-	if _, ok := stdCryptFilter(valid, 32); ok {
-		t.Fatal("stdCryptFilter should reject a key length other than the one asked for")
-	}
-
-	if _, ok := stdCryptFilter(dict{name("StmF"): name("A"), name("StrF"): name("B")}, 16); ok {
-		t.Fatal("stdCryptFilter should reject StmF != StrF")
-	}
-	badLength := dict{
-		name("CF"):   dict{name("StdCF"): dict{name("CFM"): name("AESV2"), name("Length"): int64(8)}},
-		name("StmF"): name("StdCF"),
-		name("StrF"): name("StdCF"),
-	}
-	if _, ok := stdCryptFilter(badLength, 16); ok {
-		t.Fatal("stdCryptFilter should reject non-16-byte key length")
-	}
-	badCFType := dict{
-		name("CF"):   dict{name("StdCF"): int64(1234)}, // CF value is not a dict
-		name("StmF"): name("StdCF"),
-		name("StrF"): name("StdCF"),
-	}
-	if _, ok := stdCryptFilter(badCFType, 16); ok {
-		t.Fatal("stdCryptFilter should reject a non-dict CF entry")
+func TestCryptFilterMethod(t *testing.T) {
+	for _, tt := range []struct {
+		param dict
+		V     int64
+		want  cryptMethod
+		ok    bool
+	}{
+		{dict{"CFM": name("AESV2"), "Length": int64(16), "AuthEvent": name("DocOpen")}, 4, cryptAESV2, true},
+		{dict{"CFM": name("AESV2"), "Length": int64(128)}, 4, cryptAESV2, true},
+		{dict{"CFM": name("V2")}, 4, cryptRC4, true},
+		{dict{"CFM": name("AESV2"), "AuthEvent": name("EFOpen")}, 4, cryptAESV2, true},
+		{dict{"CFM": name("AESV3"), "Length": int64(32)}, 5, cryptAESV3, true},
+		{dict{"CFM": name("AESV3"), "Length": int64(256)}, 5, cryptAESV3, true},
+		{dict{"CFM": name("AESV2"), "Length": int64(8)}, 4, 0, false},
+		{dict{"CFM": name("AESV3"), "Length": int64(16)}, 5, 0, false},
+		{dict{"CFM": name("AESV2"), "AuthEvent": name("Other")}, 4, 0, false},
+		{dict{"CFM": name("None")}, 4, 0, false},
+		{dict{"CFM": name("AESV3")}, 4, 0, false},
+		{dict{"CFM": name("AESV2")}, 5, 0, false},
+		{nil, 4, 0, false},
+	} {
+		if got, ok := cryptFilterMethod(tt.param, tt.V); got != tt.want || ok != tt.ok {
+			t.Errorf("V%d %v: got %v, %v; want %v, %v", tt.V, tt.param, got, ok, tt.want, tt.ok)
+		}
 	}
 
-	// V4 takes only AESV2 and V2, and V5 only AESV3.
+	// A string or stream filter no method serves is unsupported.
 	for _, enc := range []string{
 		"<< /Filter /Standard /V 4 /R 4 /CF << /StdCF << /CFM /None >> >> /StmF /StdCF /StrF /StdCF >>",
 		"<< /Filter /Standard /V 4 /R 4 /CF << /StdCF << /CFM /AESV3 >> >> /StmF /StdCF /StrF /StdCF >>",
 		"<< /Filter /Standard /V 5 /R 6 /CF << /StdCF << /CFM /V2 >> >> /StmF /StdCF /StrF /StdCF >>",
+		"<< /Filter /Standard /V 4 /R 4 /StmF /StdCF /StrF /StdCF >>",
+		"<< /Filter /Standard /V 4 /R 4 /CF << /StdCF << /CFM /AESV2 >> >> /StmF /StdCF /StrF /Other >>",
 	} {
 		if err := openBytes(withEncrypt(buildPDF("<< /Type /Catalog >>"), enc)); err == nil || !strings.HasPrefix(err.Error(), "unsupported") {
 			t.Errorf("%s: got %v, want unsupported", enc, err)

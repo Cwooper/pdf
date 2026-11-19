@@ -487,7 +487,7 @@ func (b *buffer) readObject() object {
 		return nil
 	}
 
-	if str, ok := tok.(string); ok && b.key != nil && b.objptr.id != 0 {
+	if str, ok := tok.(string); ok && b.crypt != cryptNone && b.key != nil && b.objptr.id != 0 {
 		tok = b.decrypter.decrypt(b.key, b.crypt, b.objptr, str)
 	}
 

@@ -4,6 +4,8 @@ import (
 	"bytes"
 	"encoding/hex"
 	"errors"
+	"fmt"
+	"io"
 	"os"
 	"strings"
 	"testing"
@@ -122,21 +124,41 @@ func TestAES256EncryptDict(t *testing.T) {
 }
 
 // A file that encrypts only its attachments, its strings and streams under
-// /Identity, reads as plain text whatever its other entries hold; one with
-// only streams under /Identity is unsupported.
+// /Identity, reads as plain text whatever its other entries hold, and its
+// attachments fail to read rather than read as ciphertext.
 func TestIdentityCryptFilters(t *testing.T) {
-	page := streamPage("", []byte("BT (Hello world) Tj ET"))
+	page := pagePDF("", fmt.Sprintf("<< /Length 22 >>\nstream\nBT (Hello world) Tj ET\nendstream"),
+		"<< /Type /EmbeddedFile /Length 16 >>\nstream\n0123456789abcdef\nendstream")
 	for _, enc := range []string{
-		"<< /Filter /Standard /V 4 /R 4 /StmF /Identity /StrF /Identity /EFF /StdCF /CF << /StdCF << /CFM /AESV2 >> >> >>",
+		"<< /Filter /Standard /V 4 /R 4 /StmF /Identity /StrF /Identity /EFF /StdCF /CF << /StdCF << /CFM /AESV2 /AuthEvent /EFOpen >> >> >>",
 		"<< /Filter /Standard /V 5 /R 6 /StmF /Identity /StrF /Identity /EFF /StdCF /CF << /StdCF << /CFM /AESV3 >> >> >>",
+		"<< /Filter /Standard /V 4 /R 4 >>",
 	} {
-		if got, err := plainText(t, withEncrypt(page, enc)); err != nil || !strings.Contains(got, "Hello world") {
+		r := openPDF(t, withEncrypt(page, enc))
+		if got, err := r.Page(1).GetPlainText(nil); err != nil || !strings.Contains(got, "Hello world") {
 			t.Errorf("%s: GetPlainText = %q, %v; want %q", enc, got, err, "Hello world")
 		}
+		_, err := io.ReadAll(r.resolve(objptr{}, objptr{5, 0}).Reader())
+		if wantErr := strings.Contains(enc, "/EFF"); (err != nil) != wantErr {
+			t.Errorf("%s: reading the attachment: %v, want an error %v", enc, err, wantErr)
+		}
 	}
-	mixed := "<< /Filter /Standard /V 5 /R 6 /StmF /Identity /StrF /StdCF /CF << /StdCF << /CFM /AESV3 >> >> >>"
-	if err := openBytes(withEncrypt(page, mixed)); err == nil || !strings.HasPrefix(err.Error(), "unsupported") {
-		t.Errorf("mixed filters: got %v, want unsupported", err)
+}
+
+// Strings and streams can take different crypt filters, and a stream can
+// name its own through a /Crypt filter (PDF 32000-1 7.4.10).
+func TestMixedCryptFilters(t *testing.T) {
+	for _, s := range []cryptSpec{
+		{V: 4, R: 4, bits: 128, stmF: "Identity"},
+		{V: 4, R: 4, bits: 128, strF: "Identity"},
+		{V: 4, R: 4, bits: 128, ownCrypt: "Identity"},
+		{V: 4, R: 4, bits: 128, stmF: "Identity", ownCrypt: "StdCF"},
+	} {
+		t.Run(fmt.Sprintf("%+v", s), func(t *testing.T) { checkDecrypts(t, s) })
+	}
+	data := encryptedPDF(cryptSpec{V: 4, R: 4, bits: 128, ownCrypt: "Missing"}, "BT (Hello world) Tj ET", "", "")
+	if _, err := io.ReadAll(openPDF(t, data).Page(1).V.Key("Contents").Reader()); err == nil {
+		t.Error("a /Crypt filter naming no crypt filter read, want an error")
 	}
 }
 
@@ -170,8 +192,46 @@ func TestAES256HashMatchesQpdf(t *testing.T) {
 		if err != nil || len(u) != aes256OULen {
 			t.Fatalf("bad vector %q", line)
 		}
-		if got := aes256Hash(6, []byte(pw), u[32:40]); !bytes.Equal(got, u[:32]) {
+		if got := aes256Hash(6, []byte(pw), u[32:40], nil); !bytes.Equal(got, u[:32]) {
 			t.Errorf("password %q, salt %x: hash %x, want %x", pw, u[32:40], got, u[:32])
+		}
+	}
+}
+
+// Viewers try a password as the owner password too. An AES-256 file can have
+// an empty owner password and so open with none; revisions 2 to 4 take the
+// user password as the owner's when the owner's is empty (Algorithm 3).
+func TestOwnerPassword(t *testing.T) {
+	r, err := openFixture(t, "owner-empty-r6.pdf")
+	if err != nil {
+		t.Fatalf("owner-empty-r6.pdf: %v", err)
+	}
+	checkFixtureText(t, r, "aes two fifty six reads this")
+	for _, name := range []string{"userpw-r2.pdf", "userpw-r4.pdf", "aes256-userpw.pdf"} {
+		r, err := openFixture(t, name, "owner")
+		if err != nil {
+			t.Errorf("%s with the owner password: %v", name, err)
+			continue
+		}
+		checkFixtureText(t, r, "aes two fifty six reads this")
+	}
+}
+
+// Revisions 2 to 4 hash a password in PDFDocEncoding, and revisions 5 and 6
+// after SASLprep: qpdf wrote latin1-r4.pdf under "pässwörd" and sasl-r6.pdf
+// under "IX", which SASLprep makes of the Roman numeral nine.
+func TestPasswordEncoding(t *testing.T) {
+	for name, pw := range map[string]string{"latin1-r4.pdf": "pässwörd", "sasl-r6.pdf": "\u2168"} {
+		r, err := openFixture(t, name, pw)
+		if err != nil {
+			t.Fatalf("%s: %v", name, err)
+		}
+		checkFixtureText(t, r, "aes two fifty six reads this")
+	}
+	// RFC 4013's examples, and a space.
+	for in, want := range map[string]string{"I\u00adX": "IX", "user": "user", "USER": "USER", "\u00aa": "a", "\u2168": "IX", "a\u00a0b": "a b"} {
+		if got := saslPrep(in); got != want {
+			t.Errorf("saslPrep(%q) = %q, want %q", in, got, want)
 		}
 	}
 }

@@ -77,6 +77,22 @@ type cryptSpec struct {
 	cfLength   string // the crypt filter's /Length, if any
 	noMetadata bool   // /EncryptMetadata false, with a metadata stream
 	slop       int    // bytes after the content stream's data, in its /Length
+	// With V 4: stmF and strF name the stream and string filters, StdCF when
+	// empty, and ownCrypt the filter the content stream names in its own
+	// /Crypt filter, if any. Under /Identity the data stays in the clear.
+	stmF, strF, ownCrypt string
+}
+
+// sealed reports whether data under the crypt filter named f is encrypted.
+func (s cryptSpec) sealed(f string) bool {
+	return s.V < 4 || f != "Identity"
+}
+
+func orStdCF(f string) string {
+	if f == "" {
+		return "StdCF"
+	}
+	return f
 }
 
 // fileKey derives the file key (Algorithm 2).
@@ -155,7 +171,20 @@ func (s cryptSpec) encrypt(key []byte, id int, data []byte) []byte {
 func encryptedPDF(s cryptSpec, content, title, pageExtra string) []byte {
 	O := strings.Repeat("O", 32)
 	key := s.fileKey(O)
-	strm := append(s.encrypt(key, 4, []byte(content)), strings.Repeat(" ", s.slop)...)
+	stmF, strF := orStdCF(s.stmF), orStdCF(s.strF)
+	contentF, contentDict := stmF, ""
+	if s.ownCrypt != "" {
+		contentF, contentDict = s.ownCrypt, " /Filter /Crypt /DecodeParms << /Name /"+s.ownCrypt+" >>"
+	}
+	strm := []byte(content)
+	if s.sealed(contentF) {
+		strm = s.encrypt(key, 4, strm)
+	}
+	strm = append(strm, strings.Repeat(" ", s.slop)...)
+	titleStr := []byte(title)
+	if s.sealed(strF) {
+		titleStr = s.encrypt(key, 6, titleStr)
+	}
 	enc := fmt.Sprintf("<< /Filter /Standard /V %d /R %d /Length %d /O <%x> /U <%x> /P -4", s.V, s.R, s.bits, O, s.userEntry(key))
 	if s.V == 4 {
 		cfLength := ""
@@ -166,7 +195,7 @@ func encryptedPDF(s cryptSpec, content, title, pageExtra string) []byte {
 		if s.rc4CF {
 			cfm = "V2"
 		}
-		enc += fmt.Sprintf(" /CF << /StdCF << /CFM /%s%s >> >> /StmF /StdCF /StrF /StdCF", cfm, cfLength)
+		enc += fmt.Sprintf(" /CF << /StdCF << /CFM /%s%s >> >> /StmF /%s /StrF /%s", cfm, cfLength, stmF, strF)
 	}
 	catalog := "<< /Type /Catalog /Pages 2 0 R /Outlines 5 0 R >>"
 	if s.noMetadata {
@@ -177,9 +206,9 @@ func encryptedPDF(s cryptSpec, content, title, pageExtra string) []byte {
 		catalog,
 		"<< /Type /Pages /Kids [3 0 R] /Count 1 >>",
 		"<< /Type /Page /Parent 2 0 R /Contents 4 0 R " + pageExtra + " >>",
-		fmt.Sprintf("<< /Length %d >>\nstream\n%s\nendstream", len(strm), strm),
+		fmt.Sprintf("<< /Length %d%s >>\nstream\n%s\nendstream", len(strm), contentDict, strm),
 		"<< /Type /Outlines /First 6 0 R /Last 6 0 R /Count 1 >>",
-		fmt.Sprintf("<< /Title <%x> /Parent 5 0 R >>", s.encrypt(key, 6, []byte(title))),
+		fmt.Sprintf("<< /Title <%x> /Parent 5 0 R >>", titleStr),
 		enc + " >>",
 	}
 	if s.noMetadata {

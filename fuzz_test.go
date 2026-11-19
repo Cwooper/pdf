@@ -44,7 +44,7 @@ func checkErr(t *testing.T, what string, err error) {
 var fuzzKeys = []struct {
 	key   []byte
 	crypt cryptMethod
-}{{nil, cryptRC4}, {[]byte("40bit"), cryptRC4}, {[]byte(testID), cryptRC4}, {[]byte(testID), cryptAESV2}, {[]byte(testID + testID), cryptAESV3}}
+}{{nil, cryptNone}, {[]byte("40bit"), cryptRC4}, {[]byte(testID), cryptRC4}, {[]byte(testID), cryptAESV2}, {[]byte(testID + testID), cryptAESV3}}
 
 // objSize returns the string bytes and the array and dict entries x holds.
 func objSize(x object) (strs, entries int) {
@@ -270,7 +270,7 @@ func FuzzStream(f *testing.F) {
 		}
 		file := buildPDF("<< /Type /Catalog >>", fmt.Sprintf("<< /Length %d %s %s >>\nstream\n%s\nendstream", len(data), filter, dict, data))
 		r := openPDF(t, file)
-		r.key, r.crypt, r.clearMetadata = k.key, k.crypt, mode&8 != 0
+		r.key, r.stmCrypt, r.clearMetadata = k.key, k.crypt, mode&8 != 0
 		tolerate(func() {
 			n, _ := io.Copy(io.Discard, r.resolve(objptr{}, objptr{2, 0}).Reader())
 			if n > r.cache.limit {
@@ -377,7 +377,7 @@ func FuzzOpen(f *testing.F) {
 	} {
 		f.Add(openInput(seed))
 	}
-	for _, name := range []string{"testdata/ascii85_flate_chain.pdf", "testdata/ascii85_zero_group.pdf", "testdata/aes256-r6.pdf", "testdata/aes256-r5.pdf"} {
+	for _, name := range []string{"testdata/ascii85_flate_chain.pdf", "testdata/ascii85_zero_group.pdf", "testdata/aes256-r6.pdf", "testdata/aes256-r5.pdf", "testdata/owner-empty-r6.pdf"} {
 		data, err := os.ReadFile(name)
 		if err != nil {
 			f.Fatal(err)

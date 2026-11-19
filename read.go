@@ -54,7 +54,8 @@ package pdf
 // BUG(rsc): Apart from the object streams, fonts, cmaps, and page tree a Reader decodes, which it keeps, the library
 // makes no attempt at efficiency. A value cache maintained in the Reader would probably help.
 
-// BUG(rsc): The support for reading encrypted files is weak.
+// BUG(rsc): Only the Standard security handler is supported: a file encrypted
+// to public-key certificates does not open.
 
 // BUG(rsc): The Value API does not support error reporting. The intent is to allow users to
 // set an error reporting callback in Reader, but that code has not been implemented.
@@ -82,8 +83,11 @@ import (
 	"slices"
 	"sort"
 	"strconv"
+	"strings"
 	"sync"
 	"sync/atomic"
+
+	"golang.org/x/text/unicode/norm"
 )
 
 // DebugOn is responsible for logging messages into stdout. If problems arise during reading, set it true.
@@ -101,8 +105,12 @@ type Reader struct {
 	xref       *xrefTable
 	trailer    dict
 	trailerptr objptr
-	key        []byte
-	crypt      cryptMethod
+	key        []byte // nil when no password opened the file
+	// strCrypt, stmCrypt, and effCrypt encrypt strings, streams, and embedded
+	// files; filters holds the crypt filters by name, for a stream's own
+	// /Crypt filter.
+	strCrypt, stmCrypt, effCrypt cryptMethod
+	filters                      map[name]cryptMethod
 	// clearMetadata marks /EncryptMetadata false: metadata streams are
 	// stored unencrypted.
 	clearMetadata bool
@@ -998,7 +1006,7 @@ func (r *Reader) resolve(parent objptr, x interface{}) Value {
 		} else {
 			b := newBuffer(io.NewSectionReader(r.f, xref.offset, r.end-xref.offset), xref.offset)
 			b.key = r.key
-			b.crypt = r.crypt
+			b.crypt = r.strCrypt
 			obj = b.readObject()
 			r.spend(b.readOffset() - xref.offset)
 			def, ok := obj.(objdef)
@@ -1293,28 +1301,59 @@ func (v Value) Reader() io.ReadCloser {
 	if streamLen <= 0 {
 		return io.NopCloser(bytes.NewReader(nil))
 	}
-	var rd io.Reader
-	rd = io.NewSectionReader(v.r.f, x.offset, streamLen)
-	if v.r.key != nil && !(v.r.clearMetadata && v.Key("Type").Name() == "Metadata") {
-		rd = decryptStream(v.r.key, v.r.crypt, x.ptr, rd)
-	}
-	rd = v.r.charge(rd)
 	filter := v.Key("Filter")
 	param := v.Key("DecodeParms")
+	var filters []string
+	var params []Value
 	switch filter.Kind() {
 	default:
 		panic(fmt.Errorf("unsupported filter %v", filter))
 	case Null:
 		// ok
 	case Name:
-		rd = v.r.charge(v.r.applyFilter(rd, filter.Name(), param))
+		filters, params = []string{filter.Name()}, []Value{param}
 	case Array:
 		if filter.Len() > maxFilters {
 			panic(fmt.Errorf("stream has %d filters, more than %d", filter.Len(), maxFilters))
 		}
 		for i := 0; i < filter.Len(); i++ {
-			rd = v.r.charge(v.r.applyFilter(rd, filter.Index(i).Name(), param.Index(i)))
+			filters, params = append(filters, filter.Index(i).Name()), append(params, param.Index(i))
 		}
+	}
+
+	m := v.r.stmCrypt
+	switch v.Key("Type").Name() {
+	case "Metadata":
+		if v.r.clearMetadata {
+			m = cryptNone
+		}
+	case "EmbeddedFile":
+		m = v.r.effCrypt
+	}
+	// A /Crypt filter, first in the chain, picks the stream's own crypt
+	// filter by name (section 7.4.10).
+	if len(filters) > 0 && filters[0] == "Crypt" {
+		n := name(params[0].Key("Name").Name())
+		if n == "" {
+			n = "Identity"
+		}
+		var ok bool
+		if m, ok = v.r.filters[n]; !ok && n != "Identity" {
+			return &errorReadCloser{fmt.Errorf("unknown crypt filter %v", n)}
+		}
+		filters, params = filters[1:], params[1:]
+	}
+	var rd io.Reader
+	rd = io.NewSectionReader(v.r.f, x.offset, streamLen)
+	if m != cryptNone {
+		if v.r.key == nil {
+			return &errorReadCloser{errNoFileKey}
+		}
+		rd = decryptStream(v.r.key, m, x.ptr, rd)
+	}
+	rd = v.r.charge(rd)
+	for i, f := range filters {
+		rd = v.r.charge(v.r.applyFilter(rd, f, params[i]))
 	}
 
 	return io.NopCloser(rd)
@@ -1433,7 +1472,7 @@ const (
 	// revisions >= 3 (Algorithm 5).
 	rc4UIterations = 19
 
-	// AES-256 (V 5) parameters. See ISO 32000-2:2020, §7.6.4.
+	// AES-256 (V 5) parameters. See ISO 32000-2:2020, section 7.6.4.
 	// aes256OULen is the byte length of O and U: a 32-byte hash, an 8-byte
 	// validation salt, and an 8-byte key salt.
 	aes256OULen = 48
@@ -1444,18 +1483,20 @@ const (
 	aes256MaxPassword = 127
 )
 
-// cryptMethod is how a file's strings and streams are encrypted.
+// cryptMethod is how a class of strings or streams is encrypted.
 type cryptMethod uint8
 
 const (
-	cryptRC4 cryptMethod = iota
+	cryptNone cryptMethod = iota // the Identity filter: in the clear
+	cryptRC4
 	cryptAESV2
 	cryptAESV3 // AES-256, under the file key itself
 )
 
-// TODO: initEncrypt tries password only as the user password; viewers also
-// try it as the owner password, which opens a file whose owner password is
-// empty though its user password is not.
+// errNoFileKey fails a read that needs the file key when the password did not
+// open it, as in a file that encrypts only its attachments.
+var errNoFileKey = errors.New("encrypted PDF: no password opens this stream")
+
 func (r *Reader) initEncrypt(password string) error {
 	// See PDF 32000-1:2008, §7.6.
 	encrypt, _ := r.resolve(objptr{}, r.trailer["Encrypt"]).data.(dict)
@@ -1463,142 +1504,301 @@ func (r *Reader) initEncrypt(password string) error {
 		return fmt.Errorf("unsupported PDF: encryption filter %v", objfmt(encrypt["Filter"]))
 	}
 	V, _ := encrypt["V"].(int64)
-	// Acrobat's "encrypt only file attachments" leaves strings and streams in
-	// the clear, and the file opens without a password.
-	// TODO: a file with only one of StmF and StrF /Identity fails as
-	// unsupported, as does a stream's own /Crypt filter.
-	if V >= 4 && encrypt["StmF"] == name("Identity") && encrypt["StrF"] == name("Identity") {
-		return nil
-	}
-	if V == 5 {
-		return r.initEncryptAES256(encrypt, password)
-	}
-	cfm, okV4 := stdCryptFilter(encrypt, maxKeyBits/8)
-	if V != 1 && V != 2 && (V != 4 || !okV4 || cfm != name("AESV2") && cfm != name("V2")) {
+	if V != 1 && V != 2 && V != 4 && V != 5 {
 		return fmt.Errorf("unsupported PDF: encryption version V=%d; %v", V, objfmt(encrypt))
 	}
+	str, stm, eff, filters, err := r.cryptFilters(encrypt, V)
+	if err != nil {
+		return err
+	}
+	R, _ := encrypt["R"].(int64)
+	clearMetadata := R >= 4 && encrypt["EncryptMetadata"] == false
+	var key []byte
+	if V == 5 {
+		key, err = aes256FileKey(encrypt, R, password)
+	} else {
+		key, err = r.rc4FileKey(encrypt, V, R, clearMetadata, password)
+	}
+	if err != nil {
+		// A document whose strings and streams are in the clear opens without
+		// the password; only its attachments need it.
+		if str != cryptNone || stm != cryptNone {
+			return err
+		}
+		key = nil
+	}
+	r.key = key
+	r.strCrypt, r.stmCrypt, r.effCrypt, r.filters = str, stm, eff, filters
+	r.clearMetadata = clearMetadata
+	return nil
+}
+
+// cryptFilters returns the methods strings, streams, and embedded files are
+// encrypted with, and the crypt filters by name for a stream's own /Crypt
+// filter (section 7.6.5).
+func (r *Reader) cryptFilters(encrypt dict, V int64) (str, stm, eff cryptMethod, filters map[name]cryptMethod, err error) {
+	if V < 4 {
+		return cryptRC4, cryptRC4, cryptRC4, nil, nil
+	}
+	filters = map[name]cryptMethod{"Identity": cryptNone}
+	cf, _ := r.resolve(objptr{}, encrypt["CF"]).data.(dict)
+	for n, x := range cf {
+		param, _ := r.resolve(objptr{}, x).data.(dict)
+		if m, ok := cryptFilterMethod(param, V); ok && n != "Identity" {
+			filters[n] = m
+		}
+	}
+	pick := func(key name, def name) (cryptMethod, error) {
+		n, ok := encrypt[key].(name)
+		if !ok {
+			n = def
+		}
+		m, ok := filters[n]
+		if !ok {
+			return 0, fmt.Errorf("unsupported PDF: crypt filter %v for %s; %v", n, key, objfmt(encrypt))
+		}
+		return m, nil
+	}
+	if str, err = pick("StrF", "Identity"); err != nil {
+		return
+	}
+	if stm, err = pick("StmF", "Identity"); err != nil {
+		return
+	}
+	stmName, ok := encrypt["StmF"].(name)
+	if !ok {
+		stmName = "Identity"
+	}
+	eff, err = pick("EFF", stmName)
+	return
+}
+
+// cryptFilterMethod returns the method of a crypt filter dictionary, if a
+// V4 or V5 file may use it: V4 takes RC4 (V2) and AES-128 (AESV2) under a
+// 128-bit key, V5 AES-256 (AESV3).
+func cryptFilterMethod(param dict, V int64) (cryptMethod, bool) {
+	// EFOpen asks for the password when an attachment opens; the key is the
+	// same.
+	if a := param["AuthEvent"]; a != nil && a != name("DocOpen") && a != name("EFOpen") {
+		return 0, false
+	}
+	keyLen := int64(maxKeyBits / 8)
+	if V == 5 {
+		keyLen = aes256KeyLen
+	}
+	// Writers give the key length in bytes or in bits.
+	if l := param["Length"]; l != nil && l != keyLen && l != keyLen*8 {
+		return 0, false
+	}
+	switch cfm := param["CFM"]; {
+	case V == 4 && cfm == name("V2"):
+		return cryptRC4, true
+	case V == 4 && cfm == name("AESV2"):
+		return cryptAESV2, true
+	case V == 5 && cfm == name("AESV3"):
+		return cryptAESV3, true
+	}
+	return 0, false
+}
+
+// passwordBytes lists the byte strings password may have been hashed as,
+// most likely first. Revisions 2 to 4 hash PDFDocEncoding and revisions 5
+// and 6 SASLprep'd UTF-8 cut to 127 bytes; some writers hash the UTF-8 as
+// typed instead.
+func passwordBytes(password string, R int64) [][]byte {
+	raw := []byte(password)
+	want := raw
+	if R >= 5 {
+		want = []byte(saslPrep(password))
+		raw, want = raw[:min(len(raw), aes256MaxPassword)], want[:min(len(want), aes256MaxPassword)]
+	} else if b, ok := pdfDocBytes(password); ok {
+		want = b
+	}
+	if bytes.Equal(want, raw) {
+		return [][]byte{want}
+	}
+	return [][]byte{want, raw}
+}
+
+// pdfDocBytes encodes s in PDFDocEncoding, reporting false if a rune has no
+// byte there.
+func pdfDocBytes(s string) ([]byte, bool) {
+	b := make([]byte, 0, len(s))
+	for _, c := range s {
+		i := slices.Index(pdfDocEncoding[:], c)
+		if i < 0 || c == noRune {
+			return nil, false
+		}
+		b = append(b, byte(i))
+	}
+	return b, true
+}
+
+// saslPrep maps a password as RFC 4013 does before it is hashed: non-ASCII
+// spaces become spaces, characters commonly mapped to nothing go, and the
+// rest is NFKC-normalized. Its prohibitions are skipped, since a writer
+// refuses such a password, so it never matches anyway.
+func saslPrep(s string) string {
+	return norm.NFKC.String(strings.Map(func(c rune) rune {
+		switch c {
+		case 0x00A0, 0x1680, 0x202F, 0x205F, 0x3000: // RFC 3454 table C.1.2
+			return ' '
+		case 0x00AD, 0x034F, 0x1806, 0x200C, 0x200D, 0x2060, 0xFEFF: // table B.1
+			return -1
+		}
+		switch {
+		case c >= 0x2000 && c <= 0x200B: // C.1.2
+			return ' '
+		case c >= 0x180B && c <= 0x180D, c >= 0xFE00 && c <= 0xFE0F: // B.1
+			return -1
+		}
+		return c
+	}, s))
+}
+
+// rc4FileKey derives the file key of a V1 to V4 file, trying password as the
+// user password and then as the owner password (Algorithms 2, 6, and 7).
+func (r *Reader) rc4FileKey(encrypt dict, V, R int64, clearMetadata bool, password string) ([]byte, error) {
 	n, _ := encrypt["Length"].(int64)
 	if n == 0 {
 		n = minKeyBits
 	}
 	if V == 4 {
-		// stdCryptFilter allows only 128-bit crypt filters, whatever /Length says,
-		// and a shorter key fails aes.NewCipher.
+		// cryptFilterMethod allows only 128-bit crypt filters, whatever
+		// /Length says, and a shorter key fails aes.NewCipher.
 		n = maxKeyBits
 	}
 	if n%8 != 0 || n > maxKeyBits || n < minKeyBits {
-		return fmt.Errorf("malformed PDF: %d-bit encryption key", n)
+		return nil, fmt.Errorf("malformed PDF: %d-bit encryption key", n)
 	}
-
 	ids, ok := r.trailer["ID"].(array)
 	if !ok || len(ids) < 1 {
-		return fmt.Errorf("malformed PDF: missing ID in trailer")
+		return nil, fmt.Errorf("malformed PDF: missing ID in trailer")
 	}
 	idstr, ok := ids[0].(string)
 	if !ok {
-		return fmt.Errorf("malformed PDF: missing ID in trailer")
+		return nil, fmt.Errorf("malformed PDF: missing ID in trailer")
 	}
-	ID := []byte(idstr)
-
-	R, _ := encrypt["R"].(int64)
 	if R < 2 {
-		return fmt.Errorf("malformed PDF: encryption revision R=%d", R)
+		return nil, fmt.Errorf("malformed PDF: encryption revision R=%d", R)
 	}
 	if R > 4 {
-		return fmt.Errorf("unsupported PDF: encryption revision R=%d", R)
+		return nil, fmt.Errorf("unsupported PDF: encryption revision R=%d", R)
 	}
 	O, _ := encrypt["O"].(string)
 	U, _ := encrypt["U"].(string)
 	if len(O) != ouEntryLen || len(U) != ouEntryLen {
-		return fmt.Errorf("malformed PDF: missing O= or U= encryption parameters")
+		return nil, fmt.Errorf("malformed PDF: missing O= or U= encryption parameters")
 	}
 	p, _ := encrypt["P"].(int64)
-	P := uint32(p)
-
-	// TODO: Password should be converted to Latin-1.
-	pw := []byte(password)
-	h := md5.New()
-	if len(pw) >= len(passwordPad) {
-		h.Write(pw[:len(passwordPad)])
-	} else {
-		h.Write(pw)
-		h.Write(passwordPad[:len(passwordPad)-len(pw)])
+	s := rc4Params{R: R, keyLen: int(n / 8), O: []byte(O), U: []byte(U), ID: []byte(idstr), P: uint32(p), clearMetadata: clearMetadata}
+	if R == 2 {
+		s.keyLen = minKeyBits / 8
 	}
-	h.Write([]byte(O))
-	h.Write([]byte{byte(P), byte(P >> 8), byte(P >> 16), byte(P >> 24)})
-	h.Write([]byte(ID))
-	clearMetadata := R >= 4 && encrypt["EncryptMetadata"] == false
-	if clearMetadata {
+	for _, pw := range passwordBytes(password, R) {
+		if key, ok := s.userKey(pw); ok {
+			return key, nil
+		}
+		if key, ok := s.userKey(s.ownerToUser(pw)); ok {
+			return key, nil
+		}
+	}
+	return nil, ErrInvalidPassword
+}
+
+// rc4Params are a V1 to V4 file's Standard security handler entries.
+type rc4Params struct {
+	R             int64
+	keyLen        int
+	O, U, ID      []byte
+	P             uint32
+	clearMetadata bool
+}
+
+// padPassword pads or cuts pw to 32 bytes (Algorithm 2, step a).
+func padPassword(pw []byte) []byte {
+	return append(slices.Clone(pw[:min(len(pw), len(passwordPad))]), passwordPad[:len(passwordPad)-min(len(pw), len(passwordPad))]...)
+}
+
+// userKey derives the file key from pw as the user password and checks it
+// against U (Algorithms 2, 4, and 5).
+func (s rc4Params) userKey(pw []byte) ([]byte, bool) {
+	h := md5.New()
+	h.Write(padPassword(pw))
+	h.Write(s.O)
+	h.Write([]byte{byte(s.P), byte(s.P >> 8), byte(s.P >> 16), byte(s.P >> 24)})
+	h.Write(s.ID)
+	if s.clearMetadata {
 		h.Write([]byte{0xff, 0xff, 0xff, 0xff})
 	}
 	key := h.Sum(nil)
-
-	keyLen := int(n / 8) // encryption key length in bytes
-	if R >= 3 {
-		for i := 0; i < md5KeyIterations; i++ {
-			h.Reset()
-			h.Write(key[:keyLen])
-			key = h.Sum(key[:0])
+	if s.R >= 3 {
+		for range md5KeyIterations {
+			sum := md5.Sum(key[:s.keyLen])
+			key = sum[:]
 		}
-		key = key[:keyLen]
-	} else {
-		key = key[:minKeyBits/8]
 	}
-
-	c, err := rc4.NewCipher(key)
-	if err != nil {
-		return fmt.Errorf("malformed PDF: invalid RC4 key: %v", err)
-	}
+	key = key[:s.keyLen]
 
 	var u []byte
-	if R == 2 {
-		u = make([]byte, len(passwordPad))
-		copy(u, passwordPad)
+	if s.R == 2 {
+		u = slices.Clone(passwordPad)
+		c, _ := rc4.NewCipher(key)
 		c.XORKeyStream(u, u)
 	} else {
-		h.Reset()
-		h.Write(passwordPad)
-		h.Write([]byte(ID))
-		u = h.Sum(nil)
-		c.XORKeyStream(u, u)
-
-		for i := 1; i <= rc4UIterations; i++ {
-			key1 := make([]byte, len(key))
-			copy(key1, key)
-			for j := range key1 {
-				key1[j] ^= byte(i)
-			}
-			c, _ = rc4.NewCipher(key1)
+		sum := md5.Sum(slices.Concat(passwordPad, s.ID))
+		u = sum[:]
+		for i := 0; i <= rc4UIterations; i++ {
+			c, _ := rc4.NewCipher(xorKey(key, byte(i)))
 			c.XORKeyStream(u, u)
 		}
 	}
-
-	if !bytes.HasPrefix([]byte(U), u) {
-		return ErrInvalidPassword
-	}
-
-	r.key = key
-	r.crypt = cryptRC4
-	if V == 4 && cfm == name("AESV2") {
-		r.crypt = cryptAESV2
-	}
-	r.clearMetadata = clearMetadata
-
-	return nil
+	return key, bytes.HasPrefix(s.U, u)
 }
 
-// initEncryptAES256 checks password as the user password of an AES-256 file
-// and derives its file key (ISO 32000-2:2020, Algorithms 2.A and 11).
-func (r *Reader) initEncryptAES256(encrypt dict, password string) error {
-	if cfm, ok := stdCryptFilter(encrypt, aes256KeyLen); !ok || cfm != name("AESV3") {
-		return fmt.Errorf("unsupported PDF: encryption version V=5; %v", objfmt(encrypt))
+// ownerToUser recovers the padded user password from O with pw as the owner
+// password (Algorithm 7, through Algorithm 3's key).
+func (s rc4Params) ownerToUser(pw []byte) []byte {
+	sum := md5.Sum(padPassword(pw))
+	key := sum[:]
+	if s.R >= 3 {
+		for range md5KeyIterations {
+			sum = md5.Sum(key)
+			key = sum[:]
+		}
 	}
-	R, _ := encrypt["R"].(int64)
+	key = key[:s.keyLen]
+	u := slices.Clone(s.O)
+	if s.R == 2 {
+		c, _ := rc4.NewCipher(key)
+		c.XORKeyStream(u, u)
+		return u
+	}
+	for i := rc4UIterations; i >= 0; i-- {
+		c, _ := rc4.NewCipher(xorKey(key, byte(i)))
+		c.XORKeyStream(u, u)
+	}
+	return u
+}
+
+// xorKey returns key with every byte XORed with i.
+func xorKey(key []byte, i byte) []byte {
+	k := slices.Clone(key)
+	for j := range k {
+		k[j] ^= i
+	}
+	return k
+}
+
+// aes256FileKey derives the file key of an AES-256 file, trying password as
+// the user password and then as the owner password (ISO 32000-2:2020,
+// Algorithm 2.A).
+func aes256FileKey(encrypt dict, R int64, password string) ([]byte, error) {
 	if R < 5 {
-		return fmt.Errorf("malformed PDF: encryption revision R=%d", R)
+		return nil, fmt.Errorf("malformed PDF: encryption revision R=%d", R)
 	}
 	if R > 6 {
-		return fmt.Errorf("unsupported PDF: encryption revision R=%d", R)
+		return nil, fmt.Errorf("unsupported PDF: encryption revision R=%d", R)
 	}
 	// Viewers read the first bytes of a longer entry, so only a short one is
 	// malformed.
@@ -1607,37 +1807,39 @@ func (r *Reader) initEncryptAES256(encrypt dict, password string) error {
 	OE, _ := encrypt["OE"].(string)
 	UE, _ := encrypt["UE"].(string)
 	if len(O) < aes256OULen || len(U) < aes256OULen || len(OE) < aes256KeyLen || len(UE) < aes256KeyLen {
-		return fmt.Errorf("malformed PDF: missing O=, U=, OE=, or UE= encryption parameters")
+		return nil, fmt.Errorf("malformed PDF: missing O=, U=, OE=, or UE= encryption parameters")
 	}
-
-	// TODO: Password should be SASLprep-normalized (RFC 4013) first.
-	pw := []byte(password)
-	if len(pw) > aes256MaxPassword {
-		pw = pw[:aes256MaxPassword]
+	u := []byte(U[:aes256OULen])
+	for _, pw := range passwordBytes(password, R) {
+		// The owner's hashes take U as well.
+		for _, k := range []struct {
+			entry, encKey, udata []byte
+		}{
+			{u, []byte(UE[:aes256KeyLen]), nil},
+			{[]byte(O[:aes256OULen]), []byte(OE[:aes256KeyLen]), u},
+		} {
+			hash, validationSalt, keySalt := k.entry[:32], k.entry[32:40], k.entry[40:48]
+			if !bytes.Equal(aes256Hash(R, pw, validationSalt, k.udata), hash) {
+				continue
+			}
+			b, err := aes.NewCipher(aes256Hash(R, pw, keySalt, k.udata))
+			if err != nil {
+				return nil, fmt.Errorf("malformed PDF: invalid AES key: %v", err)
+			}
+			key := slices.Clone(k.encKey)
+			cipher.NewCBCDecrypter(b, make([]byte, aes.BlockSize)).CryptBlocks(key, key)
+			return key, nil
+		}
 	}
-	hash, validationSalt, keySalt := U[:32], U[32:40], U[40:48]
-	if !bytes.Equal(aes256Hash(R, pw, []byte(validationSalt)), []byte(hash)) {
-		return ErrInvalidPassword
-	}
-	b, err := aes.NewCipher(aes256Hash(R, pw, []byte(keySalt)))
-	if err != nil {
-		return fmt.Errorf("malformed PDF: invalid AES key: %v", err)
-	}
-	key := []byte(UE[:aes256KeyLen])
-	cipher.NewCBCDecrypter(b, make([]byte, aes.BlockSize)).CryptBlocks(key, key)
-
-	r.key = key
-	r.crypt = cryptAESV3
-	r.clearMetadata = encrypt["EncryptMetadata"] == false
-	return nil
+	return nil, ErrInvalidPassword
 }
 
-// aes256Hash hashes a user password with salt (ISO 32000-2:2020, Algorithm
-// 2.B). Revision 5 stops at the first SHA-256. Revision 6 runs at least 64
-// rounds and stops once E's last byte is at most the round count less 32, so
-// by round 287 at the latest.
-func aes256Hash(R int64, pw, salt []byte) []byte {
-	sum := sha256.Sum256(slices.Concat(pw, salt))
+// aes256Hash hashes a password with salt and, for the owner, U (ISO
+// 32000-2:2020, Algorithm 2.B). Revision 5 stops at the first SHA-256.
+// Revision 6 runs at least 64 rounds and stops once E's last byte is at most
+// the round count less 32, so by round 287 at the latest.
+func aes256Hash(R int64, pw, salt, udata []byte) []byte {
+	sum := sha256.Sum256(slices.Concat(pw, salt, udata))
 	k := sum[:]
 	if R == 5 {
 		return k
@@ -1646,7 +1848,7 @@ func aes256Hash(R int64, pw, salt []byte) []byte {
 	for i := 0; i < 64 || int(e[len(e)-1]) > i-32; i++ {
 		e = e[:0]
 		for range 64 {
-			e = append(append(e, pw...), k...)
+			e = append(append(append(e, pw...), k...), udata...)
 		}
 		b, _ := aes.NewCipher(k[:16])
 		cipher.NewCBCEncrypter(b, k[16:32]).CryptBlocks(e, e)
@@ -1672,40 +1874,6 @@ func aes256Hash(R int64, pw, salt []byte) []byte {
 }
 
 var ErrInvalidPassword = fmt.Errorf("encrypted PDF: invalid password")
-
-// stdCryptFilter returns the method (CFM) of the crypt filter a V4 or V5
-// /Encrypt dict names for both strings and streams, if that filter is
-// supported and its key is keyLen bytes long.
-func stdCryptFilter(encrypt dict, keyLen int64) (cfm name, ok bool) {
-	cf, ok := encrypt["CF"].(dict)
-	if !ok {
-		return "", false
-	}
-	stmf, ok := encrypt["StmF"].(name)
-	if !ok {
-		return "", false
-	}
-	strf, ok := encrypt["StrF"].(name)
-	if !ok {
-		return "", false
-	}
-	if stmf != strf {
-		return "", false
-	}
-	cfparam, ok := cf[stmf].(dict)
-	if !ok {
-		return "", false
-	}
-	if cfparam["AuthEvent"] != nil && cfparam["AuthEvent"] != name("DocOpen") {
-		return "", false
-	}
-	// Writers give the key length in bytes or in bits.
-	if l := cfparam["Length"]; l != nil && l != keyLen && l != keyLen*8 {
-		return "", false
-	}
-	cfm, ok = cfparam["CFM"].(name)
-	return cfm, ok
-}
 
 // cryptKey derives an object's key from the file key (Algorithm 1), except
 // under AES-256, which encrypts every object with the file key itself.
