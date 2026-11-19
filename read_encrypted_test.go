@@ -235,3 +235,10 @@ func TestPasswordEncoding(t *testing.T) {
 		}
 	}
 }
+
+func TestSecurityHandler(t *testing.T) {
+	data := withEncrypt(buildPDF("<< /Type /Catalog >>"), "<< /Filter /Adobe.PubSec /V 4 /SubFilter /adbe.pkcs7.s5 >>")
+	if err := openBytes(data); !errors.Is(err, ErrSecurityHandler) {
+		t.Errorf("got %v, want ErrSecurityHandler", err)
+	}
+}

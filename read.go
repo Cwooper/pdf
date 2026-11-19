@@ -1501,7 +1501,7 @@ func (r *Reader) initEncrypt(password string) error {
 	// See PDF 32000-1:2008, §7.6.
 	encrypt, _ := r.resolve(objptr{}, r.trailer["Encrypt"]).data.(dict)
 	if encrypt["Filter"] != name("Standard") {
-		return fmt.Errorf("unsupported PDF: encryption filter %v", objfmt(encrypt["Filter"]))
+		return fmt.Errorf("%w %v", ErrSecurityHandler, objfmt(encrypt["Filter"]))
 	}
 	V, _ := encrypt["V"].(int64)
 	if V != 1 && V != 2 && V != 4 && V != 5 {
@@ -1874,6 +1874,10 @@ func aes256Hash(R int64, pw, salt, udata []byte) []byte {
 }
 
 var ErrInvalidPassword = fmt.Errorf("encrypted PDF: invalid password")
+
+// ErrSecurityHandler is a file encrypted by a handler other than the Standard
+// one, such as to public-key certificates, which no password opens.
+var ErrSecurityHandler = errors.New("unsupported PDF: encryption filter")
 
 // cryptKey derives an object's key from the file key (Algorithm 1), except
 // under AES-256, which encrypts every object with the file key itself.
