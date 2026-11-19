@@ -292,6 +292,7 @@ func FuzzPageText(f *testing.F) {
 	f.Add([]byte(content), []byte("<< /Type /Font /Subtype /Type1 /BaseFont /ABCDEF+Helvetica /FirstChar 97 /LastChar 101 /Widths [500 600 700 800 900] /Encoding /WinAnsiEncoding >>"), []byte(cmap))
 	f.Add([]byte(content), []byte("<< /Type /Font /Subtype /Type0 /Encoding /Identity-H /ToUnicode 6 0 R /DescendantFonts [<< /DW 500 /W [1 [600 700] 16 32 400] >>] >>"), []byte(cmap))
 	f.Add([]byte(content), []byte("<< /Encoding << /Differences [97 /quoteright /bullet 100 /fi] >> >>"), []byte(cmap))
+	f.Add([]byte(content), []byte("<< /Type /Font /Subtype /TrueType /FirstChar 97 /LastChar 101 /Widths [500 600 700 800 900] /Encoding << /BaseEncoding /WinAnsiEncoding /Differences [1 /g3 /g4 97 /fi] >> /ToUnicode 6 0 R >>"), []byte("1 begincodespacerange <00> <FF> endcodespacerange 2 beginbfchar <01> <00660069> <61> <0041> endbfchar 1 beginbfrange <62> <63> [<0042> 1] endbfrange"))
 	f.Add([]byte("BT /F1 1 Tf <0001> Tj ID \x00\xff EI ET"), []byte("<< /ToUnicode 6 0 R >>"), []byte("1 begincodespacerange <00> <FF> endcodespacerange 1 beginbfrange <00> <FF> <0041> endbfrange"))
 	f.Fuzz(func(t *testing.T, content, font, cmap []byte) {
 		// Interpret itself, as text extraction drives it.

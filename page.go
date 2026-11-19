@@ -574,57 +574,99 @@ func (f *Font) Encoder() TextEncoding {
 }
 
 func (f Font) getEncoder() TextEncoding {
-	enc := f.V.Key("Encoding")
-	switch enc.Kind() {
-	case Name:
-		switch enc.Name() {
-		case "WinAnsiEncoding":
-			return &byteEncoder{&winAnsiEncoding}
-		case "MacRomanEncoding":
-			return &byteEncoder{&macRomanEncoding}
-		case "Identity-H":
-			return f.charmapEncoding()
-		case "UniGB-UCS2-H":
-			return &ucs2Encoder{}
-		default:
-			if DebugOn {
-				println("unknown encoding", enc.Name())
-			}
-			return &nopEncoder{}
-		}
-	case Dict:
-		return &byteEncoder{differences(enc.Key("Differences"))}
-	case Null:
-		return f.charmapEncoding()
-	default:
-		if DebugOn {
-			println("unexpected encoding", enc.String())
-		}
-		return &nopEncoder{}
+	if f.V.Key("Subtype").Name() == "Type0" {
+		return f.type0Encoding()
 	}
+	return f.simpleEncoding()
 }
 
-func (f *Font) charmapEncoding() TextEncoding {
+// type0Encoding decodes a Type0 font through its ToUnicode cmap whatever its
+// /Encoding names, since the cmap is the only map to Unicode it has.
+func (f Font) type0Encoding() TextEncoding {
 	toUnicode := f.V.Key("ToUnicode")
 	if toUnicode.Kind() == Stream {
-		m := toUnicode.r.toUnicodeCmap(toUnicode)
-		if m == nil {
-			return &nopEncoder{}
+		if m := toUnicode.r.toUnicodeCmap(toUnicode); m != nil {
+			return m
 		}
-		return m
 	}
-
-	return &byteEncoder{&pdfDocEncoding}
+	enc := f.V.Key("Encoding")
+	switch {
+	case enc.Kind() == Name && enc.Name() == "UniGB-UCS2-H":
+		return &ucs2Encoder{}
+	case toUnicode.Kind() != Stream && (enc.Kind() == Null || enc.Kind() == Name && enc.Name() == "Identity-H"):
+		return &byteEncoder{&pdfDocEncoding}
+	}
+	return &nopEncoder{}
 }
 
-// differences returns the byte table a /Differences array makes of the
-// identity mapping, the first known glyph name given for a code winning.
-func differences(v Value) *[256]rune {
-	var table [256]rune
-	var set [256]bool
-	for i := range table {
-		table[i] = rune(i)
+// simpleEncoding decodes a simple font's codes in the order of PDF 32000
+// 9.10.2: its ToUnicode cmap, then its encoding with /Differences over it.
+func (f Font) simpleEncoding() TextEncoding {
+	enc := f.V.Key("Encoding")
+	base := enc
+	if enc.Kind() == Dict {
+		base = enc.Key("BaseEncoding")
 	}
+	diffs := enc.Key("Differences")
+	var table *[256]rune
+	switch base.Name() {
+	case "WinAnsiEncoding":
+		table = &winAnsiEncoding
+	case "MacRomanEncoding":
+		table = &macRomanEncoding
+	default:
+		table = f.defaultEncoding(diffs.Len() > 0)
+	}
+	if diffs.Kind() == Array {
+		table = differences(diffs, table)
+	}
+	var m *cmap
+	if toUnicode := f.V.Key("ToUnicode"); toUnicode.Kind() == Stream {
+		m = toUnicode.r.toUnicodeCmap(toUnicode)
+	}
+	if m == nil {
+		return &byteEncoder{table}
+	}
+	return &simpleEncoder{m, table}
+}
+
+// Font descriptor flags, PDF 32000 table 123.
+const (
+	fontSymbolic    = 1 << 2
+	fontNonsymbolic = 1 << 5
+)
+
+// defaultEncoding returns the encoding of a simple font that names none it
+// can use, chosen as pdf.js chooses it: StandardEncoding, but WinAnsi for a
+// TrueType font not flagged nonsymbolic, and PDFDocEncoding for a symbolic
+// font, whose built-in encoding is not read.
+func (f Font) defaultEncoding(differences bool) *[256]rune {
+	flags := f.V.Key("FontDescriptor").Key("Flags").Int64()
+	trueType := f.V.Key("Subtype").Name() == "TrueType"
+	symbolic := flags&fontSymbolic != 0
+	// pdf.js reads a font flagged both ways as nonsymbolic when it has
+	// /Differences, which only a nonsymbolic font uses.
+	if trueType && symbolic && flags&fontNonsymbolic != 0 && differences {
+		symbolic = false
+	}
+	base := f.V.Key("BaseFont").Name()
+	if i := strings.IndexByte(base, '+'); i >= 0 {
+		base = base[i+1:]
+	}
+	switch {
+	case symbolic || base == "Symbol" || base == "ZapfDingbats":
+		return &pdfDocEncoding
+	case trueType && flags&fontNonsymbolic == 0:
+		return &winAnsiEncoding
+	}
+	return &standardEncoding
+}
+
+// differences returns base with a /Differences array applied over it, the
+// first known glyph name given for a code winning.
+func differences(v Value, base *[256]rune) *[256]rune {
+	table := *base
+	var set [256]bool
 	n := -1
 	for i := range v.Len() {
 		x := v.Index(i)
@@ -651,6 +693,12 @@ type TextEncoding interface {
 	Decode(raw string) (text string)
 }
 
+// A runeDecoder decodes raw, appending to r until r holds limit runes or
+// soon after: one code can decode to many.
+type runeDecoder interface {
+	appendRunes(r []rune, raw string, limit int) []rune
+}
+
 type nopEncoder struct {
 }
 
@@ -669,11 +717,39 @@ type byteEncoder struct {
 }
 
 func (e *byteEncoder) Decode(raw string) (text string) {
-	r := make([]rune, 0, len(raw))
-	for i := 0; i < len(raw); i++ {
+	return string(e.appendRunes(make([]rune, 0, len(raw)), raw, math.MaxInt))
+}
+
+func (e *byteEncoder) appendRunes(r []rune, raw string, limit int) []rune {
+	for i := 0; i < len(raw) && len(r) < limit; i++ {
 		r = append(r, e.table[raw[i]])
 	}
-	return string(r)
+	return r
+}
+
+// A simpleEncoder decodes a simple font's codes, one byte each: a code its
+// ToUnicode cmap maps takes the cmap's text, any other its encoding's.
+type simpleEncoder struct {
+	cmap  *cmap
+	table *[256]rune
+}
+
+func (e *simpleEncoder) Decode(raw string) string {
+	return string(e.appendRunes(nil, raw, math.MaxInt))
+}
+
+func (e *simpleEncoder) appendRunes(r []rune, raw string, limit int) []rune {
+	for i := 0; i < len(raw) && len(r) < limit; i++ {
+		// Producers give simple fonts two-byte codespaces too, so a code is
+		// also looked up zero-padded, as pdf.js reads every entry by value.
+		var ok bool
+		if r, ok = e.cmap.find(r, raw[i:i+1]); !ok {
+			if r, ok = e.cmap.find(r, "\x00"+raw[i:i+1]); !ok {
+				r = append(r, e.table[raw[i]])
+			}
+		}
+	}
+	return r
 }
 
 type byteRange struct {
@@ -697,12 +773,10 @@ type cmap struct {
 }
 
 func (m *cmap) Decode(raw string) (text string) {
-	return m.decode(raw, math.MaxInt)
+	return string(m.appendRunes(nil, raw, math.MaxInt))
 }
 
-// decode decodes raw, stopping once the text holds limit runes.
-func (m *cmap) decode(raw string, limit int) string {
-	var r []rune
+func (m *cmap) appendRunes(r []rune, raw string, limit int) []rune {
 	for len(raw) > 0 && len(r) < limit {
 		n := m.codeLen(raw)
 		if n == 0 {
@@ -713,10 +787,13 @@ func (m *cmap) decode(raw string, limit int) string {
 			raw = raw[1:]
 			continue
 		}
-		r = m.lookup(r, raw[:n])
+		var ok bool
+		if r, ok = m.find(r, raw[:n]); !ok {
+			r = append(r, noRune)
+		}
 		raw = raw[n:]
 	}
-	return string(r)
+	return r
 }
 
 // codeLen returns the length of the code raw starts with, or 0 if no
@@ -732,27 +809,28 @@ func (m *cmap) codeLen(raw string) int {
 	return 0
 }
 
-// lookup appends the text code maps to to r.
-func (m *cmap) lookup(r []rune, text string) []rune {
-	if repl, ok := m.bfchar[text]; ok {
-		return append(r, []rune(utf16Decode(repl))...)
+// find appends the text code maps to to r, reporting false if the cmap maps
+// it to no usable text.
+func (m *cmap) find(r []rune, code string) ([]rune, bool) {
+	if repl, ok := m.bfchar[code]; ok {
+		return append(r, []rune(utf16Decode(repl))...), true
 	}
-	bfrange := m.findRange(text)
+	bfrange := m.findRange(code)
 	if bfrange == nil {
-		return append(r, noRune)
+		return r, false
 	}
 	if bfrange.dst.Kind() == String {
 		s := bfrange.dst.RawString()
-		if bfrange.lo != text { // value isn't at the beginning of the range so scale result
-			s = addOffset(s, beUint(text)-beUint(bfrange.lo))
+		if bfrange.lo != code { // value isn't at the beginning of the range so scale result
+			s = addOffset(s, beUint(code)-beUint(bfrange.lo))
 		}
-		return append(r, []rune(utf16Decode(s))...)
+		return append(r, []rune(utf16Decode(s))...), true
 	}
 	if bfrange.dst.Kind() == Array {
-		n := text[len(text)-1] - bfrange.lo[len(bfrange.lo)-1]
+		n := code[len(code)-1] - bfrange.lo[len(bfrange.lo)-1]
 		v := bfrange.dst.Index(int(n))
 		if v.Kind() == String && len(v.RawString()) <= maxCmapDst {
-			return append(r, []rune(utf16Decode(v.RawString()))...)
+			return append(r, []rune(utf16Decode(v.RawString()))...), true
 		}
 		if DebugOn {
 			fmt.Printf("array %v\n", bfrange.dst)
@@ -760,7 +838,7 @@ func (m *cmap) lookup(r []rune, text string) []rune {
 	} else if DebugOn {
 		fmt.Printf("unknown dst %v\n", bfrange.dst)
 	}
-	return append(r, noRune)
+	return r, false
 }
 
 // findRange returns the bfrange holding code, or nil. Where ranges overlap,
@@ -1076,14 +1154,20 @@ var errPageGlyphs = fmt.Errorf("page shows more than %d glyphs", maxPageGlyphs)
 // decodeLimit decodes raw with enc, stopping once the text holds limit
 // runes or soon after.
 func decodeLimit(enc TextEncoding, raw string, limit int) string {
-	if m, ok := enc.(*cmap); ok {
-		return m.decode(raw, limit)
+	return string(appendDecoded(nil, enc, raw, limit))
+}
+
+// appendDecoded appends what enc decodes raw to to r, stopping once r holds
+// limit runes or soon after.
+func appendDecoded(r []rune, enc TextEncoding, raw string, limit int) []rune {
+	if d, ok := enc.(runeDecoder); ok {
+		return d.appendRunes(r, raw, limit)
 	}
 	// The other encodings yield at most one rune per byte.
-	if len(raw) > limit {
-		raw = raw[:limit]
+	if n := max(0, limit-len(r)); len(raw) > n {
+		raw = raw[:n]
 	}
-	return enc.Decode(raw)
+	return append(r, []rune(enc.Decode(raw))...)
 }
 
 // decodeText decodes raw font code points with enc and returns UTF-8 text,
@@ -1390,42 +1474,35 @@ func (p Page) Content() Content {
 		tx *= g.Th
 		g.Tm = matrix{{1, 0, 0}, {0, 1, 0}, {tx, 0, 1}}.mul(g.Tm)
 	}
+	var runes []rune
+	// showText shows s a code at a time: one byte of a simple font, one code
+	// of a Type0 font's cmap. A code mapping to several runes splits its width
+	// among them.
 	showText := func(s string) {
-		if m := g.Tf.metrics(); m != nil && m.cid != nil {
-			for len(s) > 0 {
-				n := cidCodeLen(enc, s)
-				code := s[:n]
-				s = s[n:]
+		m := g.Tf.metrics()
+		for len(s) > 0 {
+			var n int
+			var w float64
+			if m != nil && m.cid != nil {
+				n = cidCodeLen(enc, s)
 				cid := -1
 				if m.identity {
-					cid = 0
-					for i := range n {
-						cid = cid<<8 | int(code[i])
-					}
+					cid = int(beUint(s[:n]))
 				}
-				// A code mapping to several runes splits its width among them.
-				runes := []rune(decodeLimit(enc, code, glyphs.left()+1))
-				w := m.cid.width(cid) / float64(max(1, len(runes)))
-				for i, ch := range runes {
-					glyph(ch, w)
-					if i < len(runes)-1 {
-						advance(w, 0)
-					}
+				w = m.cid.width(cid)
+			} else {
+				n, w = 1, g.Tf.Width(int(s[0]))
+			}
+			runes = appendDecoded(runes[:0], enc, s[:n], glyphs.left()+1)
+			s = s[n:]
+			w /= float64(max(1, len(runes)))
+			for i, ch := range runes {
+				glyph(ch, w)
+				if i < len(runes)-1 {
+					advance(w, 0)
 				}
-				advance(w, g.Tc)
 			}
-			return
-		}
-		n := 0
-		decoded := decodeLimit(enc, s, glyphs.left()+1)
-		for _, ch := range decoded {
-			var w0 float64
-			if n < len(s) {
-				w0 = g.Tf.Width(int(s[n]))
-			}
-			n++
-			glyph(ch, w0)
-			advance(w0, g.Tc)
+			advance(w, g.Tc)
 		}
 	}
 

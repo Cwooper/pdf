@@ -349,3 +349,79 @@ func TestFontsParsedOncePerReader(t *testing.T) {
 		t.Errorf("pages 2 to %d allocated %d KB, page 1 %d KB", pages, rest>>10, first>>10)
 	}
 }
+
+// TestSimpleFontEncodingOrder verifies the order a simple font's codes
+// decode in: ToUnicode first, then the base encoding with /Differences over
+// it, then the font's default encoding.
+func TestSimpleFontEncodingOrder(t *testing.T) {
+	cmap := func(entries string) string {
+		return streamObj("1 begincodespacerange <00> <ff> endcodespacerange " + entries)
+	}
+	tests := []struct {
+		name, font, show, want string
+		extra                  []string
+	}{
+		{"differences over a named base", "<< /Subtype /Type1 /Encoding << /BaseEncoding /WinAnsiEncoding /Differences [65 /Beta] >> >>",
+			"A\x93B\x97", "Β“B—", nil},
+		{"ToUnicode over unnamed glyphs", "<< /Subtype /Type1 /Encoding << /Differences [1 /g3 /g4] >> /ToUnicode 6 0 R >>",
+			"\x01\x02", "Th", []string{cmap("2 beginbfchar <01> <0054> <02> <0068> endbfchar")}},
+		{"ToUnicode over a named encoding", "<< /Subtype /TrueType /Encoding /WinAnsiEncoding /ToUnicode 6 0 R >>",
+			"AB\x93", "ZB“", []string{cmap("1 beginbfchar <41> <005a> endbfchar")}},
+		{"ToUnicode in a two-byte codespace", "<< /Subtype /Type1 /ToUnicode 6 0 R >>",
+			"AB", "XB", []string{streamObj("1 begincodespacerange <0000> <ffff> endcodespacerange 1 beginbfchar <0041> <0058> endbfchar")}},
+		{"an unusable ToUnicode destination", "<< /Subtype /TrueType /Encoding /WinAnsiEncoding /ToUnicode 6 0 R >>",
+			"A\x93", "A“", []string{cmap("1 beginbfrange <93> <93> [1] endbfrange")}},
+		{"an unknown encoding name", "<< /Subtype /Type1 /Encoding /NoSuchEncoding >>", "it's", "it’s", nil},
+		{"a Type1 default", "<< /Subtype /Type1 /BaseFont /Times-Roman >>", "`it's`", "‘it’s‘", nil},
+		{"a TrueType default", "<< /Subtype /TrueType /FontDescriptor << /Flags 0 >> >>", "\x93it's\x94", "“it's”", nil},
+		{"a nonsymbolic TrueType default", "<< /Subtype /TrueType /FontDescriptor << /Flags 32 >> >>", "it's", "it’s", nil},
+		{"a symbolic TrueType with differences", "<< /Subtype /TrueType /FontDescriptor << /Flags 36 >> /Encoding << /Differences [1 /fi] >> >>",
+			"\x01it's", "ﬁit’s", nil},
+		{"a symbolic default", "<< /Subtype /TrueType /FontDescriptor << /Flags 4 >> >>", "it's\x93", "it'sﬁ", nil},
+		{"Symbol by name", "<< /Subtype /Type1 /BaseFont /ABCDEF+Symbol >>", "it's", "it's", nil},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			r := fontPage(t, "BT /F1 12 Tf <"+fmt.Sprintf("%x", tt.show)+"> Tj ET", tt.font, tt.extra...)
+			if got, err := r.Page(1).GetPlainText(nil); err != nil || got != "\n"+tt.want {
+				t.Errorf("GetPlainText = %q, %v; want %q", got, err, "\n"+tt.want)
+			}
+		})
+	}
+}
+
+// TestType0ToUnicodeAnyEncoding verifies that a Type0 font with a ToUnicode
+// cmap decodes through it whatever its /Encoding names.
+func TestType0ToUnicodeAnyEncoding(t *testing.T) {
+	cm := streamObj("1 begincodespacerange <0000> <ffff> endcodespacerange 1 beginbfchar <0001> <0041> endbfchar")
+	for _, enc := range []string{"/Identity-H", "/Identity-V", "/UniJIS-UCS2-H", "7 0 R"} {
+		t.Run(enc, func(t *testing.T) {
+			r := fontPage(t, "BT /F1 12 Tf <00010001> Tj ET",
+				"<< /Subtype /Type0 /Encoding "+enc+" /ToUnicode 6 0 R /DescendantFonts [<< /DW 500 >>] >>", cm, streamObj("embedded cmap"))
+			if got, err := r.Page(1).GetPlainText(nil); err != nil || got != "\nAA" {
+				t.Errorf("GetPlainText = %q, %v; want %q", got, err, "\nAA")
+			}
+		})
+	}
+}
+
+// TestLigatureWidths verifies that a simple font's code whose ToUnicode
+// text is several runes splits its width among them, and the codes after it
+// keep their own widths.
+func TestLigatureWidths(t *testing.T) {
+	r := fontPage(t, "BT /F1 10 Tf (ABA) Tj ET",
+		"<< /Subtype /Type1 /FirstChar 65 /LastChar 66 /Widths [600 700] /ToUnicode 6 0 R >>",
+		streamObj("1 begincodespacerange <00> <ff> endcodespacerange 1 beginbfchar <41> <00660069> endbfchar"))
+	type glyph struct {
+		S    string
+		X, W float64
+	}
+	var got []glyph
+	for _, tx := range r.Page(1).Content().Text {
+		got = append(got, glyph{tx.S, tx.X, tx.W})
+	}
+	want := []glyph{{"f", 0, 3}, {"i", 3, 3}, {"B", 6, 7}, {"f", 13, 3}, {"i", 16, 3}}
+	if fmt.Sprint(got) != fmt.Sprint(want) {
+		t.Errorf("got  %v\nwant %v", got, want)
+	}
+}
