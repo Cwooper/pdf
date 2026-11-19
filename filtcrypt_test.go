@@ -68,20 +68,11 @@ func withEncrypt(data []byte, encrypt string) []byte {
 
 const testID = "0123456789abcdef"
 
-// TestAES256Unsupported verifies that AES-256 files are reported as
-// unsupported rather than malformed.
-func TestAES256Unsupported(t *testing.T) {
-	data := withEncrypt(buildPDF("<< /Type /Catalog >>"), "<< /Filter /Standard /V 5 /R 6 /Length 256 /CF << /StdCF << /CFM /AESV3 /Length 32 >> >> /StmF /StdCF /StrF /StdCF >>")
-	if err := openBytes(data); err == nil || !strings.HasPrefix(err.Error(), "unsupported") {
-		t.Errorf("got %v, want AES-256 reported as unsupported", err)
-	}
-}
-
 // A cryptSpec describes the Standard security handler encryptedPDF writes,
 // for the empty user password. Its derivations are written out from the
 // spec rather than shared with the reader, so that a mistake there shows.
 type cryptSpec struct {
-	V, R, bits int    // AESV2 when V is 4, else RC4
+	V, R, bits int    // AESV2 when V is 4, AESV3 when 5, else RC4
 	rc4CF      bool   // with V 4, the V2 (RC4) crypt filter instead of AESV2
 	cfLength   string // the crypt filter's /Length, if any
 	noMetadata bool   // /EncryptMetadata false, with a metadata stream
@@ -130,16 +121,20 @@ func (s cryptSpec) userEntry(key []byte) []byte {
 	return append(u, make([]byte, 16)...)
 }
 
-// encrypt encrypts data as object id's (Algorithm 1).
+// encrypt encrypts data as object id's (Algorithm 1; V 5 takes the file
+// key as it is).
 func (s cryptSpec) encrypt(key []byte, id int, data []byte) []byte {
 	h := md5.New()
 	h.Write(key)
 	h.Write([]byte{byte(id), byte(id >> 8), byte(id >> 16), 0, 0})
-	aesCF := s.V == 4 && !s.rc4CF
+	aesCF := s.V == 4 && !s.rc4CF || s.V == 5
 	if aesCF {
 		h.Write([]byte("sAlT"))
 	}
 	k := h.Sum(nil)[:min(len(key)+5, 16)]
+	if s.V == 5 {
+		k = key
+	}
 	if !aesCF {
 		out := make([]byte, len(data))
 		c, _ := rc4.NewCipher(k)

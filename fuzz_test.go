@@ -40,11 +40,11 @@ func checkErr(t *testing.T, what string, err error) {
 }
 
 // fuzzKeys are the file keys FuzzLex and FuzzStream decrypt with, chosen by
-// a mode byte: none, 40-bit RC4, 128-bit RC4, and AES.
+// a mode byte: none, 40-bit RC4, 128-bit RC4, AES-128, and AES-256.
 var fuzzKeys = []struct {
-	key    []byte
-	useAES bool
-}{{nil, false}, {[]byte("40bit"), false}, {[]byte(testID), false}, {[]byte(testID), true}}
+	key   []byte
+	crypt cryptMethod
+}{{nil, cryptRC4}, {[]byte("40bit"), cryptRC4}, {[]byte(testID), cryptRC4}, {[]byte(testID), cryptAESV2}, {[]byte(testID + testID), cryptAESV3}}
 
 // objSize returns the string bytes and the array and dict entries x holds.
 func objSize(x object) (strs, entries int) {
@@ -83,7 +83,7 @@ func FuzzLex(f *testing.F) {
 		b.allowObjptr = mode&1 == 0
 		b.allowStream = mode&2 == 0
 		k := fuzzKeys[int(mode>>2)%len(fuzzKeys)]
-		b.key, b.useAES = k.key, k.useAES
+		b.key, b.crypt = k.key, k.crypt
 		var strs, entries int
 		// Every object but the last consumes a token, at least a byte.
 		for n := 0; ; n++ {
@@ -260,14 +260,17 @@ func FuzzStream(f *testing.F) {
 		}
 		if k.key != nil {
 			v := 2
-			if k.useAES {
+			switch k.crypt {
+			case cryptAESV2:
 				v = 4
+			case cryptAESV3:
+				v = 5
 			}
 			data = cryptSpec{V: v}.encrypt(k.key, 2, data)
 		}
 		file := buildPDF("<< /Type /Catalog >>", fmt.Sprintf("<< /Length %d %s %s >>\nstream\n%s\nendstream", len(data), filter, dict, data))
 		r := openPDF(t, file)
-		r.key, r.useAES, r.clearMetadata = k.key, k.useAES, mode&8 != 0
+		r.key, r.crypt, r.clearMetadata = k.key, k.crypt, mode&8 != 0
 		tolerate(func() {
 			n, _ := io.Copy(io.Discard, r.resolve(objptr{}, objptr{2, 0}).Reader())
 			if n > r.cache.limit {
@@ -374,7 +377,7 @@ func FuzzOpen(f *testing.F) {
 	} {
 		f.Add(openInput(seed))
 	}
-	for _, name := range []string{"testdata/ascii85_flate_chain.pdf", "testdata/ascii85_zero_group.pdf"} {
+	for _, name := range []string{"testdata/ascii85_flate_chain.pdf", "testdata/ascii85_zero_group.pdf", "testdata/aes256-r6.pdf", "testdata/aes256-r5.pdf", "testdata/pdf20.pdf"} {
 		data, err := os.ReadFile(name)
 		if err != nil {
 			f.Fatal(err)

@@ -75,15 +75,15 @@ func TestCBCReader(t *testing.T) {
 }
 
 func TestCryptKeyDeterministicAndSaltAware(t *testing.T) {
-	k1 := cryptKey([]byte("secret"), false, objptr{id: 1, gen: 0})
-	k2 := cryptKey([]byte("secret"), false, objptr{id: 1, gen: 0})
+	k1 := cryptKey([]byte("secret"), cryptRC4, objptr{id: 1, gen: 0})
+	k2 := cryptKey([]byte("secret"), cryptRC4, objptr{id: 1, gen: 0})
 	if !bytes.Equal(k1, k2) {
 		t.Fatal("cryptKey is not deterministic")
 	}
-	if k3 := cryptKey([]byte("secret"), true, objptr{id: 1, gen: 0}); bytes.Equal(k1, k3) {
-		t.Fatal("cryptKey should differ when useAES (salt) differs")
+	if k3 := cryptKey([]byte("secret"), cryptAESV2, objptr{id: 1, gen: 0}); bytes.Equal(k1, k3) {
+		t.Fatal("cryptKey should differ when AES adds its salt")
 	}
-	if k4 := cryptKey([]byte("secret"), false, objptr{id: 2, gen: 0}); bytes.Equal(k1, k4) {
+	if k4 := cryptKey([]byte("secret"), cryptRC4, objptr{id: 2, gen: 0}); bytes.Equal(k1, k4) {
 		t.Fatal("cryptKey should differ when object id differs")
 	}
 	// PDF 32000-1:2008 Algorithm 1 step e: the object key is the first
@@ -92,7 +92,7 @@ func TestCryptKeyDeterministicAndSaltAware(t *testing.T) {
 	if len(k1) != 11 {
 		t.Fatalf("object key length for a 6-byte key = %d, want 11", len(k1))
 	}
-	if k5 := cryptKey([]byte("0123456789abcdef"), false, objptr{id: 1, gen: 0}); len(k5) != 16 {
+	if k5 := cryptKey([]byte("0123456789abcdef"), cryptRC4, objptr{id: 1, gen: 0}); len(k5) != 16 {
 		t.Fatalf("object key length for a 16-byte key = %d, want 16", len(k5))
 	}
 }
@@ -104,11 +104,11 @@ func TestDecryptStringRC4RoundTrip(t *testing.T) {
 
 	// RC4 is a stream cipher; applying the same keystream twice recovers the
 	// plaintext, so decrypt is its own inverse here.
-	enc := new(stringDecrypter).decrypt(key, false, ptr, plaintext)
+	enc := new(stringDecrypter).decrypt(key, cryptRC4, ptr, plaintext)
 	if enc == plaintext {
 		t.Fatal("RC4 pass did not transform the plaintext")
 	}
-	if got := new(stringDecrypter).decrypt(key, false, ptr, enc); got != plaintext {
+	if got := new(stringDecrypter).decrypt(key, cryptRC4, ptr, enc); got != plaintext {
 		t.Fatalf("round trip = %q, want %q", got, plaintext)
 	}
 }
@@ -117,7 +117,7 @@ func TestDecryptStringAESRoundTrip(t *testing.T) {
 	key := bytes.Repeat([]byte{0x42}, 16)
 	ptr := objptr{id: 7, gen: 2}
 
-	derived := cryptKey(key, true, ptr)
+	derived := cryptKey(key, cryptAESV2, ptr)
 	block, err := aes.NewCipher(derived)
 	if err != nil {
 		t.Fatal(err)
@@ -128,12 +128,12 @@ func TestDecryptStringAESRoundTrip(t *testing.T) {
 	cipher.NewCBCEncrypter(block, iv).CryptBlocks(ct, plaintext)
 
 	sealed := string(append(append([]byte{}, iv...), ct...))
-	if got := new(stringDecrypter).decrypt(key, true, ptr, sealed); got != string(plaintext) {
+	if got := new(stringDecrypter).decrypt(key, cryptAESV2, ptr, sealed); got != string(plaintext) {
 		t.Fatalf("round trip = %q, want %q", got, plaintext)
 	}
 }
 
-func TestOkayV4(t *testing.T) {
+func TestStdCryptFilter(t *testing.T) {
 	valid := dict{
 		name("CF"): dict{
 			name("StdCF"): dict{
@@ -145,35 +145,41 @@ func TestOkayV4(t *testing.T) {
 		name("StmF"): name("StdCF"),
 		name("StrF"): name("StdCF"),
 	}
-	if _, ok := okayV4(valid); !ok {
-		t.Fatal("okayV4(valid) = false, want true")
+	if cfm, ok := stdCryptFilter(valid, 16); !ok || cfm != name("AESV2") {
+		t.Fatalf("stdCryptFilter(valid) = %v, %v; want AESV2, true", cfm, ok)
+	}
+	if _, ok := stdCryptFilter(valid, 32); ok {
+		t.Fatal("stdCryptFilter should reject a key length other than the one asked for")
 	}
 
-	if _, ok := okayV4(dict{name("StmF"): name("A"), name("StrF"): name("B")}); ok {
-		t.Fatal("okayV4 should reject StmF != StrF")
-	}
-	badCFM := dict{
-		name("CF"):   dict{name("StdCF"): dict{name("CFM"): name("None"), name("Length"): int64(16)}},
-		name("StmF"): name("StdCF"),
-		name("StrF"): name("StdCF"),
-	}
-	if _, ok := okayV4(badCFM); ok {
-		t.Fatal("okayV4 should reject a CFM other than AESV2 or V2")
+	if _, ok := stdCryptFilter(dict{name("StmF"): name("A"), name("StrF"): name("B")}, 16); ok {
+		t.Fatal("stdCryptFilter should reject StmF != StrF")
 	}
 	badLength := dict{
 		name("CF"):   dict{name("StdCF"): dict{name("CFM"): name("AESV2"), name("Length"): int64(8)}},
 		name("StmF"): name("StdCF"),
 		name("StrF"): name("StdCF"),
 	}
-	if _, ok := okayV4(badLength); ok {
-		t.Fatal("okayV4 should reject non-16-byte key length")
+	if _, ok := stdCryptFilter(badLength, 16); ok {
+		t.Fatal("stdCryptFilter should reject non-16-byte key length")
 	}
 	badCFType := dict{
 		name("CF"):   dict{name("StdCF"): int64(1234)}, // CF value is not a dict
 		name("StmF"): name("StdCF"),
 		name("StrF"): name("StdCF"),
 	}
-	if _, ok := okayV4(badCFType); ok {
-		t.Fatal("okayV4 should reject a non-dict CF entry")
+	if _, ok := stdCryptFilter(badCFType, 16); ok {
+		t.Fatal("stdCryptFilter should reject a non-dict CF entry")
+	}
+
+	// V4 takes only AESV2 and V2, and V5 only AESV3.
+	for _, enc := range []string{
+		"<< /Filter /Standard /V 4 /R 4 /CF << /StdCF << /CFM /None >> >> /StmF /StdCF /StrF /StdCF >>",
+		"<< /Filter /Standard /V 4 /R 4 /CF << /StdCF << /CFM /AESV3 >> >> /StmF /StdCF /StrF /StdCF >>",
+		"<< /Filter /Standard /V 5 /R 6 /CF << /StdCF << /CFM /V2 >> >> /StmF /StdCF /StrF /StdCF >>",
+	} {
+		if err := openBytes(withEncrypt(buildPDF("<< /Type /Catalog >>"), enc)); err == nil || !strings.HasPrefix(err.Error(), "unsupported") {
+			t.Errorf("%s: got %v, want unsupported", enc, err)
+		}
 	}
 }

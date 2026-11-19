@@ -68,6 +68,8 @@ import (
 	"crypto/cipher"
 	"crypto/md5"
 	"crypto/rc4"
+	"crypto/sha256"
+	"crypto/sha512"
 	"crypto/subtle"
 	"encoding/ascii85"
 	"encoding/binary"
@@ -77,6 +79,7 @@ import (
 	"math"
 	"os"
 	"runtime"
+	"slices"
 	"sort"
 	"strconv"
 	"sync"
@@ -99,7 +102,7 @@ type Reader struct {
 	trailer    dict
 	trailerptr objptr
 	key        []byte
-	useAES     bool
+	crypt      cryptMethod
 	// clearMetadata marks /EncryptMetadata false: metadata streams are
 	// stored unencrypted.
 	clearMetadata bool
@@ -295,7 +298,7 @@ func NewReaderEncrypted(f io.ReaderAt, size int64, pw func() string) (r *Reader,
 	}
 	buf := make([]byte, 10)
 	f.ReadAt(buf, 0)
-	if !bytes.HasPrefix(buf, []byte("%PDF-1.")) || buf[7] < '0' || buf[7] > '7' || buf[8] != '\r' && buf[8] != '\n' {
+	if !validHeader(buf) {
 		return nil, fmt.Errorf("not a PDF file: invalid header")
 	}
 	end := size
@@ -680,6 +683,21 @@ func readXrefTableData(b *buffer, table *xrefTable) (*xrefTable, error) {
 	return table, nil
 }
 
+// validHeader reports whether buf opens with a PDF 1.0 to 1.7 or 2.x header
+// line.
+func validHeader(buf []byte) bool {
+	if len(buf) < 9 || !bytes.HasPrefix(buf, []byte("%PDF-")) || buf[6] != '.' || buf[8] != '\r' && buf[8] != '\n' {
+		return false
+	}
+	switch major, minor := buf[5], buf[7]; major {
+	case '1':
+		return minor >= '0' && minor <= '7'
+	case '2':
+		return minor >= '0' && minor <= '9'
+	}
+	return false
+}
+
 func findLastLine(buf []byte, s string) int {
 	bs := []byte(s)
 	max := len(buf)
@@ -980,7 +998,7 @@ func (r *Reader) resolve(parent objptr, x interface{}) Value {
 		} else {
 			b := newBuffer(io.NewSectionReader(r.f, xref.offset, r.end-xref.offset), xref.offset)
 			b.key = r.key
-			b.useAES = r.useAES
+			b.crypt = r.crypt
 			obj = b.readObject()
 			r.spend(b.readOffset() - xref.offset)
 			def, ok := obj.(objdef)
@@ -1278,7 +1296,7 @@ func (v Value) Reader() io.ReadCloser {
 	var rd io.Reader
 	rd = io.NewSectionReader(v.r.f, x.offset, streamLen)
 	if v.r.key != nil && !(v.r.clearMetadata && v.Key("Type").Name() == "Metadata") {
-		rd = decryptStream(v.r.key, v.r.useAES, x.ptr, rd)
+		rd = decryptStream(v.r.key, v.r.crypt, x.ptr, rd)
 	}
 	rd = v.r.charge(rd)
 	filter := v.Key("Filter")
@@ -1414,6 +1432,25 @@ const (
 	// rc4UIterations is the number of RC4 rounds used to derive U for
 	// revisions >= 3 (Algorithm 5).
 	rc4UIterations = 19
+
+	// AES-256 (V 5) parameters. See ISO 32000-2:2020, §7.6.4.
+	// aes256OULen is the byte length of O and U: a 32-byte hash, an 8-byte
+	// validation salt, and an 8-byte key salt.
+	aes256OULen = 48
+	// aes256KeyLen is the file key's byte length, and that of OE and UE,
+	// which hold it encrypted.
+	aes256KeyLen = 32
+	// aes256MaxPassword is the most bytes of a password that count.
+	aes256MaxPassword = 127
+)
+
+// cryptMethod is how a file's strings and streams are encrypted.
+type cryptMethod uint8
+
+const (
+	cryptRC4 cryptMethod = iota
+	cryptAESV2
+	cryptAESV3 // AES-256, under the file key itself
 )
 
 func (r *Reader) initEncrypt(password string) error {
@@ -1423,8 +1460,11 @@ func (r *Reader) initEncrypt(password string) error {
 		return fmt.Errorf("unsupported PDF: encryption filter %v", objfmt(encrypt["Filter"]))
 	}
 	V, _ := encrypt["V"].(int64)
-	aesV4, okV4 := okayV4(encrypt)
-	if V != 1 && V != 2 && (V != 4 || !okV4) {
+	if V == 5 {
+		return r.initEncryptAES256(encrypt, password)
+	}
+	cfm, okV4 := stdCryptFilter(encrypt, maxKeyBits/8)
+	if V != 1 && V != 2 && (V != 4 || !okV4 || cfm != name("AESV2") && cfm != name("V2")) {
 		return fmt.Errorf("unsupported PDF: encryption version V=%d; %v", V, objfmt(encrypt))
 	}
 	n, _ := encrypt["Length"].(int64)
@@ -1432,7 +1472,7 @@ func (r *Reader) initEncrypt(password string) error {
 		n = minKeyBits
 	}
 	if V == 4 {
-		// okayV4 allows only 128-bit crypt filters, whatever /Length says,
+		// stdCryptFilter allows only 128-bit crypt filters, whatever /Length says,
 		// and a shorter key fails aes.NewCipher.
 		n = maxKeyBits
 	}
@@ -1528,57 +1568,145 @@ func (r *Reader) initEncrypt(password string) error {
 	}
 
 	r.key = key
-	r.useAES = V == 4 && aesV4
+	r.crypt = cryptRC4
+	if V == 4 && cfm == name("AESV2") {
+		r.crypt = cryptAESV2
+	}
 	r.clearMetadata = clearMetadata
 
 	return nil
 }
 
+// initEncryptAES256 checks password as the user password of an AES-256 file
+// and derives its file key (ISO 32000-2:2020, Algorithms 2.A and 11).
+func (r *Reader) initEncryptAES256(encrypt dict, password string) error {
+	if cfm, ok := stdCryptFilter(encrypt, aes256KeyLen); !ok || cfm != name("AESV3") {
+		return fmt.Errorf("unsupported PDF: encryption version V=5; %v", objfmt(encrypt))
+	}
+	R, _ := encrypt["R"].(int64)
+	if R < 5 {
+		return fmt.Errorf("malformed PDF: encryption revision R=%d", R)
+	}
+	if R > 6 {
+		return fmt.Errorf("unsupported PDF: encryption revision R=%d", R)
+	}
+	// Viewers read the first bytes of a longer entry, so only a short one is
+	// malformed.
+	O, _ := encrypt["O"].(string)
+	U, _ := encrypt["U"].(string)
+	OE, _ := encrypt["OE"].(string)
+	UE, _ := encrypt["UE"].(string)
+	if len(O) < aes256OULen || len(U) < aes256OULen || len(OE) < aes256KeyLen || len(UE) < aes256KeyLen {
+		return fmt.Errorf("malformed PDF: missing O=, U=, OE=, or UE= encryption parameters")
+	}
+
+	// TODO: Password should be SASLprep-normalized (RFC 4013) first.
+	pw := []byte(password)
+	if len(pw) > aes256MaxPassword {
+		pw = pw[:aes256MaxPassword]
+	}
+	hash, validationSalt, keySalt := U[:32], U[32:40], U[40:48]
+	if !bytes.Equal(aes256Hash(R, pw, []byte(validationSalt)), []byte(hash)) {
+		return ErrInvalidPassword
+	}
+	b, err := aes.NewCipher(aes256Hash(R, pw, []byte(keySalt)))
+	if err != nil {
+		return fmt.Errorf("malformed PDF: invalid AES key: %v", err)
+	}
+	key := []byte(UE[:aes256KeyLen])
+	cipher.NewCBCDecrypter(b, make([]byte, aes.BlockSize)).CryptBlocks(key, key)
+
+	r.key = key
+	r.crypt = cryptAESV3
+	r.clearMetadata = encrypt["EncryptMetadata"] == false
+	return nil
+}
+
+// aes256Hash hashes a user password with salt (ISO 32000-2:2020, Algorithm
+// 2.B). Revision 5 stops at the first SHA-256. Revision 6 runs at least 64
+// rounds and stops once E's last byte is at most the round count less 32, so
+// by round 287 at the latest.
+func aes256Hash(R int64, pw, salt []byte) []byte {
+	sum := sha256.Sum256(slices.Concat(pw, salt))
+	k := sum[:]
+	if R == 5 {
+		return k
+	}
+	var e []byte
+	for i := 0; i < 64 || int(e[len(e)-1]) > i-32; i++ {
+		e = e[:0]
+		for range 64 {
+			e = append(append(e, pw...), k...)
+		}
+		b, _ := aes.NewCipher(k[:16])
+		cipher.NewCBCEncrypter(b, k[16:32]).CryptBlocks(e, e)
+		// The first 16 bytes of E, big-endian, modulo 3; 256 is 1 modulo 3,
+		// so their sum gives the same remainder.
+		n := 0
+		for _, c := range e[:16] {
+			n += int(c)
+		}
+		switch n % 3 {
+		case 0:
+			s := sha256.Sum256(e)
+			k = s[:]
+		case 1:
+			s := sha512.Sum384(e)
+			k = s[:]
+		default:
+			s := sha512.Sum512(e)
+			k = s[:]
+		}
+	}
+	return k[:32]
+}
+
 var ErrInvalidPassword = fmt.Errorf("encrypted PDF: invalid password")
 
-// okayV4 reports whether a V4 /Encrypt dict is supported, and whether its
-// crypt filter is AES (AESV2) rather than RC4 (V2).
-func okayV4(encrypt dict) (aes, ok bool) {
+// stdCryptFilter returns the method (CFM) of the crypt filter a V4 or V5
+// /Encrypt dict names for both strings and streams, if that filter is
+// supported and its key is keyLen bytes long.
+func stdCryptFilter(encrypt dict, keyLen int64) (cfm name, ok bool) {
 	cf, ok := encrypt["CF"].(dict)
 	if !ok {
-		return false, false
+		return "", false
 	}
 	stmf, ok := encrypt["StmF"].(name)
 	if !ok {
-		return false, false
+		return "", false
 	}
 	strf, ok := encrypt["StrF"].(name)
 	if !ok {
-		return false, false
+		return "", false
 	}
 	if stmf != strf {
-		return false, false
+		return "", false
 	}
 	cfparam, ok := cf[stmf].(dict)
 	if !ok {
-		return false, false
+		return "", false
 	}
 	if cfparam["AuthEvent"] != nil && cfparam["AuthEvent"] != name("DocOpen") {
-		return false, false
+		return "", false
 	}
 	// Writers give the key length in bytes or in bits.
-	if l := cfparam["Length"]; l != nil && l != int64(16) && l != int64(128) {
-		return false, false
+	if l := cfparam["Length"]; l != nil && l != keyLen && l != keyLen*8 {
+		return "", false
 	}
-	switch cfparam["CFM"] {
-	case name("AESV2"):
-		return true, true
-	case name("V2"):
-		return false, true
-	}
-	return false, false
+	cfm, ok = cfparam["CFM"].(name)
+	return cfm, ok
 }
 
-func cryptKey(key []byte, useAES bool, ptr objptr) []byte {
+// cryptKey derives an object's key from the file key (Algorithm 1), except
+// under AES-256, which encrypts every object with the file key itself.
+func cryptKey(key []byte, m cryptMethod, ptr objptr) []byte {
+	if m == cryptAESV3 {
+		return key
+	}
 	h := md5.New()
 	h.Write(key)
 	h.Write([]byte{byte(ptr.id), byte(ptr.id >> 8), byte(ptr.id >> 16), byte(ptr.gen), byte(ptr.gen >> 8)})
-	if useAES {
+	if m == cryptAESV2 {
 		h.Write([]byte("sAlT"))
 	}
 	return h.Sum(nil)[:min(len(key)+5, md5.Size)]
@@ -1593,10 +1721,11 @@ type stringDecrypter struct {
 	ks    []byte // the RC4 keystream, as long as the longest string so far
 }
 
-func (d *stringDecrypter) decrypt(key []byte, useAES bool, ptr objptr, x string) string {
+func (d *stringDecrypter) decrypt(key []byte, m cryptMethod, ptr objptr, x string) string {
+	useAES := m != cryptRC4
 	if d.ptr != ptr || d.block == nil && d.rc4 == nil {
 		*d = stringDecrypter{ptr: ptr}
-		key = cryptKey(key, useAES, ptr)
+		key = cryptKey(key, m, ptr)
 		if useAES {
 			d.block, _ = aes.NewCipher(key)
 		} else {
@@ -1639,9 +1768,9 @@ func unpad(b []byte) []byte {
 	return b
 }
 
-func decryptStream(key []byte, useAES bool, ptr objptr, rd io.Reader) io.Reader {
-	key = cryptKey(key, useAES, ptr)
-	if useAES {
+func decryptStream(key []byte, m cryptMethod, ptr objptr, rd io.Reader) io.Reader {
+	key = cryptKey(key, m, ptr)
+	if m != cryptRC4 {
 		cb, err := aes.NewCipher(key)
 		if err != nil {
 			panic("AES: " + err.Error())

@@ -50,7 +50,7 @@ type buffer struct {
 	allowStream bool
 	eof         bool
 	key         []byte
-	useAES      bool
+	crypt       cryptMethod
 	decrypter   stringDecrypter
 	objptr      objptr
 	depth       int  // current object nesting depth
@@ -488,7 +488,7 @@ func (b *buffer) readObject() object {
 	}
 
 	if str, ok := tok.(string); ok && b.key != nil && b.objptr.id != 0 {
-		tok = b.decrypter.decrypt(b.key, b.useAES, b.objptr, str)
+		tok = b.decrypter.decrypt(b.key, b.crypt, b.objptr, str)
 	}
 
 	if !b.allowObjptr {
