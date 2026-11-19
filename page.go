@@ -15,6 +15,8 @@ import (
 	"slices"
 	"sort"
 	"strings"
+	"unicode"
+	"unicode/utf16"
 )
 
 // The structures a PDF uses to describe pages and outlines are graphs of
@@ -26,6 +28,10 @@ const (
 	// maxPageTreeDepth bounds a descent through /Kids. Real page trees are
 	// broad and shallow.
 	maxPageTreeDepth = 1024
+
+	// maxPageTreeNodes bounds the /Kids entries, and so the pages, a lazy
+	// page tree walk visits.
+	maxPageTreeNodes = 1 << 20
 
 	// maxInheritDepth bounds a walk up a chain of /Parent links, counting the
 	// page itself. A page at the bottom of the deepest tree Page accepts has
@@ -100,7 +106,9 @@ func (r *Reader) Page(num int) Page {
 }
 
 // NumPage returns the number of pages in the PDF file: those its page tree
-// lists, whatever its /Count claims, up to the Reader's limits.
+// lists, whatever its /Count claims. A Reader from NewReaderOptions refuses a
+// tree past its limits as it opens; any other skips what passes its caps or
+// fails to parse.
 func (r *Reader) NumPage() int {
 	return len(r.pages())
 }
@@ -126,28 +134,27 @@ func (r *Reader) pages() []pageEntry {
 // walkPages lists the pages of the page tree. A /Kids entry referring to a
 // node or page already listed is skipped: a node listed twice at each level
 // would make a tree of 33 objects hold 2^31 pages, and one listing an
-// ancestor would make a cycle. Passing a limit panics with a LimitError on a
-// Reader from NewReaderOptions, and otherwise ends the list there, so that an
-// upstream caller's NumPage loop meets no panic it did not meet before.
-func (r *Reader) walkPages() (pages []pageEntry) {
-	maxPages := r.limits.orDefaults().Pages
-	w := pageWalk{seen: make(map[objptr]bool), maxPages: maxPages, maxNodes: 2 * maxPages}
-	if !r.strictPages {
-		defer func() {
-			if e := recover(); e != nil {
-				if _, ok := e.(LimitError); !ok {
-					panic(e)
-				}
-				pages = w.pages
-			}
-		}()
+// ancestor would make a cycle.
+func (r *Reader) walkPages() []pageEntry {
+	w := pageWalk{seen: make(map[objptr]bool), strict: r.strictPages, maxPages: math.MaxInt, maxNodes: maxPageTreeNodes}
+	if w.strict {
+		w.maxPages = r.limits.orDefaults().Pages
+		w.maxNodes = math.MaxInt
+		if w.maxPages <= math.MaxInt/2 {
+			w.maxNodes = 2 * w.maxPages
+		}
 	}
 	w.walk(r.Trailer().Key("Root").Key("Pages"), new(unresolved), 1)
 	return w.pages
 }
 
+// A pageWalk lists a page tree's pages. A strict walk, a NewReaderOptions
+// Reader's, panics with a LimitError at each cap and stops at a page only a
+// password opens; a lazy one skips past them as past a kid that fails to
+// parse, so that an upstream caller's NumPage loop meets no new panic.
 type pageWalk struct {
 	seen               map[objptr]bool
+	strict             bool
 	nodes              int
 	pages              []pageEntry
 	maxPages, maxNodes int
@@ -158,7 +165,10 @@ func (w *pageWalk) walk(node Value, resources *unresolved, depth int) {
 		return
 	}
 	if depth > maxPageTreeDepth {
-		panic(LimitError{"PageTreeDepth", maxPageTreeDepth})
+		if w.strict {
+			panic(LimitError{"PageTreeDepth", maxPageTreeDepth})
+		}
+		return
 	}
 	if d, _ := node.data.(dict); d["Resources"] != nil {
 		resources = &unresolved{node.ptr, d["Resources"]}
@@ -167,7 +177,10 @@ func (w *pageWalk) walk(node Value, resources *unresolved, depth int) {
 	entries, _ := kids.data.(array)
 	for i, x := range entries {
 		if w.nodes++; w.nodes > w.maxNodes {
-			panic(LimitError{"PageTreeNodes", int64(w.maxNodes)})
+			if w.strict {
+				panic(LimitError{"PageTreeNodes", int64(w.maxNodes)})
+			}
+			return
 		}
 		// PDF 32000 7.7.3.2 allows only references, and an inline kid
 		// would be held at every level the walk descends through.
@@ -182,15 +195,15 @@ func (w *pageWalk) walk(node Value, resources *unresolved, depth int) {
 
 // kid walks kids' entry i, skipping it if it fails to parse, so that one
 // malformed node or page loses only the pages under it. A runtime error is a
-// bug, not malformed input, and a LimitError refuses the file; both are raised
-// again.
+// bug, not malformed input, and is raised again; so, in a strict walk, are a
+// LimitError and ErrInvalidPassword, which refuse the file.
 func (w *pageWalk) kid(kids Value, i int, x object, resources *unresolved, depth int) {
 	defer func() {
 		if e := recover(); e != nil {
-			if err, ok := e.(error); ok && errors.As(err, new(LimitError)) {
+			if _, ok := e.(runtime.Error); ok {
 				panic(e)
 			}
-			if _, ok := e.(runtime.Error); ok {
+			if err, ok := e.(error); ok && w.strict && refuses(err) {
 				panic(e)
 			}
 		}
@@ -205,6 +218,12 @@ func (w *pageWalk) kid(kids Value, i int, x object, resources *unresolved, depth
 		}
 		w.pages = append(w.pages, pageEntry{kids.ptr, x, resources})
 	}
+}
+
+// refuses reports whether err refuses the whole file rather than the one
+// object being read: a limit passed, or a password needed.
+func refuses(err error) bool {
+	return errors.As(err, new(LimitError)) || errors.Is(err, ErrInvalidPassword)
 }
 
 // GetPlainText returns all the text in the PDF file
@@ -622,7 +641,31 @@ func (f Font) type0Encoding() TextEncoding {
 
 // simpleEncoding decodes a simple font's codes in the order of PDF 32000
 // 9.10.2: its ToUnicode cmap, then its encoding with /Differences over it.
+// Either failing to read leaves the other to decode.
 func (f Font) simpleEncoding() TextEncoding {
+	var table *[256]rune
+	orSkip(func() { table = f.encodingTable() })
+	if table == nil {
+		orSkip(func() { table = f.defaultEncoding(false) })
+	}
+	if table == nil {
+		table = &pdfDocEncoding
+	}
+	var m *cmap
+	orSkip(func() {
+		if toUnicode := f.V.Key("ToUnicode"); toUnicode.Kind() == Stream {
+			m = toUnicode.r.toUnicodeCmap(toUnicode)
+		}
+	})
+	if m == nil {
+		return &byteEncoder{table}
+	}
+	return &simpleEncoder{m, table}
+}
+
+// encodingTable returns a simple font's /Encoding with /Differences applied
+// over it.
+func (f Font) encodingTable() *[256]rune {
 	enc := f.V.Key("Encoding")
 	base := enc
 	if enc.Kind() == Dict {
@@ -641,14 +684,23 @@ func (f Font) simpleEncoding() TextEncoding {
 	if diffs.Kind() == Array {
 		table = differences(diffs, table)
 	}
-	var m *cmap
-	if toUnicode := f.V.Key("ToUnicode"); toUnicode.Kind() == Stream {
-		m = toUnicode.r.toUnicodeCmap(toUnicode)
-	}
-	if m == nil {
-		return &byteEncoder{table}
-	}
-	return &simpleEncoder{m, table}
+	return table
+}
+
+// orSkip calls read, recovering a panic from malformed input. A runtime
+// error, which is a bug, and an error that refuses the file are raised again.
+func orSkip(read func()) {
+	defer func() {
+		if e := recover(); e != nil {
+			if _, ok := e.(runtime.Error); ok {
+				panic(e)
+			}
+			if err, ok := e.(error); ok && refuses(err) {
+				panic(e)
+			}
+		}
+	}()
+	read()
 }
 
 // Font descriptor flags, PDF 32000 table 123.
@@ -658,9 +710,9 @@ const (
 )
 
 // defaultEncoding returns the encoding of a simple font that names none it
-// can use, chosen as pdf.js chooses it: StandardEncoding, but WinAnsi for a
-// TrueType font not flagged nonsymbolic, and PDFDocEncoding for a symbolic
-// font, whose built-in encoding is not read.
+// can use: StandardEncoding, or WinAnsi for a TrueType font not flagged
+// nonsymbolic, as pdf.js chooses; PDFDocEncoding, the earlier path, for a
+// symbolic font and for Symbol and ZapfDingbats.
 func (f Font) defaultEncoding(differences bool) *[256]rune {
 	flags := f.V.Key("FontDescriptor").Key("Flags").Int64()
 	trueType := f.V.Key("Subtype").Name() == "TrueType"
@@ -730,7 +782,28 @@ func (e *nopEncoder) Decode(raw string) (text string) {
 type ucs2Encoder struct{}
 
 func (e *ucs2Encoder) Decode(raw string) (text string) {
-	return utf16Decode(raw)
+	return string(e.appendRunes(nil, raw, math.MaxInt))
+}
+
+// appendRunes decodes raw as utf16Decode does, a code unit or surrogate pair
+// at a time, so that a pair counts as the one rune it makes.
+func (e *ucs2Encoder) appendRunes(r []rune, raw string, limit int) []rune {
+	unit := func(i int) rune { return rune(raw[i])<<8 | rune(raw[i+1]) }
+	for i := 0; i+1 < len(raw) && len(r) < limit; i += 2 {
+		u := unit(i)
+		if utf16.IsSurrogate(u) && i+3 < len(raw) {
+			if p := utf16.DecodeRune(u, unit(i+2)); p != unicode.ReplacementChar {
+				r = append(r, p)
+				i += 2
+				continue
+			}
+		}
+		if utf16.IsSurrogate(u) {
+			u = unicode.ReplacementChar
+		}
+		r = append(r, u)
+	}
+	return r
 }
 
 type byteEncoder struct {
@@ -926,8 +999,8 @@ func operandCount(stk *Stack, n, per int) int {
 // readCmap reads and parses a font's ToUnicode stream. The stream is read
 // here, outside the recovery in parseCmap: one that cannot be read at all, for
 // an unsupported filter or corrupt data, is reported the way any other
-// unreadable stream is, so an error-returning caller sees it rather than
-// silently decoding text with no cmap.
+// unreadable stream is, so that a Type0 font, which has no other map to
+// Unicode, fails rather than silently decode text with no cmap.
 func readCmap(toUnicode Value) *cmap {
 	data, err := io.ReadAll(newLimitedReader(toUnicode.Reader(), maxInterpretBytes))
 	if err != nil {
@@ -1030,8 +1103,11 @@ func parseCmap(toUnicode Value) (result *cmap) {
 			}
 			n = operandCount(stk, n, 2)
 			for i := 0; i < n; i++ {
-				repl, orig := stk.Pop().RawString(), stk.Pop().RawString()
-				if _, dup := m.bfchar[orig]; !dup && codeFits(orig) && len(repl) <= maxCmapDst {
+				dst, orig := stk.Pop(), stk.Pop().RawString()
+				// A destination that is not a string maps the code to no
+				// text, so it is left for the font's encoding.
+				repl := dst.RawString()
+				if _, dup := m.bfchar[orig]; !dup && dst.Kind() == String && codeFits(orig) && len(repl) <= maxCmapDst {
 					keep()
 					m.bfchar[orig] = repl
 				}
@@ -1134,6 +1210,7 @@ type Content struct {
 }
 
 type gstate struct {
+	enc   TextEncoding // Tf's, so that Q restores it with the font
 	Tc    float64
 	Tw    float64
 	Th    float64
@@ -1189,6 +1266,23 @@ func appendDecoded(r []rune, enc TextEncoding, raw string, limit int) []rune {
 	return append(r, []rune(enc.Decode(raw))...)
 }
 
+// An encStack saves and restores the font encoding with q and Q, as the
+// graphics state would; a q past maxGstackDepth saves none.
+type encStack []TextEncoding
+
+func (s *encStack) save(enc TextEncoding) {
+	if len(*s) < maxGstackDepth {
+		*s = append(*s, enc)
+	}
+}
+
+// restore sets *enc to the encoding last saved, if any.
+func (s *encStack) restore(enc *TextEncoding) {
+	if n := len(*s) - 1; n >= 0 {
+		*enc, *s = (*s)[n], (*s)[:n]
+	}
+}
+
 // decodeText decodes raw font code points with enc and returns UTF-8 text,
 // spending its runes from glyphs.
 func decodeText(enc TextEncoding, raw string, glyphs *glyphBudget) string {
@@ -1224,6 +1318,7 @@ func (p Page) GetPlainText(fonts map[string]*Font) (result string, err error) {
 	}
 	strm := p.V.Key("Contents")
 	var enc TextEncoding = &nopEncoder{}
+	var saved encStack
 
 	lookup := (&pageFonts{page: p}).lookup
 	if fonts != nil {
@@ -1252,6 +1347,10 @@ func (p Page) GetPlainText(fonts map[string]*Font) (result string, err error) {
 			return
 		case "BT": // add a space between text objects
 			showText("\n")
+		case "q":
+			saved.save(enc)
+		case "Q":
+			saved.restore(&enc)
 		case "T*": // move to start of next line
 			showEncodedText("\n")
 		case "Tf": // set text font and size
@@ -1400,6 +1499,7 @@ func (p Page) walkTextBlocks(emit func(x, y float64, s string)) {
 	fonts := &pageFonts{page: p}
 
 	var enc TextEncoding = &nopEncoder{}
+	var saved encStack
 	var currentX, currentY float64
 	glyphs := glyphBudget{r: p.V.r}
 	// Each Text costs its glyphs, and an empty one, as Td makes, costs one.
@@ -1421,6 +1521,10 @@ func (p Page) walkTextBlocks(emit func(x, y float64, s string)) {
 		default:
 			return
 		case "T*": // move to start of next line
+		case "q":
+			saved.save(enc)
+		case "Q":
+			saved.restore(&enc)
 		case "Tf": // set text font and size
 			if len(args) != 2 {
 				panic("bad TL")
@@ -1478,10 +1582,10 @@ func (p Page) Content() Content {
 		return Content{}
 	}
 	strm := p.V.Key("Contents")
-	var enc TextEncoding = &nopEncoder{}
 	fonts := &pageFonts{page: p}
 
 	var g = gstate{
+		enc: &nopEncoder{},
 		Th:  1,
 		CTM: ident,
 	}
@@ -1514,7 +1618,7 @@ func (p Page) Content() Content {
 			var n int
 			var w float64
 			if m != nil && m.cid != nil {
-				n = cidCodeLen(enc, s)
+				n = cidCodeLen(g.enc, s)
 				cid := -1
 				if m.identity {
 					cid = int(beUint(s[:n]))
@@ -1523,7 +1627,7 @@ func (p Page) Content() Content {
 			} else {
 				n, w = 1, g.Tf.Width(int(s[0]))
 			}
-			runes = appendDecoded(runes[:0], enc, s[:n], glyphs.left()+1)
+			runes = appendDecoded(runes[:0], g.enc, s[:n], glyphs.left()+1)
 			s = s[n:]
 			w /= float64(max(1, len(runes)))
 			for i, ch := range runes {
@@ -1637,13 +1741,13 @@ func (p Page) Content() Content {
 			}
 			f := args[0].Name()
 			font, _ := fonts.lookup(f)
-			enc = font.Encoder()
+			g.enc = font.Encoder()
 			g.Tf = *font
-			if enc == nil {
+			if g.enc == nil {
 				if DebugOn {
 					println("no cmap for", f)
 				}
-				enc = &nopEncoder{}
+				g.enc = &nopEncoder{}
 			}
 			g.Tfs = args[1].Float64()
 

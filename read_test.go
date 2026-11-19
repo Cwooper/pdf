@@ -2,6 +2,7 @@ package pdf
 
 import (
 	"bytes"
+	"errors"
 	"strings"
 	"testing"
 )
@@ -37,6 +38,31 @@ func TestReadObjectMaxDepth(t *testing.T) {
 	}
 	if !strings.Contains(panicMsg, "maximum depth") {
 		t.Fatalf("expected 'maximum depth' in panic message, got: %s", panicMsg)
+	}
+}
+
+// TestObjectDepthRefuses verifies that an object nesting past the depth cap
+// refuses the file as a LimitError: a page holding one in a strict open, and
+// a font holding one in Page.Content.
+func TestObjectDepthRefuses(t *testing.T) {
+	nest := strings.Repeat("[", maxObjectDepth+1) + strings.Repeat("]", maxObjectDepth+1)
+	isDepth := func(err error) bool {
+		var le LimitError
+		return errors.As(err, &le) && le.Limit == "ObjectDepth" && le.Max == maxObjectDepth
+	}
+	data := pagePDF("/Junk "+nest, flateObj("BT (x) Tj ET"))
+	if _, err := NewReaderOptions(bytes.NewReader(data), int64(len(data)), Options{}); !isDepth(err) {
+		t.Errorf("NewReaderOptions: err %v, want the object depth cap", err)
+	}
+	data = pagePDF("/Resources << /Font << /F1 5 0 R >> >>", flateObj("BT /F1 12 Tf (x) Tj ET"), "<< /Subtype /Type1 /Junk "+nest+" >>")
+	p := openPDF(t, data).Page(1)
+	var err error
+	func() {
+		defer func() { err, _ = recover().(error) }()
+		p.Content()
+	}()
+	if !isDepth(err) {
+		t.Errorf("Content panicked with %v, want the object depth cap", err)
 	}
 }
 

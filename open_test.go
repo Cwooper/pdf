@@ -26,6 +26,14 @@ func TestOpenMissingFile(t *testing.T) {
 	}
 }
 
+func TestNewReaderRejectsNegativeSize(t *testing.T) {
+	var err error
+	mustNotCrash(t, func() { _, err = NewReader(bytes.NewReader(nil), -1) })
+	if err == nil || !strings.Contains(err.Error(), "too short") {
+		t.Fatalf("err = %v, want 'too short' error", err)
+	}
+}
+
 func TestNewReaderRejectsInvalidHeader(t *testing.T) {
 	data := []byte("this is not a pdf at all")
 	_, err := NewReader(bytes.NewReader(data), int64(len(data)))
@@ -54,6 +62,7 @@ func TestLenientFileEnd(t *testing.T) {
 			{"junk after %%EOF", slices.Concat(data, []byte("<signature>\r\n trailing junk")), true},
 			{"nulls after %%EOF", slices.Concat(data, make([]byte, 512)), true},
 			{"no %%EOF", bytes.TrimSuffix(bytes.TrimRight(data, "\r\n"), []byte("%%EOF")), true},
+			{"a stray startxref after the last", slices.Concat(data, []byte("startxref")), true},
 			{"no line after startxref", bytes.TrimRight(bytes.TrimSuffix(bytes.TrimRight(data, "\r\n"), []byte("%%EOF")), "\r\n"), true},
 			{"startxref first in the window", slices.Concat(data, make([]byte, window-len(tail))), true},
 			{"startxref before the window", slices.Concat(data, make([]byte, window-len(tail)+1)), false},

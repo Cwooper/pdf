@@ -2,6 +2,7 @@ package pdf
 
 import (
 	"bytes"
+	"errors"
 	"fmt"
 	"strings"
 	"testing"
@@ -362,22 +363,28 @@ func TestSimpleFontEncodingOrder(t *testing.T) {
 		extra                  []string
 	}{
 		{"differences over a named base", "<< /Subtype /Type1 /Encoding << /BaseEncoding /WinAnsiEncoding /Differences [65 /Beta] >> >>",
-			"A\x93B\x97", "Β“B—", nil},
+			"A\x93B\x97", "\u0392\u201cB\u2014", nil},
 		{"ToUnicode over unnamed glyphs", "<< /Subtype /Type1 /Encoding << /Differences [1 /g3 /g4] >> /ToUnicode 6 0 R >>",
 			"\x01\x02", "Th", []string{cmap("2 beginbfchar <01> <0054> <02> <0068> endbfchar")}},
 		{"ToUnicode over a named encoding", "<< /Subtype /TrueType /Encoding /WinAnsiEncoding /ToUnicode 6 0 R >>",
-			"AB\x93", "ZB“", []string{cmap("1 beginbfchar <41> <005a> endbfchar")}},
+			"AB\x93", "ZB\u201c", []string{cmap("1 beginbfchar <41> <005a> endbfchar")}},
 		{"ToUnicode in a two-byte codespace", "<< /Subtype /Type1 /ToUnicode 6 0 R >>",
 			"AB", "XB", []string{streamObj("1 begincodespacerange <0000> <ffff> endcodespacerange 1 beginbfchar <0041> <0058> endbfchar")}},
 		{"an unusable ToUnicode destination", "<< /Subtype /TrueType /Encoding /WinAnsiEncoding /ToUnicode 6 0 R >>",
-			"A\x93", "A“", []string{cmap("1 beginbfrange <93> <93> [1] endbfrange")}},
-		{"an unknown encoding name", "<< /Subtype /Type1 /Encoding /NoSuchEncoding >>", "it's", "it’s", nil},
-		{"a Type1 default", "<< /Subtype /Type1 /BaseFont /Times-Roman >>", "`it's`", "‘it’s‘", nil},
-		{"a TrueType default", "<< /Subtype /TrueType /FontDescriptor << /Flags 0 >> >>", "\x93it's\x94", "“it's”", nil},
-		{"a nonsymbolic TrueType default", "<< /Subtype /TrueType /FontDescriptor << /Flags 32 >> >>", "it's", "it’s", nil},
+			"A\x93", "A\u201c", []string{cmap("1 beginbfrange <93> <93> [1] endbfrange")}},
+		{"a ToUnicode bfchar to a number", "<< /Subtype /TrueType /Encoding /WinAnsiEncoding /ToUnicode 6 0 R >>",
+			"AB", "AB", []string{cmap("1 beginbfchar <41> 65 endbfchar")}},
+		{"an unreadable ToUnicode", "<< /Subtype /TrueType /Encoding /WinAnsiEncoding /ToUnicode 6 0 R >>",
+			"A\x93", "A\u201c", []string{"<< /Length 4 /Filter /LZWDecode >>\nstream\n\x80\x0b\x60\x50\nendstream"}},
+		{"a malformed encoding", "<< /Subtype /Type1 /Encoding 7 0 R /ToUnicode 6 0 R >>",
+			"AB", "ZB", []string{cmap("1 beginbfchar <41> <005a> endbfchar"), "<< /BaseEncoding /WinAnsiEncoding /Junk <zz> >>"}},
+		{"an unknown encoding name", "<< /Subtype /Type1 /Encoding /NoSuchEncoding >>", "it's", "it\u2019s", nil},
+		{"a Type1 default", "<< /Subtype /Type1 /BaseFont /Times-Roman >>", "`it's`", "\u2018it\u2019s\u2018", nil},
+		{"a TrueType default", "<< /Subtype /TrueType /FontDescriptor << /Flags 0 >> >>", "\x93it's\x94", "\u201cit's\u201d", nil},
+		{"a nonsymbolic TrueType default", "<< /Subtype /TrueType /FontDescriptor << /Flags 32 >> >>", "it's", "it\u2019s", nil},
 		{"a symbolic TrueType with differences", "<< /Subtype /TrueType /FontDescriptor << /Flags 36 >> /Encoding << /Differences [1 /fi] >> >>",
-			"\x01it's", "ﬁit’s", nil},
-		{"a symbolic default", "<< /Subtype /TrueType /FontDescriptor << /Flags 4 >> >>", "it's\x93", "it'sﬁ", nil},
+			"\x01it's", "\ufb01it\u2019s", nil},
+		{"a symbolic default", "<< /Subtype /TrueType /FontDescriptor << /Flags 4 >> >>", "it's\x93", "it's\ufb01", nil},
 		{"Symbol by name", "<< /Subtype /Type1 /BaseFont /ABCDEF+Symbol >>", "it's", "it's", nil},
 	}
 	for _, tt := range tests {
@@ -423,5 +430,59 @@ func TestLigatureWidths(t *testing.T) {
 	want := []glyph{{"f", 0, 3}, {"i", 3, 3}, {"B", 6, 7}, {"f", 13, 3}, {"i", 16, 3}}
 	if fmt.Sprint(got) != fmt.Sprint(want) {
 		t.Errorf("got  %v\nwant %v", got, want)
+	}
+}
+
+// TestRestoreKeepsEncoding verifies that Q restores the font codes decode
+// through, with the font itself, in each text extraction path.
+func TestRestoreKeepsEncoding(t *testing.T) {
+	fonts := []string{
+		"<< /Subtype /TrueType /Encoding /WinAnsiEncoding >>",
+		"<< /Subtype /TrueType /Encoding /WinAnsiEncoding /ToUnicode 7 0 R >>",
+		streamObj("1 begincodespacerange <00> <ff> endcodespacerange 1 beginbfchar <78> <0051> endbfchar"),
+	}
+	for _, tt := range []struct{ name, content string }{
+		{"a font set before q", "BT /F1 12 Tf q /F2 12 Tf Q (x) Tj ET"},
+		{"no font before q", "BT q /F2 12 Tf Q (x) Tj ET"},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			r := openPDF(t, pagePDF("/Resources << /Font << /F1 5 0 R /F2 6 0 R >> >>", append([]string{flateObj(tt.content)}, fonts...)...))
+			p := r.Page(1)
+			if got := contentText(p); got != "x" {
+				t.Errorf("Content shows %q, want %q", got, "x")
+			}
+			if got, err := p.GetPlainText(nil); err != nil || got != "\nx" {
+				t.Errorf("GetPlainText = %q, %v; want %q", got, err, "\nx")
+			}
+			if rows, err := p.GetTextByRow(); err != nil || len(rows) != 1 || len(rows[0].Content) != 1 || rows[0].Content[0].S != "x" {
+				t.Errorf("GetTextByRow = %v, %v; want x", rows, err)
+			}
+		})
+	}
+}
+
+// TestUCS2DecodeLimit verifies that the UCS-2 encoding stops at a rune
+// limit, two bytes a rune, a surrogate pair counting as one.
+func TestUCS2DecodeLimit(t *testing.T) {
+	raw := "\x00A\xd8\x3d\xde\x00\x00B\x00C"
+	for limit, want := range []string{"", "A", "A\U0001f600", "A\U0001f600B", "A\U0001f600BC", "A\U0001f600BC"} {
+		if got := decodeLimit(&ucs2Encoder{}, raw, limit); got != want {
+			t.Errorf("limit %d: got %q, want %q", limit, got, want)
+		}
+	}
+}
+
+// TestToUnicodePasswordRefuses verifies that a ToUnicode cmap only a
+// password opens refuses the page rather than fall back to the encoding.
+func TestToUnicodePasswordRefuses(t *testing.T) {
+	zeros := strings.Repeat("00", 32)
+	data := withEncrypt(pagePDF("/Resources << /Font << /F1 5 0 R >> >>",
+		streamObj("BT /F1 12 Tf (A) Tj ET"),
+		"<< /Subtype /TrueType /Encoding /WinAnsiEncoding /ToUnicode 6 0 R >>",
+		"<< /Length 16 /Filter /Crypt /DecodeParms << /Name /StdCF >> >>\nstream\n0123456789abcdef\nendstream",
+		"<< /Filter /Standard /V 4 /R 4 /O <"+zeros+"> /U <"+zeros+"> /P -4 /StmF /Identity /StrF /Identity /CF << /StdCF << /CFM /AESV2 >> >> >>",
+	), "7 0 R")
+	if _, err := openPDF(t, data).Page(1).GetPlainText(nil); !errors.Is(err, ErrInvalidPassword) {
+		t.Errorf("GetPlainText: err %v, want ErrInvalidPassword", err)
 	}
 }

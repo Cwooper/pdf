@@ -404,7 +404,7 @@ func FuzzOpen(f *testing.F) {
 		}
 		pages := 0
 		tolerate(func() { pages = r.NumPage() })
-		if pages > defaultMaxPages {
+		if pages > maxPageTreeNodes {
 			t.Fatalf("%d pages", pages)
 		}
 		for i := 1; i <= pages; i++ {

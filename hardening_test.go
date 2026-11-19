@@ -263,15 +263,16 @@ func TestCmapMissingBeginDiscarded(t *testing.T) {
 	}
 }
 
-// TestToUnicodeStreamErrorReported verifies that a ToUnicode stream that
-// cannot be read at all -- an unsupported filter here -- is reported like any
-// other unreadable stream, rather than silently decoding text with no cmap.
+// TestToUnicodeStreamErrorReported verifies that a Type0 font's ToUnicode
+// stream that cannot be read at all -- an unsupported filter here -- is
+// reported like any other unreadable stream, rather than silently decoding
+// text with no cmap, since the font has no other map to Unicode.
 func TestToUnicodeStreamErrorReported(t *testing.T) {
 	const content = "BT /F1 12 Tf (AB) Tj ET"
 	file := content + "junk"
 	r := &Reader{f: bytes.NewReader([]byte(file)), end: int64(len(file))}
 	toUnicode := stream{dict{name("Length"): int64(4), name("Filter"): name("LZWDecode")}, objptr{}, int64(len(content))}
-	font := dict{name("Type"): name("Font"), name("Subtype"): name("Type1"), name("ToUnicode"): toUnicode}
+	font := dict{name("Type"): name("Font"), name("Subtype"): name("Type0"), name("ToUnicode"): toUnicode}
 	page := dict{
 		name("Resources"): dict{name("Font"): dict{name("F1"): font}},
 		name("Contents"):  stream{dict{name("Length"): int64(len(content))}, objptr{}, 0},
@@ -549,7 +550,8 @@ func objStmLayout(members []testObj) (string, int) {
 }
 
 // xrefStreamFile returns a file holding objs behind an xref stream, with
-// object 1 as the catalog. An object stream's data is Flate-compressed.
+// object 1 as the catalog. An object stream's data is Flate-compressed
+// unless its hdr names a filter.
 func xrefStreamFile(objs ...testObj) []byte {
 	var b bytes.Buffer
 	b.WriteString("%PDF-1.5\n")
@@ -571,9 +573,13 @@ func xrefStreamFile(objs ...testObj) []byte {
 			rows[m.num] = [3]int{2, o.num, i}
 			size = max(size, m.num+1)
 		}
-		z := deflate([]byte(data))
 		hdr := strings.NewReplacer("FIRST", fmt.Sprint(first), "NUM", fmt.Sprint(len(o.members))).Replace(o.hdr)
-		fmt.Fprintf(&b, "%d 0 obj\n<< /Type /ObjStm %s /Filter /FlateDecode /Length %d >>\nstream\n%s\nendstream\nendobj\n", o.num, hdr, len(z), z)
+		// An hdr naming its own filter keeps the data as it is.
+		z := []byte(data)
+		if !strings.Contains(hdr, "/Filter") {
+			z, hdr = deflate(z), hdr+" /Filter /FlateDecode"
+		}
+		fmt.Fprintf(&b, "%d 0 obj\n<< /Type /ObjStm %s /Length %d >>\nstream\n%s\nendstream\nendobj\n", o.num, hdr, len(z), z)
 	}
 	rows[size] = [3]int{1, b.Len(), 0}
 	var e bytes.Buffer

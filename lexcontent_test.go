@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"errors"
 	"fmt"
+	"math"
 	"runtime"
 	"strings"
 	"testing"
@@ -554,17 +555,65 @@ func TestPageTreeLimits(t *testing.T) {
 	if r, err := openOptions(t, pageTreePDF("<< /Type /Pages /Kids [3 0 R 4 0 R 5 0 R 6 0 R] >>", page, page, page, page), Limits{}); err != nil || r.NumPage() != 4 {
 		t.Errorf("with no limits set: err %v, want 4 pages", err)
 	}
-	// A lazy Reader lists the pages up to a limit instead of panicking.
-	data := pageTreePDF("<< /Type /Pages /Kids [3 0 R 4 0 R] >>",
-		page, "<< /Type /Pages /Kids [5 0 R 6 0 R 7 0 R] >>", "<< /Type /Pages /Kids [8 0 R 9 0 R] >>", page, page, page, page)
-	r, err := NewReader(bytes.NewReader(data), int64(len(data)))
-	if err != nil {
-		t.Fatal(err)
+	// A huge page limit doubles to no negative node cap.
+	if r, err := openOptions(t, pageTreePDF("<< /Type /Pages /Kids [3 0 R] >>", page), Limits{Pages: math.MaxInt}); err != nil || r.NumPage() != 1 {
+		t.Errorf("with the page limit at MaxInt: err %v, want 1 page", err)
 	}
-	r.limits = Limits{Pages: 3}
+}
+
+// TestLazyPageTree verifies that a Reader from NewReader skips a subtree
+// past the page tree's depth cap, or one whose parse spends the decode
+// budget, and keeps the pages beside it.
+func TestLazyPageTree(t *testing.T) {
+	page := "<< /Type /Page >>"
+	// Object 3 heads a chain of nodes nesting past the depth cap, and the
+	// node after it lists ten pages.
+	const chain = maxPageTreeDepth
+	objs := []string{"<< /Type /Catalog /Pages 2 0 R >>", fmt.Sprintf("<< /Type /Pages /Kids [3 0 R %d 0 R] >>", chain+4)}
+	for k := 3; k < chain+3; k++ {
+		objs = append(objs, fmt.Sprintf("<< /Type /Pages /Kids [%d 0 R] >>", k+1))
+	}
+	objs = append(objs, page)
+	var kids []string
+	for k := range 10 {
+		kids = append(kids, fmt.Sprintf("%d 0 R", chain+5+k))
+	}
+	objs = append(objs, "<< /Type /Pages /Kids ["+strings.Join(kids, " ")+"] >>")
+	for range 10 {
+		objs = append(objs, page)
+	}
+	r := openPDF(t, buildPDF(objs...))
 	var n int
 	mustNotCrash(t, func() { n = r.NumPage() })
-	if n != 3 {
-		t.Errorf("lazy NumPage = %d, want 3", n)
+	if n != 10 {
+		t.Errorf("past the depth cap: NumPage = %d, want 10", n)
+	}
+
+	r = openPDF(t, pageTreePDF("<< /Type /Pages /Kids [3 0 R 4 0 R] >>", page, "<< /Type /Page /Junk ("+strings.Repeat("x", 4096)+") >>"))
+	r.cache.budget.Store(1024)
+	mustNotCrash(t, func() { n = r.NumPage() })
+	if n != 1 {
+		t.Errorf("past the decode budget: NumPage = %d, want 1", n)
+	}
+}
+
+// TestPageNeedsPassword verifies that NewReaderOptions refuses a file whose
+// page only a password opens, here one kept in an object stream under a
+// crypt filter, rather than open it with no pages.
+func TestPageNeedsPassword(t *testing.T) {
+	zeros := strings.Repeat("00", 32)
+	data := xrefStreamFile(
+		testObj{num: 1, body: "<< /Type /Catalog /Pages 2 0 R >>"},
+		testObj{num: 2, body: "<< /Type /Pages /Kids [3 0 R] >>"},
+		testObj{num: 4, body: "<< /Filter /Standard /V 4 /R 4 /O <" + zeros + "> /U <" + zeros + "> /P -4 /StmF /Identity /StrF /Identity /CF << /StdCF << /CFM /AESV2 >> >> >>"},
+		testObj{num: 5, hdr: "/N NUM /First FIRST /Filter /Crypt /DecodeParms << /Name /StdCF >>", members: []testObj{{num: 3, body: "<< /Type /Page >>"}}},
+	)
+	data = bytes.Replace(data, []byte("/Root 1 0 R"), []byte("/Root 1 0 R /Encrypt 4 0 R /ID [<00112233445566778899aabbccddeeff> <>]"), 1)
+	r, err := NewReader(bytes.NewReader(data), int64(len(data)))
+	if err != nil || r.NumPage() != 0 {
+		t.Fatalf("NewReader: err %v, want a file of no pages", err)
+	}
+	if _, err := openOptions(t, data, Limits{}); !errors.Is(err, ErrInvalidPassword) {
+		t.Errorf("NewReaderOptions: err %v, want ErrInvalidPassword", err)
 	}
 }

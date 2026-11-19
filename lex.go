@@ -466,8 +466,7 @@ func (b *buffer) readObject() object {
 	b.depth++
 	defer func() { b.depth-- }()
 	if b.depth > maxObjectDepth {
-		b.errorf("object nesting exceeds maximum depth %d", maxObjectDepth)
-		return nil
+		panic(LimitError{"ObjectDepth", maxObjectDepth})
 	}
 
 	tok := b.readToken()

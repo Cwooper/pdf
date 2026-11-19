@@ -125,8 +125,8 @@ type Reader struct {
 	noObjStm bool
 
 	limits Limits
-	// strictPages makes a page tree past the limits a LimitError rather
-	// than a shortened page list.
+	// strictPages makes the page walk refuse the file at its limits and at
+	// a page only a password opens, rather than skip past them.
 	strictPages bool
 	cache       *readerCache
 }
@@ -289,8 +289,8 @@ func Open(file string) (*os.File, *Reader, error) {
 }
 
 // NewReader opens a file for reading, using the data in f with the given total size.
-// It reads the page tree only when asked for a page, and a page tree past the
-// default limits lists the pages up to them; NewReaderOptions refuses it.
+// It reads the page tree only when asked for a page, skipping what passes its
+// caps or fails to parse; NewReaderOptions refuses such a tree instead.
 func NewReader(f io.ReaderAt, size int64) (*Reader, error) {
 	return NewReaderEncrypted(f, size, nil)
 }
@@ -308,8 +308,8 @@ func NewReaderEncrypted(f io.ReaderAt, size int64, pw func() string) (*Reader, e
 // takes the default, so fields can be added without changing what a caller
 // that sets none gets.
 type Limits struct {
-	// Pages caps the pages the page tree lists; the entries of its /Kids
-	// arrays are capped at twice it. The default is 1<<20.
+	// Pages caps the pages the page tree lists, and twice it the entries
+	// of its /Kids arrays. The default is 1<<20.
 	Pages int
 	// PageContent caps the decoded bytes of a page's content streams, all
 	// of them together, that text extraction reads. The default is 16 MB.
@@ -340,8 +340,10 @@ type Options struct {
 // names the Limits field passed, or for a cap Limits does not set:
 // PageTreeNodes and PageTreeDepth for the page tree, DecodeBudget for the
 // bytes the Reader's streams decode in all, and PageGlyphs and DocGlyphs for
-// the glyphs text extraction shows on a page and in all. A Reader's methods
-// that return no error raise it as a panic.
+// the glyphs text extraction shows on a page and in all, and ObjectDepth for
+// the nesting of one object. Methods that return no error, Page.Content
+// included, raise it as a panic; a Reader from NewReader stops its page walk
+// at the page tree's caps instead.
 type LimitError struct {
 	Limit string
 	Max   int64
@@ -363,14 +365,17 @@ func (e LimitError) Error() string {
 		return fmt.Sprintf("page shows more than %d glyphs", e.Max)
 	case "DocGlyphs":
 		return fmt.Sprintf("document shows more than %d glyphs", e.Max)
+	case "ObjectDepth":
+		return fmt.Sprintf("object nesting exceeds maximum depth %d", e.Max)
 	}
 	return fmt.Sprintf("the file passes the %s limit of %d", e.Limit, e.Max)
 }
 
 // NewReaderOptions opens a file for reading, using the data in f with the
 // given total size, as NewReaderEncrypted does with o.Password. It reads the
-// page tree as it opens the file, so that a page tree past o.Limits returns
-// its LimitError here.
+// page tree as it opens the file, so that a tree past o.Limits returns its
+// LimitError here, and one holding a page only a password opens returns
+// ErrInvalidPassword.
 func NewReaderOptions(f io.ReaderAt, size int64, o Options) (r *Reader, err error) {
 	if r, err = open(f, size, o); err != nil {
 		return nil, err
@@ -395,12 +400,21 @@ func recoveredError(x any) error {
 	return fmt.Errorf("malformed PDF: %v", x)
 }
 
+// minFileSize is the size of the smallest file open reads: a header and
+// %%EOF. A negative size would panic in make.
+const minFileSize = int64(len("%PDF-1.0\n%%EOF"))
+
+var errTooShort = errors.New("not a PDF file: too short")
+
 // headerWindow is how far into a file Acrobat looks for the header. What
 // comes before it is junk a mailer or downloader prepended, so offsets count
 // from the header.
 const headerWindow = 1024
 
 func open(f io.ReaderAt, size int64, o Options) (*Reader, error) {
+	if size < minFileSize {
+		return nil, errTooShort
+	}
 	head := make([]byte, min(size, headerWindow+10))
 	f.ReadAt(head, 0)
 	for h := 1; h <= min(headerWindow, len(head)) && !validHeader(head); h++ {
@@ -419,8 +433,8 @@ func openAt(f io.ReaderAt, size int64, o Options) (r *Reader, err error) {
 		}
 	}()
 
-	if size < int64(len("%PDF-1.0\n%%EOF")) {
-		return nil, fmt.Errorf("not a PDF file: too short")
+	if size < minFileSize {
+		return nil, errTooShort
 	}
 	buf := make([]byte, 10)
 	f.ReadAt(buf, 0)
@@ -834,10 +848,12 @@ func findLastLine(buf []byte, s string) int {
 	max := len(buf)
 	for {
 		i := bytes.LastIndex(buf[:max], bs)
-		if i <= 0 || i+len(bs) >= len(buf) {
+		if i <= 0 {
 			return -1
 		}
-		if (buf[i-1] == '\n' || buf[i-1] == '\r') && (buf[i+len(bs)] == '\n' || buf[i+len(bs)] == '\r') {
+		// One at the very end has no line break after it, so an earlier one
+		// may still be the line.
+		if i+len(bs) < len(buf) && (buf[i-1] == '\n' || buf[i-1] == '\r') && (buf[i+len(bs)] == '\n' || buf[i+len(bs)] == '\r') {
 			return i
 		}
 		max = i
