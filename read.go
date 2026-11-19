@@ -97,8 +97,8 @@ var DebugOn = false
 // It is safe for concurrent use; goroutines share its caches and its budgets
 // over its lifetime: its streams decode at most the larger of 128 MB and 32
 // times the file size, and its pages show at most 2^23 glyphs. A page whose
-// content decodes past 16 MB fails. A caller reading the file through many
-// times should open a new Reader for each pass.
+// content decodes past its Limits.PageContent fails. A caller reading the
+// file through many times should open a new Reader for each pass.
 type Reader struct {
 	f          io.ReaderAt
 	end        int64
@@ -124,7 +124,8 @@ type Reader struct {
 	// header cannot make another stream load.
 	noObjStm bool
 
-	cache *readerCache
+	limits Limits
+	cache  *readerCache
 }
 
 type xref struct {
@@ -285,6 +286,8 @@ func Open(file string) (*os.File, *Reader, error) {
 }
 
 // NewReader opens a file for reading, using the data in f with the given total size.
+// It reads the page tree only when asked for a page, so a page tree past the
+// default limits panics with a LimitError there; NewReaderOptions reports it.
 func NewReader(f io.ReaderAt, size int64) (*Reader, error) {
 	return NewReaderEncrypted(f, size, nil)
 }
@@ -294,15 +297,104 @@ func NewReader(f io.ReaderAt, size int64) (*Reader, error) {
 // to try. If pw returns the empty string, NewReaderEncrypted stops trying to decrypt
 // the file and returns an error, except for a file that encrypts only its
 // attachments: that file opens anyway, and its attachments fail to read.
-func NewReaderEncrypted(f io.ReaderAt, size int64, pw func() string) (r *Reader, err error) {
+func NewReaderEncrypted(f io.ReaderAt, size int64, pw func() string) (*Reader, error) {
+	return open(f, size, Options{Password: pw})
+}
+
+// Limits caps what one file may make a Reader do. A field of zero or less
+// takes the default, so fields can be added without changing what a caller
+// that sets none gets.
+type Limits struct {
+	// Pages caps the pages the page tree lists; the entries of its /Kids
+	// arrays are capped at twice it. The default is 1<<20.
+	Pages int
+	// PageContent caps the decoded bytes of a page's content streams, all
+	// of them together, that text extraction reads. The default is 16 MB.
+	PageContent int64
+}
+
+const defaultMaxPages = 1 << 20
+
+func (l Limits) orDefaults() Limits {
+	if l.Pages <= 0 {
+		l.Pages = defaultMaxPages
+	}
+	if l.PageContent <= 0 {
+		l.PageContent = maxInterpretBytes
+	}
+	return l
+}
+
+// Options configures NewReaderOptions.
+type Options struct {
+	// Password, if set, is called for passwords to try, as NewReaderEncrypted
+	// calls its pw.
+	Password func() string
+	Limits   Limits
+}
+
+// A LimitError reports a file that passes one of a Reader's limits. Limit
+// names the Limits field passed, or for a cap Limits does not set:
+// PageTreeNodes and PageTreeDepth for the page tree, DecodeBudget for the
+// bytes the Reader's streams decode in all, and PageGlyphs and DocGlyphs for
+// the glyphs text extraction shows on a page and in all. A Reader's methods
+// that return no error raise it as a panic.
+type LimitError struct {
+	Limit string
+	Max   int64
+}
+
+func (e LimitError) Error() string {
+	switch e.Limit {
+	case "Pages":
+		return fmt.Sprintf("the page tree lists more than %d pages", e.Max)
+	case "PageContent":
+		return fmt.Sprintf("a page's content exceeds %d bytes", e.Max)
+	case "PageTreeNodes":
+		return fmt.Sprintf("the page tree lists more than %d kids", e.Max)
+	case "PageTreeDepth":
+		return fmt.Sprintf("the page tree nests more than %d levels", e.Max)
+	case "DecodeBudget":
+		return fmt.Sprintf("decoding exceeds the %d-byte budget for this file", e.Max)
+	case "PageGlyphs":
+		return fmt.Sprintf("page shows more than %d glyphs", e.Max)
+	case "DocGlyphs":
+		return fmt.Sprintf("document shows more than %d glyphs", e.Max)
+	}
+	return fmt.Sprintf("the file passes the %s limit of %d", e.Limit, e.Max)
+}
+
+// NewReaderOptions opens a file for reading, using the data in f with the
+// given total size, as NewReaderEncrypted does with o.Password. It reads the
+// page tree as it opens the file, so that a page tree past o.Limits returns
+// its LimitError here.
+func NewReaderOptions(f io.ReaderAt, size int64, o Options) (r *Reader, err error) {
+	if r, err = open(f, size, o); err != nil {
+		return nil, err
+	}
 	defer func() {
 		if x := recover(); x != nil {
-			r = nil
-			if e, ok := x.(error); ok {
-				err = e
-			} else {
-				err = fmt.Errorf("malformed PDF: %v", x)
-			}
+			r, err = nil, recoveredError(x)
+		}
+	}()
+	r.pages()
+	return r, nil
+}
+
+// recoveredError returns a panic recovered from reading a file as the error
+// to report, keeping an error as it is so that errors.As and errors.Is see
+// through it.
+func recoveredError(x any) error {
+	if err, ok := x.(error); ok {
+		return err
+	}
+	return fmt.Errorf("malformed PDF: %v", x)
+}
+
+func open(f io.ReaderAt, size int64, o Options) (r *Reader, err error) {
+	defer func() {
+		if x := recover(); x != nil {
+			r, err = nil, recoveredError(x)
 		}
 	}()
 
@@ -330,9 +422,10 @@ func NewReaderEncrypted(f io.ReaderAt, size int64, pw func() string) (r *Reader,
 	}
 
 	r = &Reader{
-		f:     f,
-		end:   end,
-		cache: new(readerCache),
+		f:      f,
+		end:    end,
+		limits: o.Limits,
+		cache:  new(readerCache),
 	}
 	r.cache.limit = max(minDecodeBudget, decodeBudgetRatio*size)
 	r.cache.budget.Store(r.cache.limit)
@@ -368,8 +461,8 @@ func NewReaderEncrypted(f io.ReaderAt, size int64, pw func() string) (r *Reader,
 	if err != ErrInvalidPassword && err != errKeyless {
 		return nil, err
 	}
-	for pw != nil {
-		next := pw()
+	for o.Password != nil {
+		next := o.Password()
 		if next == "" {
 			break
 		}
@@ -451,13 +544,13 @@ func readXrefStream(r *Reader, b *buffer) (*xrefTable, objptr, dict, error) {
 	}
 	// A negative /Size would panic in make.
 	if err := checkObjectNumber(size); err != nil {
-		return nil, objptr{}, nil, fmt.Errorf("malformed PDF: xref stream Size: %v", err)
+		return nil, objptr{}, nil, fmt.Errorf("malformed PDF: xref stream Size: %w", err)
 	}
 	table := newXrefTable(size)
 
 	table, err := readXrefStreamData(r, strm, table, size)
 	if err != nil {
-		return nil, objptr{}, nil, fmt.Errorf("malformed PDF: %v", err)
+		return nil, objptr{}, nil, fmt.Errorf("malformed PDF: %w", err)
 	}
 
 	err = readPrevXrefs(r, strm.hdr["Prev"], func(b *buffer) (object, error) {
@@ -484,7 +577,7 @@ func readXrefStream(r *Reader, b *buffer) (*xrefTable, objptr, dict, error) {
 		var dataErr error
 		table, dataErr = readXrefStreamData(r, prev.data.(stream), table, psize)
 		if dataErr != nil {
-			return nil, fmt.Errorf("malformed PDF: reading xref prev stream: %v", dataErr)
+			return nil, fmt.Errorf("malformed PDF: reading xref prev stream: %w", dataErr)
 		}
 		return prevstrm.hdr["Prev"], nil
 	})
@@ -545,10 +638,10 @@ func readXrefStreamData(r *Reader, strm stream, table *xrefTable, size int64) (*
 		index = index[2:]
 		// Object numbers must fit an objptr's uint32.
 		if err := checkObjectNumber(start); err != nil {
-			return nil, fmt.Errorf("invalid Index start: %v", err)
+			return nil, fmt.Errorf("invalid Index start: %w", err)
 		}
 		if err := checkObjectNumber(start + n); err != nil {
-			return nil, fmt.Errorf("invalid Index range: %v", err)
+			return nil, fmt.Errorf("invalid Index range: %w", err)
 		}
 		for i := range n {
 			if table.rows++; table.rows > maxXrefRows {
@@ -556,7 +649,7 @@ func readXrefStreamData(r *Reader, strm stream, table *xrefTable, size int64) (*
 			}
 			_, err := io.ReadFull(data, buf)
 			if err != nil {
-				return nil, fmt.Errorf("error reading xref stream: %v", err)
+				return nil, fmt.Errorf("error reading xref stream: %w", err)
 			}
 			v1 := decodeInt(buf[0:w[0]])
 			if w[0] == 0 {
@@ -616,7 +709,7 @@ func ensureXrefLen(table []xref, x, limit int) []xref {
 func readXrefTable(r *Reader, b *buffer) (*xrefTable, objptr, dict, error) {
 	table, err := readXrefTableData(b, newXrefTable(0))
 	if err != nil {
-		return nil, objptr{}, nil, fmt.Errorf("malformed PDF: %v", err)
+		return nil, objptr{}, nil, fmt.Errorf("malformed PDF: %w", err)
 	}
 
 	trailer, ok := b.readObject().(dict)
@@ -631,7 +724,7 @@ func readXrefTable(r *Reader, b *buffer) (*xrefTable, objptr, dict, error) {
 		var dataErr error
 		table, dataErr = readXrefTableData(b, table)
 		if dataErr != nil {
-			return nil, fmt.Errorf("malformed PDF: %v", dataErr)
+			return nil, fmt.Errorf("malformed PDF: %w", dataErr)
 		}
 		prevTrailer, ok := b.readObject().(dict)
 		if !ok {
@@ -649,7 +742,7 @@ func readXrefTable(r *Reader, b *buffer) (*xrefTable, objptr, dict, error) {
 	}
 	// A negative /Size would panic in truncate.
 	if err := checkObjectNumber(size); err != nil {
-		return nil, objptr{}, nil, fmt.Errorf("malformed PDF: trailer /Size: %v", err)
+		return nil, objptr{}, nil, fmt.Errorf("malformed PDF: trailer /Size: %w", err)
 	}
 
 	table.truncate(size)
@@ -670,10 +763,10 @@ func readXrefTableData(b *buffer, table *xrefTable) (*xrefTable, error) {
 		}
 		// Object numbers must fit an objptr's uint32.
 		if err := checkObjectNumber(start); err != nil {
-			return nil, fmt.Errorf("malformed xref table: %v", err)
+			return nil, fmt.Errorf("malformed xref table: %w", err)
 		}
 		if err := checkObjectNumber(start + n); err != nil {
-			return nil, fmt.Errorf("malformed xref table: %v", err)
+			return nil, fmt.Errorf("malformed xref table: %w", err)
 		}
 		for i := range n {
 			if table.rows++; table.rows > maxXrefRows {
@@ -1086,7 +1179,7 @@ func (b *budgetReader) Read(p []byte) (int, error) {
 
 func (c *readerCache) spend(n int64) error {
 	if c.budget.Add(-n) < 0 {
-		return fmt.Errorf("decoding exceeds the %d-byte budget for this file", c.limit)
+		return LimitError{"DecodeBudget", c.limit}
 	}
 	return nil
 }
@@ -1198,7 +1291,7 @@ func (s *objStm) index(r *Reader, n, first int64) {
 			if _, ok := x.(runtime.Error); ok {
 				panic(x)
 			}
-			s.scanErr = fmt.Errorf("%v", x)
+			s.scanErr = recoveredError(x)
 		}
 	}()
 	b := newBuffer(bytes.NewReader(s.data), 0)
@@ -1272,6 +1365,7 @@ func (r *Reader) objectInStream(ptr objptr, strm objptr) object {
 type limitedReader struct {
 	r      io.Reader
 	n, max int64
+	err    error // reported past max, if not the generic error
 }
 
 func newLimitedReader(r io.Reader, max int64) *limitedReader {
@@ -1281,6 +1375,9 @@ func newLimitedReader(r io.Reader, max int64) *limitedReader {
 func (l *limitedReader) Read(p []byte) (int, error) {
 	n, err := l.r.Read(p)
 	if l.n -= int64(n); l.n < 0 {
+		if l.err != nil {
+			return 0, l.err
+		}
 		return 0, fmt.Errorf("stream exceeds %d bytes", l.max)
 	}
 	return n, err
@@ -1876,7 +1973,7 @@ func aes256FileKey(encrypt dict, R int64, password string) ([]byte, error) {
 			}
 			b, err := aes.NewCipher(aes256Hash(R, pw, keySalt, k.udata))
 			if err != nil {
-				return nil, fmt.Errorf("malformed PDF: invalid AES key: %v", err)
+				return nil, fmt.Errorf("malformed PDF: invalid AES key: %w", err)
 			}
 			key := slices.Clone(k.encKey)
 			cipher.NewCBCDecrypter(b, make([]byte, aes.BlockSize)).CryptBlocks(key, key)

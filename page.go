@@ -27,10 +27,6 @@ const (
 	// broad and shallow.
 	maxPageTreeDepth = 1024
 
-	// maxPageTreeNodes bounds the /Kids entries, and so the pages, the page
-	// tree walk visits.
-	maxPageTreeNodes = 1 << 20
-
 	// maxInheritDepth bounds a walk up a chain of /Parent links, counting the
 	// page itself. A page at the bottom of the deepest tree Page accepts has
 	// maxPageTreeDepth ancestors, all of which may carry inherited entries.
@@ -104,7 +100,8 @@ func (r *Reader) Page(num int) Page {
 }
 
 // NumPage returns the number of pages in the PDF file: those its page tree
-// lists, whatever its /Count claims.
+// lists, whatever its /Count claims. A page tree past the Reader's limits
+// panics with a LimitError.
 func (r *Reader) NumPage() int {
 	return len(r.pages())
 }
@@ -130,22 +127,27 @@ func (r *Reader) pages() []pageEntry {
 // walkPages lists the pages of the page tree. A /Kids entry referring to a
 // node or page already listed is skipped: a node listed twice at each level
 // would make a tree of 33 objects hold 2^31 pages, and one listing an
-// ancestor would make a cycle.
+// ancestor would make a cycle. Passing a limit panics with a LimitError.
 func (r *Reader) walkPages() []pageEntry {
-	w := pageWalk{seen: make(map[objptr]bool)}
+	pages := r.limits.orDefaults().Pages
+	w := pageWalk{seen: make(map[objptr]bool), maxPages: pages, maxNodes: 2 * pages}
 	w.walk(r.Trailer().Key("Root").Key("Pages"), new(unresolved), 1)
 	return w.pages
 }
 
 type pageWalk struct {
-	seen  map[objptr]bool
-	nodes int
-	pages []pageEntry
+	seen               map[objptr]bool
+	nodes              int
+	pages              []pageEntry
+	maxPages, maxNodes int
 }
 
 func (w *pageWalk) walk(node Value, resources *unresolved, depth int) {
-	if depth > maxPageTreeDepth || node.Key("Type").Name() != "Pages" {
+	if node.Key("Type").Name() != "Pages" {
 		return
+	}
+	if depth > maxPageTreeDepth {
+		panic(LimitError{"PageTreeDepth", maxPageTreeDepth})
 	}
 	if d, _ := node.data.(dict); d["Resources"] != nil {
 		resources = &unresolved{node.ptr, d["Resources"]}
@@ -153,25 +155,30 @@ func (w *pageWalk) walk(node Value, resources *unresolved, depth int) {
 	kids := node.Key("Kids")
 	entries, _ := kids.data.(array)
 	for i, x := range entries {
-		if w.nodes++; w.nodes > maxPageTreeNodes {
-			return
+		if w.nodes++; w.nodes > w.maxNodes {
+			panic(LimitError{"PageTreeNodes", int64(w.maxNodes)})
 		}
-		if ref, ok := x.(objptr); ok {
-			if w.seen[ref] {
-				continue
-			}
-			w.seen[ref] = true
+		// PDF 32000 7.7.3.2 allows only references, and an inline kid
+		// would be held at every level the walk descends through.
+		ref, ok := x.(objptr)
+		if !ok || w.seen[ref] {
+			continue
 		}
+		w.seen[ref] = true
 		w.kid(kids, i, x, resources, depth)
 	}
 }
 
 // kid walks kids' entry i, skipping it if it fails to parse, so that one
 // malformed node or page loses only the pages under it. A runtime error is a
-// bug, not malformed input, and is raised again.
+// bug, not malformed input, and a LimitError refuses the file; both are raised
+// again.
 func (w *pageWalk) kid(kids Value, i int, x object, resources *unresolved, depth int) {
 	defer func() {
 		if e := recover(); e != nil {
+			if err, ok := e.(error); ok && errors.As(err, new(LimitError)) {
+				panic(e)
+			}
 			if _, ok := e.(runtime.Error); ok {
 				panic(e)
 			}
@@ -182,6 +189,9 @@ func (w *pageWalk) kid(kids Value, i int, x object, resources *unresolved, depth
 	case "Pages":
 		w.walk(kid, resources, depth+1)
 	case "Page":
+		if len(w.pages) >= w.maxPages {
+			panic(LimitError{"Pages", int64(w.maxPages)})
+		}
 		w.pages = append(w.pages, pageEntry{kids.ptr, x, resources})
 	}
 }
@@ -192,7 +202,7 @@ func (r *Reader) GetPlainText() (reader io.Reader, err error) {
 	// its own.
 	defer func() {
 		if e := recover(); e != nil {
-			reader, err = &bytes.Buffer{}, fmt.Errorf("malformed PDF: %v", e)
+			reader, err = &bytes.Buffer{}, recoveredError(e)
 		}
 	}()
 
@@ -214,7 +224,7 @@ func (r *Reader) GetStyledTexts() (sentences []Text, err error) {
 	// its panics here rather than letting them reach the caller.
 	defer func() {
 		if e := recover(); e != nil {
-			sentences, err = nil, fmt.Errorf("malformed PDF: %v", e)
+			sentences, err = nil, recoveredError(e)
 		}
 	}()
 
@@ -316,10 +326,10 @@ type glyphBudget struct {
 
 func (g *glyphBudget) spend(n int) {
 	if g.n += n; g.n > maxPageGlyphs {
-		panic(errPageGlyphs)
+		panic(LimitError{"PageGlyphs", maxPageGlyphs})
 	}
 	if g.r != nil && g.r.cache != nil && g.r.cache.glyphs.Add(-int64(n)) < 0 {
-		panic(fmt.Errorf("document shows more than %d glyphs", maxDocGlyphs))
+		panic(LimitError{"DocGlyphs", maxDocGlyphs})
 	}
 }
 
@@ -910,7 +920,7 @@ func operandCount(stk *Stack, n, per int) int {
 func readCmap(toUnicode Value) *cmap {
 	data, err := io.ReadAll(newLimitedReader(toUnicode.Reader(), maxInterpretBytes))
 	if err != nil {
-		panic(fmt.Errorf("reading ToUnicode cmap: %v", err))
+		panic(fmt.Errorf("reading ToUnicode cmap: %w", err))
 	}
 	return parseCmap(memoryStream(data))
 }
@@ -1145,11 +1155,9 @@ func popArgs(stk *Stack) []Value {
 func recoverTo(err *error, reset func()) {
 	if r := recover(); r != nil {
 		reset()
-		*err = errors.New(fmt.Sprint(r))
+		*err = recoveredError(r)
 	}
 }
-
-var errPageGlyphs = fmt.Errorf("page shows more than %d glyphs", maxPageGlyphs)
 
 // decodeLimit decodes raw with enc, stopping once the text holds limit
 // runes or soon after.
@@ -1183,6 +1191,17 @@ func decodeText(enc TextEncoding, raw string, glyphs *glyphBudget) string {
 	return b.String()
 }
 
+// contentLimit returns the reader a page's content is read through, which
+// fails past the page content limit.
+func (p Page) contentLimit() *limitedReader {
+	var l Limits
+	if p.V.r != nil {
+		l = p.V.r.limits
+	}
+	n := l.orDefaults().PageContent
+	return &limitedReader{n: n, max: n, err: LimitError{"PageContent", n}}
+}
+
 // GetPlainText returns the page's text without format. A non-nil fonts maps
 // the names Tf selects to the fonts to use in place of the page's own.
 func (p Page) GetPlainText(fonts map[string]*Font) (result string, err error) {
@@ -1212,7 +1231,7 @@ func (p Page) GetPlainText(fonts map[string]*Font) (result string, err error) {
 		textBuilder.WriteString(decodeText(enc, s, &glyphs))
 	}
 
-	Interpret(strm, func(stk *Stack, op string) {
+	interpret(strm, p.contentLimit(), func(stk *Stack, op string) {
 		args := popArgs(stk)
 
 		switch op {
@@ -1380,7 +1399,7 @@ func (p Page) walkTextBlocks(emit func(x, y float64, s string)) {
 		}
 		emit(currentX, currentY, s)
 	}
-	Interpret(strm, func(stk *Stack, op string) {
+	interpret(strm, p.contentLimit(), func(stk *Stack, op string) {
 		args := popArgs(stk)
 
 		// if DebugOn {
@@ -1508,7 +1527,7 @@ func (p Page) Content() Content {
 
 	var rect []Rect
 	var gstack []gstate
-	Interpret(strm, func(stk *Stack, op string) {
+	interpret(strm, p.contentLimit(), func(stk *Stack, op string) {
 		args := popArgs(stk)
 		switch op {
 		default:

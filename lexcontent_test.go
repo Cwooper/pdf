@@ -1,6 +1,8 @@
 package pdf
 
 import (
+	"bytes"
+	"errors"
 	"fmt"
 	"runtime"
 	"strings"
@@ -492,5 +494,64 @@ func TestPageTreeMalformedKid(t *testing.T) {
 		if got := r.Page(i + 1).V.Key("N").Int64(); got != want {
 			t.Errorf("Page(%d) is page %d, want %d", i+1, got, want)
 		}
+	}
+}
+
+// openOptions opens data under limits, failing the test on a runtime error.
+func openOptions(t *testing.T, data []byte, limits Limits) (r *Reader, err error) {
+	t.Helper()
+	mustNotCrash(t, func() { r, err = NewReaderOptions(bytes.NewReader(data), int64(len(data)), Options{Limits: limits}) })
+	return r, err
+}
+
+// TestPageTreeLimits verifies that NewReaderOptions walks the page tree as
+// it opens a file and refuses one past its page limit, or the node and depth
+// caps, wherever in the tree it is passed, and that a kid that is not a
+// reference is skipped.
+func TestPageTreeLimits(t *testing.T) {
+	page := "<< /Type /Page >>"
+	// deep nests a page under levels nodes.
+	deep := func(levels int) []byte {
+		objs := []string{"<< /Type /Catalog /Pages 2 0 R >>"}
+		for k := 2; k <= levels+1; k++ {
+			objs = append(objs, fmt.Sprintf("<< /Type /Pages /Kids [%d 0 R] >>", k+1))
+		}
+		return buildPDF(append(objs, page)...)
+	}
+	tests := []struct {
+		name     string
+		data     []byte
+		maxPages int
+		pages    int
+		limit    string // the limit refusing the file, or ""
+	}{
+		{"pages at the limit", pageTreePDF("<< /Type /Pages /Kids [3 0 R 4 0 R 5 0 R] >>", page, page, page), 3, 3, ""},
+		{"pages past the limit", pageTreePDF("<< /Type /Pages /Kids [3 0 R 4 0 R 5 0 R 6 0 R] >>", page, page, page, page), 3, 0, "Pages"},
+		{"pages past the limit in the last nested subtree", pageTreePDF("<< /Type /Pages /Kids [3 0 R 4 0 R] >>",
+			page, "<< /Type /Pages /Kids [5 0 R 6 0 R 7 0 R] >>", "<< /Type /Pages /Kids [8 0 R 9 0 R] >>", page, page, page, page), 3, 0, "Pages"},
+		{"entries past the node cap", pageTreePDF("<< /Type /Pages /Kids [3 0 R 3 0 R 3 0 R 3 0 R 3 0 R 3 0 R 3 0 R] >>", page), 3, 0, "PageTreeNodes"},
+		{"kids that are not references", pageTreePDF("<< /Type /Pages /Kids [3 0 R << /Type /Page >> (4 0 R) 4 /Page] >>", page, page), 3, 1, ""},
+		{"a tree at the depth cap", deep(maxPageTreeDepth), 0, 1, ""},
+		{"a tree past the depth cap", deep(maxPageTreeDepth + 1), 0, 0, "PageTreeDepth"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			r, err := openOptions(t, tt.data, Limits{Pages: tt.maxPages})
+			var le LimitError
+			switch {
+			case tt.limit != "":
+				if !errors.As(err, &le) || le.Limit != tt.limit {
+					t.Fatalf("err = %v, want the %s limit passed", err, tt.limit)
+				}
+			case err != nil:
+				t.Fatal(err)
+			case r.NumPage() != tt.pages:
+				t.Fatalf("NumPage = %d, want %d", r.NumPage(), tt.pages)
+			}
+		})
+	}
+	// Zero limits take the defaults.
+	if r, err := openOptions(t, pageTreePDF("<< /Type /Pages /Kids [3 0 R 4 0 R 5 0 R 6 0 R] >>", page, page, page, page), Limits{}); err != nil || r.NumPage() != 4 {
+		t.Errorf("with no limits set: err %v, want 4 pages", err)
 	}
 }

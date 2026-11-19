@@ -11,8 +11,8 @@ import (
 	"strings"
 )
 
-// maxInterpretBytes bounds the decoded bytes one Interpret call reads: a
-// page's content streams or a cmap. Flate expands about 1000:1, so a small
+// maxInterpretBytes bounds the decoded bytes one Interpret call reads, and
+// a page's content by default. Flate expands about 1000:1, so a small
 // file could otherwise feed the lexer gigabytes. The largest page content in
 // 33 thousand pages of ordinary documents is 8.5 MB.
 const maxInterpretBytes = 16 << 20
@@ -78,9 +78,15 @@ func newDict() Value {
 //
 // There is no support for executable blocks, among other limitations.
 func Interpret(strm Value, do func(stk *Stack, op string)) {
+	interpret(strm, newLimitedReader(nil, maxInterpretBytes), do)
+}
+
+// interpret is Interpret reading strm through lim, which it points at strm's
+// streams in turn, so that lim caps them together.
+func interpret(strm Value, lim *limitedReader, do func(stk *Stack, op string)) {
 	var stk Stack
 	var dicts []dict
-	var rd io.Reader
+	var rd io.Reader = lim
 	errs := 0
 	malformed := func() {
 		if errs++; errs > maxInterpretErrors {
@@ -88,12 +94,12 @@ func Interpret(strm Value, do func(stk *Stack, op string)) {
 		}
 	}
 	if strm.Kind() == Array {
-		rd = &contentsReader{streams: strm}
+		rd = &contentsReader{streams: strm, lim: lim}
 	} else {
-		rd = strm.Reader()
+		lim.r = strm.Reader()
 	}
 
-	b := newBuffer(newLimitedReader(rd, maxInterpretBytes), 0)
+	b := newBuffer(rd, 0)
 	b.allowEOF = true
 	b.allowObjptr = false
 	b.allowStream = false
@@ -202,11 +208,13 @@ Reading:
 // empty stream hundreds of thousands of times.
 const contentsEntryCost = 1 << 10
 
-// A contentsReader reads the streams of an array in turn, opening each only
-// once the one before it ends, so that a long array never holds a decoder
-// for every stream at once. An entry that is not a stream is skipped.
+// A contentsReader reads the streams of an array in turn through lim,
+// opening each only once the one before it ends, so that a long array never
+// holds a decoder for every stream at once. An entry that is not a stream is
+// skipped.
 type contentsReader struct {
 	streams Value
+	lim     *limitedReader
 	next    int
 	cur     io.Reader
 }
@@ -219,8 +227,10 @@ func (c *contentsReader) Read(p []byte) (int, error) {
 			}
 			c.streams.r.spend(contentsEntryCost)
 			if v := c.streams.Index(c.next); v.Kind() == Stream {
-				// A newline keeps tokens from running across streams.
-				c.cur = io.MultiReader(strings.NewReader("\n"), v.Reader())
+				// A newline keeps tokens from running across streams; it
+				// is not content, so lim does not count it.
+				c.lim.r = v.Reader()
+				c.cur = io.MultiReader(strings.NewReader("\n"), c.lim)
 			}
 			c.next++
 		}

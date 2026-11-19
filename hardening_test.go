@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"compress/zlib"
 	"encoding/ascii85"
+	"errors"
 	"fmt"
 	"io"
 	"runtime"
@@ -1015,5 +1016,92 @@ func TestGstackDepthCap(t *testing.T) {
 	mustNotCrash(t, func() { got = allocated(func() { text = p.Content().Text }) })
 	if got > 16<<20 || len(text) != 1 {
 		t.Errorf("Content allocated %d MB and showed %d texts, want 1", got>>20, len(text))
+	}
+}
+
+// TestPageContentLimit verifies that the page content limit counts the
+// decoded bytes of all of a page's content streams together, in each text
+// extraction path, and that Interpret keeps its own cap.
+func TestPageContentLimit(t *testing.T) {
+	const limit = 1 << 10
+	half := func(n int) string { return flateObj("BT (a) Tj ET" + strings.Repeat(" ", n-len("BT (a) Tj ET"))) }
+	at := pagePDF("", "[5 0 R 6 0 R]", half(limit/2), half(limit/2))
+	past := pagePDF("", "[5 0 R 6 0 R]", half(limit/2), half(limit/2+1))
+	open := func(data []byte) Page {
+		r, err := NewReaderOptions(bytes.NewReader(data), int64(len(data)), Options{Limits: Limits{PageContent: limit}})
+		if err != nil {
+			t.Fatal(err)
+		}
+		return r.Page(1)
+	}
+	if got := contentText(open(at)); got != "aa" {
+		t.Errorf("content at the limit shows %q, want %q", got, "aa")
+	}
+	p := open(past)
+	isLimit := func(err error) bool {
+		var le LimitError
+		return errors.As(err, &le) && le.Limit == "PageContent" && le.Max == limit
+	}
+	var err error
+	func() {
+		defer func() { err, _ = recover().(error) }()
+		p.Content()
+	}()
+	if !isLimit(err) {
+		t.Errorf("Content panicked with %v, want the page content limit", err)
+	}
+	if _, err := p.GetPlainText(nil); !isLimit(err) {
+		t.Errorf("GetPlainText: got %v, want the page content limit", err)
+	}
+	if _, err := p.GetTextByRow(); !isLimit(err) {
+		t.Errorf("GetTextByRow: got %v, want the page content limit", err)
+	}
+	ops := 0
+	Interpret(p.V.Key("Contents"), func(stk *Stack, op string) { ops++ })
+	if ops != 6 {
+		t.Errorf("Interpret read %d operators, want 6", ops)
+	}
+}
+
+// TestLimitErrorsKeepTheirType verifies that a limit passed, or a password
+// needed, deep in a read reaches the caller as an error errors.As and
+// errors.Is can find.
+func TestLimitErrorsKeepTheirType(t *testing.T) {
+	limit := func(name string) func(error) bool {
+		return func(err error) bool {
+			var le LimitError
+			return errors.As(err, &le) && le.Limit == name
+		}
+	}
+	budget := openPDF(t, pagePDF("", flateObj("BT (x) Tj ET")))
+	budgetPage := budget.Page(1)
+	budget.cache.budget.Store(16)
+	glyphs := openPDF(t, pagePDF("", flateObj("BT (xyz) Tj ET")))
+	glyphs.cache.glyphs.Store(2)
+	password := openWith(t, encryptedPDF(cryptSpec{V: 4, R: 4, bits: 128, user: "secret", stmF: "Identity", strF: "Identity", ownCrypt: "StdCF"}, "BT (x) Tj ET", "", ""))
+	tests := []struct {
+		name string
+		r    *Reader
+		p    Page
+		want func(error) bool
+	}{
+		{"decode budget", budget, budgetPage, limit("DecodeBudget")},
+		{"document glyphs", glyphs, glyphs.Page(1), limit("DocGlyphs")},
+		{"password", password, password.Page(1), func(err error) bool { return errors.Is(err, ErrInvalidPassword) }},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if _, err := tt.p.GetTextByRow(); !tt.want(err) {
+				t.Errorf("GetTextByRow: got %v", err)
+			}
+			if _, err := tt.r.GetPlainText(); !tt.want(err) {
+				t.Errorf("GetPlainText: got %v", err)
+			}
+		})
+	}
+	// The page glyph cap, through a recovered panic.
+	p := pageWithContent("BT (" + strings.Repeat("A", maxPageGlyphs+1) + ") Tj ET")
+	if _, err := p.GetPlainText(nil); !limit("PageGlyphs")(err) {
+		t.Errorf("GetPlainText: got %v, want the page glyph cap", err)
 	}
 }
