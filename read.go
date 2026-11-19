@@ -111,6 +111,10 @@ type Reader struct {
 	// /Crypt filter.
 	strCrypt, stmCrypt, effCrypt cryptMethod
 	filters                      map[name]cryptMethod
+	// keyErr is why key is nil in a file whose strings and streams are in
+	// the clear, and effErr why its /EFF names no usable filter; either
+	// fails only the reads that need it.
+	keyErr, effErr error
 	// clearMetadata marks /EncryptMetadata false: metadata streams are
 	// stored unencrypted.
 	clearMetadata bool
@@ -363,10 +367,10 @@ func NewReaderEncrypted(f io.ReaderAt, size int64, pw func() string) (r *Reader,
 	if err == nil {
 		return r, nil
 	}
-	if pw == nil || err != ErrInvalidPassword {
+	if err != ErrInvalidPassword && err != errKeyless {
 		return nil, err
 	}
-	for {
+	for pw != nil {
 		next := pw()
 		if next == "" {
 			break
@@ -374,6 +378,9 @@ func NewReaderEncrypted(f io.ReaderAt, size int64, pw func() string) (r *Reader,
 		if r.initEncrypt(next) == nil {
 			return r, nil
 		}
+	}
+	if err == errKeyless {
+		return r, nil
 	}
 	return nil, err
 }
@@ -727,6 +734,9 @@ type Value struct {
 	r    *Reader
 	ptr  objptr
 	data interface{}
+	// viaEF marks a value reached through a file specification's /EF, so
+	// that an embedded file stream with no /Type still takes /EFF.
+	viaEF bool
 }
 
 // IsNull reports whether the value is a null. It is equivalent to Kind() == Null.
@@ -944,7 +954,9 @@ func (v Value) Key(key string) Value {
 		}
 		x = strm.hdr
 	}
-	return v.r.resolve(v.ptr, x[name(key)])
+	res := v.r.resolve(v.ptr, x[name(key)])
+	res.viaEF = v.viaEF || key == "EF"
+	return res
 }
 
 // Keys returns a sorted list of the keys in the dictionary v.
@@ -1024,9 +1036,9 @@ func (r *Reader) resolve(parent objptr, x interface{}) Value {
 
 	switch x := x.(type) {
 	case nil, bool, int64, float64, name, dict, array, stream:
-		return Value{r, parent, x}
+		return Value{r: r, ptr: parent, data: x}
 	case string:
-		return Value{r, parent, x}
+		return Value{r: r, ptr: parent, data: x}
 	default:
 		panic(fmt.Errorf("unexpected value type %T in resolve", x))
 	}
@@ -1322,13 +1334,14 @@ func (v Value) Reader() io.ReadCloser {
 	}
 
 	m := v.r.stmCrypt
-	switch v.Key("Type").Name() {
-	case "Metadata":
-		if v.r.clearMetadata {
-			m = cryptNone
+	switch typ := v.Key("Type").Name(); {
+	case v.viaEF || typ == "EmbeddedFile":
+		if v.r.effErr != nil {
+			return &errorReadCloser{v.r.effErr}
 		}
-	case "EmbeddedFile":
 		m = v.r.effCrypt
+	case typ == "Metadata" && v.r.clearMetadata:
+		m = cryptNone
 	}
 	// A /Crypt filter, first in the chain, picks the stream's own crypt
 	// filter by name (section 7.4.10).
@@ -1347,7 +1360,7 @@ func (v Value) Reader() io.ReadCloser {
 	rd = io.NewSectionReader(v.r.f, x.offset, streamLen)
 	if m != cryptNone {
 		if v.r.key == nil {
-			return &errorReadCloser{errNoFileKey}
+			return &errorReadCloser{v.r.keyErr}
 		}
 		rd = decryptStream(v.r.key, m, x.ptr, rd)
 	}
@@ -1453,7 +1466,7 @@ var passwordPad = []byte{
 	0x2E, 0x2E, 0x00, 0xB6, 0xD0, 0x68, 0x3E, 0x80, 0x2F, 0x0C, 0xA9, 0xFE, 0x64, 0x53, 0x69, 0x7A,
 }
 
-// PDF encryption parameters. See PDF 32000-1:2008, §7.6.
+// PDF encryption parameters. See PDF 32000-1:2008, section 7.6.
 const (
 	// minKeyBits and maxKeyBits bound the /Length value (in bits) in the
 	// encryption dictionary.
@@ -1464,12 +1477,13 @@ const (
 	// revisions 2 through 4.
 	ouEntryLen = 32
 
-	// md5KeyIterations is the number of MD5 rounds used to derive the file
-	// key for revisions >= 3 (Algorithm 2, step (b)).
+	// md5KeyIterations is the number of times revisions >= 3 rehash the MD5
+	// that keys a file or its owner password (Algorithm 2 step f, Algorithm 3
+	// step c).
 	md5KeyIterations = 50
 
-	// rc4UIterations is the number of RC4 rounds used to derive U for
-	// revisions >= 3 (Algorithm 5).
+	// rc4UIterations is the number of RC4 passes, after the first, that
+	// revisions >= 3 run over U and O (Algorithms 5 and 7).
 	rc4UIterations = 19
 
 	// AES-256 (V 5) parameters. See ISO 32000-2:2020, section 7.6.4.
@@ -1493,21 +1507,31 @@ const (
 	cryptAESV3 // AES-256, under the file key itself
 )
 
-// errNoFileKey fails a read that needs the file key when the password did not
-// open it, as in a file that encrypts only its attachments.
-var errNoFileKey = errors.New("encrypted PDF: no password opens this stream")
+// errKeyless reports a file whose strings and streams are in the clear but
+// whose password did not open its key, so its encrypted attachments fail to
+// read.
+var errKeyless = errors.New("encrypted PDF: only its attachments need a password")
 
 func (r *Reader) initEncrypt(password string) error {
-	// See PDF 32000-1:2008, §7.6.
-	encrypt, _ := r.resolve(objptr{}, r.trailer["Encrypt"]).data.(dict)
-	if encrypt["Filter"] != name("Standard") {
-		return fmt.Errorf("%w %v", ErrSecurityHandler, objfmt(encrypt["Filter"]))
+	// See PDF 32000-1:2008, section 7.6.
+	encrypt, ok := r.resolve(objptr{}, r.trailer["Encrypt"]).data.(dict)
+	if !ok {
+		// pdf.js and qpdf read a file whose /Encrypt is no dictionary, a
+		// dangling reference included, as unencrypted.
+		return nil
+	}
+	encrypt = r.resolvedDict(encrypt)
+	switch f, ok := encrypt["Filter"].(name); {
+	case !ok:
+		return fmt.Errorf("malformed PDF: encryption /Filter %v", objfmt(encrypt["Filter"]))
+	case f != "Standard":
+		return fmt.Errorf("%w %v", ErrSecurityHandler, objfmt(f))
 	}
 	V, _ := encrypt["V"].(int64)
 	if V != 1 && V != 2 && V != 4 && V != 5 {
 		return fmt.Errorf("unsupported PDF: encryption version V=%d; %v", V, objfmt(encrypt))
 	}
-	str, stm, eff, filters, err := r.cryptFilters(encrypt, V)
+	str, stm, eff, filters, effErr, err := r.cryptFilters(encrypt, V)
 	if err != nil {
 		return err
 	}
@@ -1519,39 +1543,60 @@ func (r *Reader) initEncrypt(password string) error {
 	} else {
 		key, err = r.rc4FileKey(encrypt, V, R, clearMetadata, password)
 	}
+	r.key, r.keyErr = key, nil
+	r.strCrypt, r.stmCrypt, r.effCrypt, r.filters, r.effErr = str, stm, eff, filters, effErr
+	r.clearMetadata = clearMetadata
 	if err != nil {
 		// A document whose strings and streams are in the clear opens without
-		// the password; only its attachments need it.
+		// its key; only the reads that need one fail.
 		if str != cryptNone || stm != cryptNone {
 			return err
 		}
-		key = nil
+		r.keyErr = err
+		if err == ErrInvalidPassword {
+			return errKeyless
+		}
 	}
-	r.key = key
-	r.strCrypt, r.stmCrypt, r.effCrypt, r.filters = str, stm, eff, filters
-	r.clearMetadata = clearMetadata
 	return nil
+}
+
+// resolvedDict returns d with each value resolved, since any may be an
+// indirect reference.
+func (r *Reader) resolvedDict(d dict) dict {
+	out := make(dict, len(d))
+	for k, x := range d {
+		out[k] = r.resolve(objptr{}, x).data
+	}
+	return out
 }
 
 // cryptFilters returns the methods strings, streams, and embedded files are
 // encrypted with, and the crypt filters by name for a stream's own /Crypt
-// filter (section 7.6.5).
-func (r *Reader) cryptFilters(encrypt dict, V int64) (str, stm, eff cryptMethod, filters map[name]cryptMethod, err error) {
+// filter (section 7.6.5). An /EFF naming no usable filter fails only the
+// attachments, through effErr.
+func (r *Reader) cryptFilters(encrypt dict, V int64) (str, stm, eff cryptMethod, filters map[name]cryptMethod, effErr, err error) {
 	if V < 4 {
-		return cryptRC4, cryptRC4, cryptRC4, nil, nil
+		return cryptRC4, cryptRC4, cryptRC4, nil, nil, nil
 	}
 	filters = map[name]cryptMethod{"Identity": cryptNone}
-	cf, _ := r.resolve(objptr{}, encrypt["CF"]).data.(dict)
+	cf, _ := encrypt["CF"].(dict)
 	for n, x := range cf {
-		param, _ := r.resolve(objptr{}, x).data.(dict)
-		if m, ok := cryptFilterMethod(param, V); ok && n != "Identity" {
-			filters[n] = m
-		}
+		// An entry no stream may name fails nothing.
+		func() {
+			defer func() { _ = recover() }()
+			param, _ := r.resolve(objptr{}, x).data.(dict)
+			if m, ok := cryptFilterMethod(r.resolvedDict(param), V); ok && n != "Identity" {
+				filters[n] = m
+			}
+		}()
 	}
-	pick := func(key name, def name) (cryptMethod, error) {
-		n, ok := encrypt[key].(name)
-		if !ok {
-			n = def
+	pick := func(key, def name) (cryptMethod, error) {
+		n := def
+		if x := encrypt[key]; x != nil {
+			var ok bool
+			if n, ok = x.(name); !ok {
+				return 0, fmt.Errorf("unsupported PDF: /%s %v", key, objfmt(x))
+			}
 		}
 		m, ok := filters[n]
 		if !ok {
@@ -1569,7 +1614,7 @@ func (r *Reader) cryptFilters(encrypt dict, V int64) (str, stm, eff cryptMethod,
 	if !ok {
 		stmName = "Identity"
 	}
-	eff, err = pick("EFF", stmName)
+	eff, effErr = pick("EFF", stmName)
 	return
 }
 
@@ -1637,9 +1682,11 @@ func pdfDocBytes(s string) ([]byte, bool) {
 // saslPrep maps a password as RFC 4013 does before it is hashed: non-ASCII
 // spaces become spaces, characters commonly mapped to nothing go, and the
 // rest is NFKC-normalized. Its prohibitions are skipped, since a writer
-// refuses such a password, so it never matches anyway.
+// refuses such a password, so it never matches anyway. The mapping removes
+// every U+034F, so any left after norm are the ones its stream-safe form
+// inserts past 30 combining marks, which plain NFKC does not.
 func saslPrep(s string) string {
-	return norm.NFKC.String(strings.Map(func(c rune) rune {
+	return strings.ReplaceAll(norm.NFKC.String(strings.Map(func(c rune) rune {
 		switch c {
 		case 0x00A0, 0x1680, 0x202F, 0x205F, 0x3000: // RFC 3454 table C.1.2
 			return ' '
@@ -1653,7 +1700,7 @@ func saslPrep(s string) string {
 			return -1
 		}
 		return c
-	}, s))
+	}, s)), "\u034f", "")
 }
 
 // rc4FileKey derives the file key of a V1 to V4 file, trying password as the
@@ -1679,8 +1726,8 @@ func (r *Reader) rc4FileKey(encrypt dict, V, R int64, clearMetadata bool, passwo
 	if !ok {
 		return nil, fmt.Errorf("malformed PDF: missing ID in trailer")
 	}
-	if R < 2 {
-		return nil, fmt.Errorf("malformed PDF: encryption revision R=%d", R)
+	if R < 2 || V == 4 && R < 4 {
+		return nil, fmt.Errorf("malformed PDF: encryption revision R=%d for V=%d", R, V)
 	}
 	if R > 4 {
 		return nil, fmt.Errorf("unsupported PDF: encryption revision R=%d", R)

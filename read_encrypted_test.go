@@ -125,7 +125,8 @@ func TestAES256EncryptDict(t *testing.T) {
 
 // A file that encrypts only its attachments, its strings and streams under
 // /Identity, reads as plain text whatever its other entries hold, and its
-// attachments fail to read rather than read as ciphertext.
+// attachments fail to read rather than read as ciphertext. One naming no
+// filters reads everything in the clear, attachments included.
 func TestIdentityCryptFilters(t *testing.T) {
 	page := pagePDF("", fmt.Sprintf("<< /Length 22 >>\nstream\nBT (Hello world) Tj ET\nendstream"),
 		"<< /Type /EmbeddedFile /Length 16 >>\nstream\n0123456789abcdef\nendstream")
@@ -218,10 +219,11 @@ func TestOwnerPassword(t *testing.T) {
 }
 
 // Revisions 2 to 4 hash a password in PDFDocEncoding, and revisions 5 and 6
-// after SASLprep: qpdf wrote latin1-r4.pdf under "pässwörd" and sasl-r6.pdf
-// under "IX", which SASLprep makes of the Roman numeral nine.
+// after SASLprep: qpdf wrote pdfdoc-r4.pdf under "pässwörd€", whose euro sign
+// Latin-1 lacks, and sasl-r6.pdf under "IX", which SASLprep makes of the
+// Roman numeral nine.
 func TestPasswordEncoding(t *testing.T) {
-	for name, pw := range map[string]string{"latin1-r4.pdf": "pässwörd", "sasl-r6.pdf": "\u2168"} {
+	for name, pw := range map[string]string{"pdfdoc-r4.pdf": "pässwörd€", "sasl-r6.pdf": "\u2168"} {
 		r, err := openFixture(t, name, pw)
 		if err != nil {
 			t.Fatalf("%s: %v", name, err)
@@ -234,11 +236,115 @@ func TestPasswordEncoding(t *testing.T) {
 			t.Errorf("saslPrep(%q) = %q, want %q", in, got, want)
 		}
 	}
+	// NFKC proper composes the first mark and leaves the rest; norm's
+	// stream-safe form would add a U+034F after the thirtieth.
+	marks := "a" + strings.Repeat("\u0301", 32)
+	if got, want := saslPrep(marks), "\u00e1"+strings.Repeat("\u0301", 31); got != want {
+		t.Errorf("saslPrep(a and 32 acute accents) = %+q, want %+q", got, want)
+	}
 }
 
 func TestSecurityHandler(t *testing.T) {
 	data := withEncrypt(buildPDF("<< /Type /Catalog >>"), "<< /Filter /Adobe.PubSec /V 4 /SubFilter /adbe.pkcs7.s5 >>")
 	if err := openBytes(data); !errors.Is(err, ErrSecurityHandler) {
 		t.Errorf("got %v, want ErrSecurityHandler", err)
+	}
+}
+
+// openWith opens data trying the passwords pw lists after the empty one.
+func openWith(t *testing.T, data []byte, pw ...string) *Reader {
+	t.Helper()
+	r, err := NewReaderEncrypted(bytes.NewReader(data), int64(len(data)), func() string {
+		if len(pw) == 0 {
+			return ""
+		}
+		p := pw[0]
+		pw = pw[1:]
+		return p
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return r
+}
+
+// attachment reads the embedded file encryptedPDF writes, through its file
+// specification.
+func attachment(r *Reader) (string, error) {
+	b, err := io.ReadAll(r.resolve(objptr{}, objptr{9, 0}).Key("EF").Key("F").Reader())
+	return string(b), err
+}
+
+// An attachment takes /EFF, or /StmF when there is none. In a file whose
+// strings and streams are in the clear, the document opens without the
+// password, its attachments open with it, and an /EFF naming no usable filter
+// fails only the attachments.
+func TestAttachments(t *testing.T) {
+	const content = "BT (Hello world) Tj ET"
+	for _, tt := range []struct {
+		name string
+		s    cryptSpec
+		pw   []string
+		want string // the attachment, or "" for an error
+	}{
+		{"EFF defaults to StmF", cryptSpec{V: 4, R: 4, bits: 128, attachment: "attached"}, nil, "attached"},
+		{"attachments only, no password", cryptSpec{V: 4, R: 4, bits: 128, user: "secret", stmF: "Identity", strF: "Identity", eff: "StdCF", attachment: "attached"}, nil, ""},
+		{"attachments only, password", cryptSpec{V: 4, R: 4, bits: 128, user: "secret", stmF: "Identity", strF: "Identity", eff: "StdCF", attachment: "attached"}, []string{"wrong", "secret"}, "attached"},
+		{"no /Type", cryptSpec{V: 4, R: 4, bits: 128, user: "secret", stmF: "Identity", strF: "Identity", eff: "StdCF", attachment: "attached", attachmentNoType: true}, []string{"secret"}, "attached"},
+		{"unusable EFF", cryptSpec{V: 4, R: 4, bits: 128, stmF: "Identity", strF: "Identity", eff: "Missing", attachment: "attached"}, nil, ""},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			r := openWith(t, encryptedPDF(tt.s, content, "", ""), tt.pw...)
+			if got, err := r.Page(1).GetPlainText(nil); err != nil || !strings.Contains(got, "Hello world") {
+				t.Errorf("GetPlainText = %q, %v; want %q", got, err, "Hello world")
+			}
+			got, err := attachment(r)
+			if tt.want == "" && err == nil || tt.want != "" && got != tt.want {
+				t.Errorf("attachment = %q, %v; want %q", got, err, tt.want)
+			}
+		})
+	}
+}
+
+// Every /Encrypt entry may be an indirect reference, a stream's /Crypt filter
+// with no /Name is /Identity, and a 40-bit key under revision 3 takes the
+// owner password's whole MD5 through its 50 rehashes (Algorithm 3).
+func TestCryptSpecVariants(t *testing.T) {
+	for _, s := range []cryptSpec{
+		{V: 4, R: 4, bits: 128, indirect: true},
+		{V: 4, R: 4, bits: 128, ownCryptNoName: true},
+	} {
+		t.Run(fmt.Sprintf("%+v", s), func(t *testing.T) { checkDecrypts(t, s) })
+	}
+	s := cryptSpec{V: 2, R: 3, bits: 40, user: "user", owner: "owner"}
+	r := openWith(t, encryptedPDF(s, "BT (Hello world) Tj ET", "", ""), "owner")
+	if got, err := r.Page(1).GetPlainText(nil); err != nil || !strings.Contains(got, "Hello world") {
+		t.Errorf("40-bit R3 with the owner password: GetPlainText = %q, %v", got, err)
+	}
+}
+
+func TestEncryptDictErrors(t *testing.T) {
+	page := streamPage("", []byte("BT (Hello world) Tj ET"))
+	if got, err := plainText(t, bytes.Replace(page, []byte("/Root 1 0 R >>"), []byte("/Root 1 0 R /Encrypt 99 0 R >>"), 1)); err != nil || !strings.Contains(got, "Hello world") {
+		t.Errorf("dangling /Encrypt: GetPlainText = %q, %v; want it read as unencrypted", got, err)
+	}
+	for _, tt := range []struct{ enc, want string }{
+		{"<< /V 5 /R 6 >>", "malformed"},
+		{"<< /Filter (Standard) /V 4 >>", "malformed"},
+		{"<< /Filter /Standard /V 4 /R 3 /CF << /StdCF << /CFM /AESV2 >> >> /StmF /StdCF /StrF /StdCF /O <" + strings.Repeat("00", 32) + "> /U <" + strings.Repeat("00", 32) + "> >>", "malformed"},
+		{"<< /Filter /Standard /V 4 /R 4 /StmF (StdCF) >>", "unsupported"},
+	} {
+		err := openBytes(withEncrypt(page, tt.enc))
+		if err == nil || !strings.HasPrefix(err.Error(), tt.want) || errors.Is(err, ErrSecurityHandler) {
+			t.Errorf("%s: got %v, want %s", tt.enc, err, tt.want)
+		}
+	}
+	// A bad key entry in a file whose strings and streams are clear fails only
+	// the attachment, with its own error.
+	data := pagePDF("", "<< /Length 22 >>\nstream\nBT (Hello world) Tj ET\nendstream",
+		"<< /Type /EmbeddedFile /Length 16 >>\nstream\n0123456789abcdef\nendstream")
+	data = withEncrypt(data, "<< /Filter /Standard /V 5 /R 6 /StmF /Identity /StrF /Identity /EFF /StdCF /CF << /StdCF << /CFM /AESV3 >> >> /O <"+strings.Repeat("00", 48)+"> /U <"+strings.Repeat("00", 48)+"> /OE <"+strings.Repeat("00", 32)+"> /UE <00> >>")
+	if _, err := io.ReadAll(openPDF(t, data).resolve(objptr{}, objptr{5, 0}).Reader()); err == nil || !strings.HasPrefix(err.Error(), "malformed") {
+		t.Errorf("attachment with a short /UE: %v, want the malformed-key error", err)
 	}
 }

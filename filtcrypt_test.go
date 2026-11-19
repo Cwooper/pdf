@@ -81,6 +81,51 @@ type cryptSpec struct {
 	// empty, and ownCrypt the filter the content stream names in its own
 	// /Crypt filter, if any. Under /Identity the data stays in the clear.
 	stmF, strF, ownCrypt string
+	ownCryptNoName       bool // the content stream's /Crypt filter names none
+	// user and owner are the passwords; O holds filler when owner is empty.
+	user, owner string
+	// attachment is the data of an embedded file stream, object 8, under the
+	// /EFF filter eff (none written when empty), reached through the file
+	// specification in object 9; attachmentNoType leaves out its /Type.
+	eff, attachment  string
+	attachmentNoType bool
+	// indirect writes /CF, its filter's /CFM, /StmF, and /StrF as indirect
+	// references.
+	indirect bool
+}
+
+// padTest pads or cuts pw to 32 bytes (Algorithm 2, step a).
+func padTest(pw string) []byte {
+	return append([]byte(pw), passwordPad...)[:32]
+}
+
+// ownerEntry computes /O from the owner and user passwords (Algorithm 3).
+func (s cryptSpec) ownerEntry() string {
+	sum := md5.Sum(padTest(s.owner))
+	k := sum[:]
+	n := 5
+	if s.R >= 3 {
+		for range 50 {
+			sum = md5.Sum(k)
+			k = sum[:]
+		}
+		n = s.bits / 8
+	}
+	k = k[:n]
+	o := padTest(s.user)
+	rounds := 1
+	if s.R >= 3 {
+		rounds = 20
+	}
+	for i := range rounds {
+		ki := bytes.Clone(k)
+		for j := range ki {
+			ki[j] ^= byte(i)
+		}
+		c, _ := rc4.NewCipher(ki)
+		c.XORKeyStream(o, o)
+	}
+	return string(o)
 }
 
 // sealed reports whether data under the crypt filter named f is encrypted.
@@ -98,7 +143,7 @@ func orStdCF(f string) string {
 // fileKey derives the file key (Algorithm 2).
 func (s cryptSpec) fileKey(O string) []byte {
 	h := md5.New()
-	h.Write(passwordPad)
+	h.Write(padTest(s.user))
 	h.Write([]byte(O))
 	h.Write([]byte{0xfc, 0xff, 0xff, 0xff}) // /P -4
 	h.Write([]byte(testID))
@@ -170,10 +215,16 @@ func (s cryptSpec) encrypt(key []byte, id int, data []byte) []byte {
 // it stands.
 func encryptedPDF(s cryptSpec, content, title, pageExtra string) []byte {
 	O := strings.Repeat("O", 32)
+	if s.owner != "" {
+		O = s.ownerEntry()
+	}
 	key := s.fileKey(O)
 	stmF, strF := orStdCF(s.stmF), orStdCF(s.strF)
 	contentF, contentDict := stmF, ""
-	if s.ownCrypt != "" {
+	switch {
+	case s.ownCryptNoName:
+		contentF, contentDict = "Identity", " /Filter /Crypt"
+	case s.ownCrypt != "":
 		contentF, contentDict = s.ownCrypt, " /Filter /Crypt /DecodeParms << /Name /"+s.ownCrypt+" >>"
 	}
 	strm := []byte(content)
@@ -186,6 +237,7 @@ func encryptedPDF(s cryptSpec, content, title, pageExtra string) []byte {
 		titleStr = s.encrypt(key, 6, titleStr)
 	}
 	enc := fmt.Sprintf("<< /Filter /Standard /V %d /R %d /Length %d /O <%x> /U <%x> /P -4", s.V, s.R, s.bits, O, s.userEntry(key))
+	var extra []string
 	if s.V == 4 {
 		cfLength := ""
 		if s.cfLength != "" {
@@ -195,7 +247,18 @@ func encryptedPDF(s cryptSpec, content, title, pageExtra string) []byte {
 		if s.rc4CF {
 			cfm = "V2"
 		}
-		enc += fmt.Sprintf(" /CF << /StdCF << /CFM /%s%s >> >> /StmF /%s /StrF /%s", cfm, cfLength, stmF, strF)
+		cf := fmt.Sprintf("<< /StdCF << /CFM /%s%s >> >>", cfm, cfLength)
+		stm, str := "/"+stmF, "/"+strF
+		if s.indirect {
+			// Objects 10 to 13, after the attachment's.
+			cf = fmt.Sprintf("<< /StdCF << /CFM 13 0 R%s >> >>", cfLength)
+			extra = append(extra, cf, "/"+stmF, "/"+strF, "/"+cfm)
+			cf, stm, str = "10 0 R", "11 0 R", "12 0 R"
+		}
+		enc += fmt.Sprintf(" /CF %s /StmF %s /StrF %s", cf, stm, str)
+		if s.eff != "" {
+			enc += " /EFF /" + s.eff
+		}
 	}
 	catalog := "<< /Type /Catalog /Pages 2 0 R /Outlines 5 0 R >>"
 	if s.noMetadata {
@@ -211,9 +274,27 @@ func encryptedPDF(s cryptSpec, content, title, pageExtra string) []byte {
 		fmt.Sprintf("<< /Title <%x> /Parent 5 0 R >>", titleStr),
 		enc + " >>",
 	}
-	if s.noMetadata {
+	switch {
+	case s.noMetadata:
 		objs = append(objs, "<< /Type /Metadata /Subtype /XML /Length 12 >>\nstream\n<x:xmpmeta/>\nendstream")
+	case s.attachment != "" || s.indirect:
+		data := []byte(s.attachment)
+		effF := s.eff
+		if effF == "" {
+			effF = stmF
+		}
+		if s.sealed(effF) {
+			data = s.encrypt(key, 8, data)
+		}
+		typ := "/Type /EmbeddedFile "
+		if s.attachmentNoType {
+			typ = ""
+		}
+		objs = append(objs,
+			fmt.Sprintf("<< %s/Length %d >>\nstream\n%s\nendstream", typ, len(data), data),
+			"<< /Type /Filespec /F (a.txt) /EF << /F 8 0 R >> >>")
 	}
+	objs = append(objs, extra...)
 	return withEncrypt(buildPDF(objs...), "7 0 R")
 }
 
