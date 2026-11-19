@@ -339,9 +339,10 @@ type Options struct {
 // A LimitError reports a file that passes one of a Reader's limits. Limit
 // names the Limits field passed, or for a cap Limits does not set:
 // PageTreeNodes and PageTreeDepth for the page tree, DecodeBudget for the
-// bytes the Reader's streams decode in all, and PageGlyphs and DocGlyphs for
-// the glyphs text extraction shows on a page and in all, and ObjectDepth for
-// the nesting of one object. Methods that return no error, Page.Content
+// bytes the Reader's streams decode in all, PageGlyphs and DocGlyphs for the
+// glyphs text extraction shows on a page and in all, and ObjectDepth for the
+// nesting of one object read from the file (a content stream's operands skip
+// it instead). Methods that return no error, Page.Content
 // included, raise it as a panic; a Reader from NewReader stops its page walk
 // at the page tree's caps instead.
 type LimitError struct {
