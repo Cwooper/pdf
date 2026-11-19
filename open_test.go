@@ -75,6 +75,45 @@ func TestLenientFileEnd(t *testing.T) {
 	}
 }
 
+// TestLenientFileStart verifies that a file opens with bytes before its
+// header, so long as the header starts in the first 1,024 bytes, reading its
+// offsets from the header.
+func TestLenientFileStart(t *testing.T) {
+	const window = 1024
+	for _, name := range []string{"pdf20.pdf", "ascii85_flate_chain.pdf", "rc4-40.pdf"} {
+		data, err := os.ReadFile("testdata/" + name)
+		if err != nil {
+			t.Fatal(err)
+		}
+		want := fileText(t, data)
+		tests := []struct {
+			name string
+			junk []byte
+			ok   bool
+		}{
+			{"a mail header", []byte("Content-Type: application/pdf\r\n\r\n"), true},
+			{"a stray %PDF- before the header", []byte("%PDF-junk\n"), true},
+			{"the header at the window's end", make([]byte, window), true},
+			{"the header past the window", make([]byte, window+1), false},
+		}
+		for _, tt := range tests {
+			t.Run(name+" "+tt.name, func(t *testing.T) {
+				data := slices.Concat(tt.junk, data)
+				_, err := NewReader(bytes.NewReader(data), int64(len(data)))
+				if !tt.ok {
+					if err == nil || !strings.Contains(err.Error(), "invalid header") {
+						t.Errorf("err = %v, want invalid header", err)
+					}
+					return
+				}
+				if got := fileText(t, data); got != want {
+					t.Errorf("text = %q, want %q", got, want)
+				}
+			})
+		}
+	}
+}
+
 // fileText returns the text of every page of data.
 func fileText(t *testing.T, data []byte) string {
 	t.Helper()

@@ -395,7 +395,24 @@ func recoveredError(x any) error {
 	return fmt.Errorf("malformed PDF: %v", x)
 }
 
-func open(f io.ReaderAt, size int64, o Options) (r *Reader, err error) {
+// headerWindow is how far into a file Acrobat looks for the header. What
+// comes before it is junk a mailer or downloader prepended, so offsets count
+// from the header.
+const headerWindow = 1024
+
+func open(f io.ReaderAt, size int64, o Options) (*Reader, error) {
+	head := make([]byte, min(size, headerWindow+10))
+	f.ReadAt(head, 0)
+	for h := 1; h <= min(headerWindow, len(head)) && !validHeader(head); h++ {
+		if validHeader(head[h:]) {
+			f, size = io.NewSectionReader(f, int64(h), size-int64(h)), size-int64(h)
+			break
+		}
+	}
+	return openAt(f, size, o)
+}
+
+func openAt(f io.ReaderAt, size int64, o Options) (r *Reader, err error) {
 	defer func() {
 		if x := recover(); x != nil {
 			r, err = nil, recoveredError(x)
