@@ -554,4 +554,17 @@ func TestPageTreeLimits(t *testing.T) {
 	if r, err := openOptions(t, pageTreePDF("<< /Type /Pages /Kids [3 0 R 4 0 R 5 0 R 6 0 R] >>", page, page, page, page), Limits{}); err != nil || r.NumPage() != 4 {
 		t.Errorf("with no limits set: err %v, want 4 pages", err)
 	}
+	// A lazy Reader lists the pages up to a limit instead of panicking.
+	data := pageTreePDF("<< /Type /Pages /Kids [3 0 R 4 0 R] >>",
+		page, "<< /Type /Pages /Kids [5 0 R 6 0 R 7 0 R] >>", "<< /Type /Pages /Kids [8 0 R 9 0 R] >>", page, page, page, page)
+	r, err := NewReader(bytes.NewReader(data), int64(len(data)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	r.limits = Limits{Pages: 3}
+	var n int
+	mustNotCrash(t, func() { n = r.NumPage() })
+	if n != 3 {
+		t.Errorf("lazy NumPage = %d, want 3", n)
+	}
 }

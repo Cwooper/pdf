@@ -100,8 +100,7 @@ func (r *Reader) Page(num int) Page {
 }
 
 // NumPage returns the number of pages in the PDF file: those its page tree
-// lists, whatever its /Count claims. A page tree past the Reader's limits
-// panics with a LimitError.
+// lists, whatever its /Count claims, up to the Reader's limits.
 func (r *Reader) NumPage() int {
 	return len(r.pages())
 }
@@ -127,10 +126,22 @@ func (r *Reader) pages() []pageEntry {
 // walkPages lists the pages of the page tree. A /Kids entry referring to a
 // node or page already listed is skipped: a node listed twice at each level
 // would make a tree of 33 objects hold 2^31 pages, and one listing an
-// ancestor would make a cycle. Passing a limit panics with a LimitError.
-func (r *Reader) walkPages() []pageEntry {
-	pages := r.limits.orDefaults().Pages
-	w := pageWalk{seen: make(map[objptr]bool), maxPages: pages, maxNodes: 2 * pages}
+// ancestor would make a cycle. Passing a limit panics with a LimitError on a
+// Reader from NewReaderOptions, and otherwise ends the list there, so that an
+// upstream caller's NumPage loop meets no panic it did not meet before.
+func (r *Reader) walkPages() (pages []pageEntry) {
+	maxPages := r.limits.orDefaults().Pages
+	w := pageWalk{seen: make(map[objptr]bool), maxPages: maxPages, maxNodes: 2 * maxPages}
+	if !r.strictPages {
+		defer func() {
+			if e := recover(); e != nil {
+				if _, ok := e.(LimitError); !ok {
+					panic(e)
+				}
+				pages = w.pages
+			}
+		}()
+	}
 	w.walk(r.Trailer().Key("Root").Key("Pages"), new(unresolved), 1)
 	return w.pages
 }

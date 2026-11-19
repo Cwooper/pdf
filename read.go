@@ -125,7 +125,10 @@ type Reader struct {
 	noObjStm bool
 
 	limits Limits
-	cache  *readerCache
+	// strictPages makes a page tree past the limits a LimitError rather
+	// than a shortened page list.
+	strictPages bool
+	cache       *readerCache
 }
 
 type xref struct {
@@ -286,8 +289,8 @@ func Open(file string) (*os.File, *Reader, error) {
 }
 
 // NewReader opens a file for reading, using the data in f with the given total size.
-// It reads the page tree only when asked for a page, so a page tree past the
-// default limits panics with a LimitError there; NewReaderOptions reports it.
+// It reads the page tree only when asked for a page, and a page tree past the
+// default limits lists the pages up to them; NewReaderOptions refuses it.
 func NewReader(f io.ReaderAt, size int64) (*Reader, error) {
 	return NewReaderEncrypted(f, size, nil)
 }
@@ -377,6 +380,7 @@ func NewReaderOptions(f io.ReaderAt, size int64, o Options) (r *Reader, err erro
 			r, err = nil, recoveredError(x)
 		}
 	}()
+	r.strictPages = true
 	r.pages()
 	return r, nil
 }
